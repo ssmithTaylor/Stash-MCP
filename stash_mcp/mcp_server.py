@@ -107,7 +107,11 @@ def _build_instructions(
     parts = [
         "Stash is a file-backed document store. All paths are POSIX-style and "
         "relative to the content root, with no leading slash (e.g. 'docs/guide.md'). "
-        "Start with list_content(recursive=true) to discover files."
+        "Start with README.md at the content root (the store index) and the "
+        "README.md of the root you are working in; use list_content(path=<root>) "
+        "to browse it and find_content(path_prefix=<root>) to search within it. "
+        "list_content(recursive=true) lists every file and is only useful for "
+        "small stores."
     ]
     if read_only:
         parts.append(
@@ -116,11 +120,13 @@ def _build_instructions(
     else:
         parts.append(
             "Writing a file creates missing parent directories automatically; there "
-            "is no separate mkdir step. To modify a file, call read_content first to "
-            "get its sha, then edit_content (targeted string replacement, preferred "
-            "for small changes) or overwrite_content (full replace). create_content "
-            "is only for files that do not exist yet; delete_content also requires "
-            "the sha."
+            "is no separate mkdir step. To add knowledge to an existing markdown "
+            "doc: list_content to find it, inspect_content_structure to see its "
+            "heading outline, read_content for the current text and sha, then "
+            "edit_content to change just the relevant part instead of rewriting "
+            "the file. overwrite_content replaces the full file, update_metadata "
+            "sets or removes frontmatter keys, create_content is only for files "
+            "that do not exist yet, and delete_content also requires the sha."
         )
     if transactions_active:
         parts.append(
@@ -132,8 +138,15 @@ def _build_instructions(
         )
     if search_enabled:
         parts.append(
-            "search_content finds content by meaning and returns ranked snippets; "
-            "follow up with read_content to retrieve full files."
+            "search_content finds content by meaning and returns ranked snippets "
+            "with the Section (heading path) each came from; scope with "
+            "path_prefix (hard — only these roots) or boost_prefix (soft — "
+            "prefers without hiding the rest). The server may be configured to "
+            "exclude certain paths (e.g. working directories) from results by "
+            "default; pass include_excluded=true to search them too. The Section "
+            "line names the heading a snippet came from, so follow up with "
+            "read_content and jump straight to that part instead of scanning "
+            "the whole file."
         )
     if git_enabled:
         parts.append(

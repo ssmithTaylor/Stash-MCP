@@ -1270,6 +1270,30 @@ async def test_server_instructions_transaction_mode(tmp_path):
     assert "commit_content_transaction" in instructions
 
 
+async def test_server_instructions_are_index_first(mcp_server):
+    """Instructions lead with the README index and scoped navigation instead
+    of a recursive dump, and never promise read_section/edit_section, which
+    do not exist in this codebase."""
+    text = mcp_server.instructions
+    first_paragraph = text.split("\n\n")[0]
+    assert "Start with README.md" in first_paragraph and "path_prefix" in first_paragraph
+    assert "Start with list_content(recursive=true)" not in text
+    assert "inspect_content_structure" in text and "update_metadata" in text
+    assert "read_section" not in text and "edit_section" not in text
+
+
+async def test_server_instructions_boost_prefix_only_when_search_enabled(temp_fs):
+    """boost_prefix only means anything on search_content; the instructions
+    must not promise it (or the tool) when search is disabled."""
+    disabled = create_mcp_server(temp_fs)
+    assert "search_content" not in disabled.instructions
+    assert "boost_prefix" not in disabled.instructions
+
+    enabled = create_mcp_server(temp_fs, search_engine=object())
+    assert "search_content" in enabled.instructions
+    assert "boost_prefix" in enabled.instructions
+
+
 async def test_write_tool_descriptions_note_transactions_when_gated(tmp_path):
     """Write tools warn about transaction gating only on gated servers."""
     mcp = _txn_server(tmp_path)
