@@ -1036,26 +1036,18 @@ class SearchEngine:
         # the BM25 store must be wiped in the same block so the two
         # indexes don't drift.
         if self.meta.embedder_model and self.meta.embedder_model != embedder_model:
-            logger.warning(
+            self._clear_index_for_rebuild(
                 f"Embedder model changed from '{self.meta.embedder_model}' "
                 f"to '{embedder_model}'. Clearing stale index for rebuild."
             )
-            self.store.clear()
-            self.bm25_store.clear()
-            self.meta = IndexMeta()
-            self.meta.save(self.index_dir / "index_meta.json")
 
         # Chunk-metadata layout changed (e.g. the `metadata` dict was added):
         # clear everything so the startup build re-embeds and repopulates.
         if self.meta.schema_version != INDEX_SCHEMA_VERSION:
-            logger.warning(
-                "Search index schema version %s != %s; clearing index for rebuild.",
-                self.meta.schema_version, INDEX_SCHEMA_VERSION,
+            self._clear_index_for_rebuild(
+                f"Search index schema version {self.meta.schema_version} != "
+                f"{INDEX_SCHEMA_VERSION}; clearing index for rebuild."
             )
-            self.store.clear()
-            self.bm25_store.clear()
-            self.meta = IndexMeta()
-            self.meta.save(self.index_dir / "index_meta.json")
 
         # Upgrade path: vectors.pkl exists from a pre-hybrid deployment
         # but no BM25 index yet — rebuild it now so the first query
@@ -1075,6 +1067,25 @@ class SearchEngine:
 
         # Eagerly initialise the embedder so the first search query is fast
         self._embedder = self._create_embedder()
+
+    def _clear_index_for_rebuild(self, reason: str) -> None:
+        """Wipe the vector store, BM25 store, and index metadata, then persist.
+
+        Called at startup whenever something invalidates every stored chunk
+        (embedder model change, index schema-version bump, ...). The vector
+        and BM25 stores are cleared together so the two indexes never drift,
+        and the fresh, empty ``IndexMeta`` is saved immediately so a crash
+        before the next successful ``build_index()`` doesn't leave stale
+        on-disk state.
+
+        Args:
+            reason: Logged as a warning before clearing.
+        """
+        logger.warning(reason)
+        self.store.clear()
+        self.bm25_store.clear()
+        self.meta = IndexMeta()
+        self.meta.save(self.index_dir / "index_meta.json")
 
     def _create_embedder(self):
         """Create and return the embedding model instance, or None for custom embed_fn.

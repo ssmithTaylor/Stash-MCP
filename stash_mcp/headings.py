@@ -9,6 +9,9 @@ from dataclasses import dataclass
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _FENCE_RE = re.compile(r"^(```|~~~)")
+# A CommonMark ATX closing sequence is a run of "#" preceded by whitespace;
+# "C#" is not one, so an unconditional rstrip("#") would corrupt it to "C".
+_CLOSING_HASHES_RE = re.compile(r"(?<=\s)#+\s*$")
 
 
 @dataclass(frozen=True)
@@ -20,18 +23,28 @@ class Heading:
 
 
 def scan_headings(text: str) -> list[Heading]:
-    """Return ATX headings outside fenced code blocks, in document order."""
+    """Return ATX headings outside fenced code blocks, in document order.
+
+    A fence opened with ``` is only closed by another ``` line (likewise for
+    ~~~) — a line using the other delimiter while a fence is open is just
+    content, not a close, matching CommonMark.
+    """
     headings: list[Heading] = []
-    in_fence = False
+    fence_delim: str | None = None
     offset = 0
     for line_no, raw in enumerate(text.split("\n"), start=1):
         stripped = raw.strip()
-        if _FENCE_RE.match(stripped):
-            in_fence = not in_fence
-        elif not in_fence:
+        fence_match = _FENCE_RE.match(stripped)
+        if fence_match:
+            delim = fence_match.group(1)
+            if fence_delim is None:
+                fence_delim = delim
+            elif delim == fence_delim:
+                fence_delim = None
+        elif fence_delim is None:
             match = _HEADING_RE.match(stripped)
             if match:
-                title = match.group(2).rstrip("#").strip()
+                title = _CLOSING_HASHES_RE.sub("", match.group(2)).strip()
                 headings.append(
                     Heading(text=title, level=len(match.group(1)), line=line_no, offset=offset)
                 )
