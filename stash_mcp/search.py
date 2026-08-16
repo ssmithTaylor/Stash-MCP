@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 
-from .filesystem import glob_to_regex
+from .filesystem import glob_to_regex, normalize_glob
 from .frontmatter import extract_metadata, normalize_key
 from .headings import heading_path_at, scan_headings
 
@@ -75,10 +75,7 @@ class SearchResult:
 
 def _normalize_exclude_pattern(pattern: str) -> str:
     """Apply the STASH_CONTENT_PATHS conventions to a caller-supplied glob."""
-    p = pattern.strip().replace("\\", "/").lstrip("/")
-    if p.endswith("/"):
-        p += "**"
-    return p
+    return normalize_glob(pattern)
 
 
 def normalize_prefixes(value: str | list[str] | None) -> list[str]:

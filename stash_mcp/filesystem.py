@@ -56,6 +56,14 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
     return re.compile(res + r"\Z")
 
 
+def normalize_glob(pattern: str) -> str:
+    """Apply the STASH_CONTENT_PATHS conventions to a caller-supplied glob."""
+    p = pattern.strip().replace("\\", "/").lstrip("/")
+    if p.endswith("/"):
+        p += "**"
+    return p
+
+
 class FileSystem:
     """Manages filesystem operations for content storage."""
 

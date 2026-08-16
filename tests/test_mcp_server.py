@@ -442,6 +442,42 @@ async def test_list_content_tool_non_recursive(mcp_server):
     assert "docs" in text
 
 
+async def test_list_content_max_depth_and_glob(mcp_server, temp_fs):
+    temp_fs.write_file("docs/deep/inner.md", "# Inner")
+    tool = await mcp_server.get_tool("list_content")
+    top = str((await tool.run({"path": "", "max_depth": 1})).content[0].text)
+    assert "README.md" in top and "data.json" in top and "docs/README.md" not in top
+    md_only = str((await tool.run({"path": "", "glob": "docs/**/*.md"})).content[0].text)
+    assert "docs/README.md" in md_only and "docs/deep/inner.md" in md_only
+    assert "data.json" not in md_only and "\nREADME.md" not in "\n" + md_only
+
+
+async def test_list_content_limit_truncates(mcp_server):
+    tool = await mcp_server.get_tool("list_content")
+    text = str((await tool.run({"path": "", "recursive": True, "limit": 1})).content[0].text)
+    assert "truncated" in text
+    assert len([ln for ln in text.splitlines() if ln and not ln.startswith("…")]) == 1
+
+
+async def test_list_content_with_metadata_returns_json_rows(mcp_server, temp_fs):
+    temp_fs.write_file("docs/meta.md", "---\nlayer: x\nverified: 2026-08-16\n---\n# M\n")
+    tool = await mcp_server.get_tool("list_content")
+    result = await tool.run({"path": "docs", "with_metadata": True})
+    data = json.loads(str(result.content[0].text))
+    rows = {row["path"]: row for row in data["items"]}
+    assert data["truncated"] is False
+    assert rows["docs/meta.md"]["metadata"] == {"layer": "x", "verified": "2026-08-16"}
+    assert rows["docs/README.md"]["metadata"] == {}
+    assert rows["docs/meta.md"]["size"] > 0
+    assert all(p.endswith(".md") for p in rows)          # data.json is not listed
+
+
+async def test_list_content_default_output_unchanged(mcp_server):
+    tool = await mcp_server.get_tool("list_content")
+    text = str((await tool.run({"path": ""})).content[0].text)
+    assert "📁 docs" in text and "📄 README.md" in text
+
+
 async def test_move_content_tool(mcp_server, temp_fs, mock_context):
     """Test move_content tool moves a file."""
     tool = await mcp_server.get_tool("move_content")

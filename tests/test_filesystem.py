@@ -394,3 +394,14 @@ class TestGlobToRegex:
     def test_static_method_still_delegates(self):
         from stash_mcp.filesystem import FileSystem
         assert FileSystem._glob_to_regex("x/**").match("x/y/z")
+
+
+# --- normalize_glob module-level function tests ---
+
+
+def test_normalize_glob():
+    from stash_mcp.filesystem import normalize_glob
+
+    assert normalize_glob("_reports/") == "_reports/**"
+    assert normalize_glob("/projects\\x/**") == "projects/x/**"
+    assert normalize_glob("  docs/*.md ") == "docs/*.md"

@@ -20,7 +20,13 @@ from pydantic import AnyUrl, BaseModel, Field
 
 from .config import Config
 from .events import CONTENT_CREATED, CONTENT_DELETED, CONTENT_MOVED, CONTENT_UPDATED, emit
-from .filesystem import FileNotFoundError, FileSystem, InvalidPathError
+from .filesystem import (
+    FileNotFoundError,
+    FileSystem,
+    InvalidPathError,
+    glob_to_regex,
+    normalize_glob,
+)
 from .frontmatter import extract_metadata
 from .headings import scan_headings
 from .metrics import get_metrics
@@ -868,35 +874,86 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             bool,
             Field(description="If true, list every file under path as full relative paths"),
         ] = False,
-    ) -> str:
+        max_depth: Annotated[
+            int | None,
+            Field(ge=1, description="Bound the recursive listing to this many levels below "
+                  "path (1 = direct children only); implies recursive"),
+        ] = None,
+        glob: Annotated[
+            str | None,
+            Field(description="Glob over full relative paths (STASH_CONTENT_PATHS dialect: *, ?, "
+                  "**), e.g. 'projects/*/services/*.md'; implies recursive"),
+        ] = None,
+        limit: Annotated[
+            int, Field(ge=1, description="Maximum entries returned (default 500)"),
+        ] = 500,
+        with_metadata: Annotated[
+            bool,
+            Field(description="Return JSON rows for markdown files with size and frontmatter "
+                  "metadata instead of the text listing; implies recursive"),
+        ] = False,
+    ) -> str | dict:
         """List files and directories in the content store.
 
         Non-recursive listings show one entry per line with a 📁 prefix for
         directories and 📄 for files; entries are names only, so join them
         with *path* to build full paths. Recursive listings return full
         relative file paths, one per line, with no prefixes. Hidden files
-        (dotfiles) are excluded.
+        (dotfiles) are excluded. Large stores: prefer max_depth/glob over a
+        bare recursive listing, which is capped by limit.
 
         Args:
             path: Path relative to content root (defaults to root)
             recursive: If true, list all files recursively
+            max_depth: Bound recursion depth (implies recursive)
+            glob: Filter full paths with a glob (implies recursive)
+            limit: Cap on entries; a trailing "… truncated" line marks a cut
+            with_metadata: Return {"items": [{path, size, metadata}], "truncated"}
+                for markdown files (implies recursive)
         Returns:
-            A formatted string listing the files and directories
+            A formatted string listing, or a dict when with_metadata is true
         """
-        if recursive:
-            files = filesystem.list_all_files(path)
+        base = path.strip("/")
+        base_depth = len(base.split("/")) if base else 0
+        wants_files = recursive or max_depth is not None or glob is not None or with_metadata
+        if wants_files:
+            files = await asyncio.to_thread(filesystem.list_all_files, base)
+            if max_depth is not None:
+                files = [f for f in files if len(f.split("/")) - base_depth <= max_depth]
+            if glob:
+                rx = glob_to_regex(normalize_glob(glob))
+                files = [f for f in files if rx.match(f)]
+            if with_metadata:
+                files = [f for f in files if f.lower().endswith((".md", ".markdown"))]
+            truncated = len(files) > limit
+            files = files[:limit]
+            if with_metadata:
+                items = []
+                for f in files:
+                    text = await asyncio.to_thread(filesystem.try_read_text, f)
+                    if text is None:
+                        continue
+                    meta, _ = extract_metadata(text)
+                    items.append({
+                        "path": f, "size": len(text.encode("utf-8")), "metadata": meta,
+                    })
+                return {"items": items, "truncated": truncated}
             if not files:
-                return f"No files found under '{path or '/'}'"
-            return "\n".join(files)
-        else:
-            items = filesystem.list_files(path)
-            lines = []
-            for name, is_dir in items:
-                prefix = "📁 " if is_dir else "📄 "
-                lines.append(f"{prefix}{name}")
-            if not lines:
-                return f"Empty directory: '{path or '/'}'"
-            return "\n".join(lines)
+                return f"No files found under '{base or '/'}'"
+            out = "\n".join(files)
+            if truncated:
+                out += f"\n… truncated ({len(files)} shown; raise limit or narrow with path/glob)"
+            return out
+        items = filesystem.list_files(base)
+        lines = []
+        for name, is_dir in items[:limit]:
+            prefix = "📁 " if is_dir else "📄 "
+            lines.append(f"{prefix}{name}")
+        if not lines:
+            return f"Empty directory: '{base or '/'}'"
+        if len(items) > limit:
+            lines.append(f"… truncated ({limit} shown)")
+        return "\n".join(lines)
 
     @mcp.tool(
         annotations=ToolAnnotations(
