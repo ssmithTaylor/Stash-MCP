@@ -831,6 +831,18 @@ class TestSearchConfig:
 
         assert Config.MODEL_CACHE_DIR == Path("/data/models")
 
+    def test_search_exclude_patterns_default_unset(self):
+        from stash_mcp.config import Config
+
+        assert Config.SEARCH_EXCLUDE_PATTERNS is None
+
+    def test_search_exclude_patterns_parse(self):
+        from stash_mcp.config import _parse_content_paths
+
+        assert _parse_content_paths("**/_reports/, **/_archive/**") == [
+            "**/_reports/**", "**/_archive/**",
+        ]
+
 
 # --- Path normalization tests ---
 
