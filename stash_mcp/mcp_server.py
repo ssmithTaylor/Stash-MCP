@@ -714,7 +714,8 @@ def create_mcp_server(
                 commit_message: Optional git commit message (git-tracked servers only)
                 author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
-                A dict with path, result status, and new_sha
+                A dict with path, result status, new_sha, and commit (git hash,
+                or null when nothing was committed — e.g. inside a transaction)
             """
             async with _write_guard(ctx):
                 current = filesystem.read_file(file_path)
@@ -770,7 +771,10 @@ def create_mcp_server(
                 commit_message: Optional git commit message (git-tracked servers only)
                 author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
-                A dict with a results list containing path, result status, and new_sha per file
+                A dict with a results list (path, result status, and new_sha per
+                file) and a top-level commit (git hash for the single commit
+                covering every file, or null when nothing was committed — e.g.
+                inside a transaction)
             """
             if len(edit_operations) == 0:
                 raise ValueError("At least one edit operation is required.")
@@ -1334,7 +1338,9 @@ def create_mcp_server(
                 commit_message: Optional git commit message (git-tracked servers only)
                 author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
-                A dict with 'source', 'destination', and 'files_moved' count
+                A dict with 'source', 'destination', 'files_moved' count, and
+                'commit' (git hash, or null when nothing was committed — e.g.
+                inside a transaction)
             """
             async with _write_guard(ctx):
                 moved_files = filesystem.move_directory(source_path, dest_path)
@@ -1399,7 +1405,10 @@ def create_mcp_server(
                 commit_message: Optional git commit message (git-tracked servers only)
                 author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
-                A dict with 'results' list containing source, destination, and status per file
+                A dict with a 'results' list (source, destination, and status
+                per file) and a top-level 'commit' (git hash for the single
+                commit covering every move, or null when nothing was
+                committed — e.g. inside a transaction)
             """
             if len(moves) == 0:
                 raise ValueError("At least one move operation is required.")
@@ -1752,6 +1761,13 @@ def create_mcp_server(
                 )
             except TransactionError as exc:
                 raise ValueError(str(exc))
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"Transaction closed, but the commit failed: {exc}. The "
+                    "touched files were NOT committed — they remain on disk, "
+                    "dirty and unstaged, and are no longer part of any "
+                    "transaction; inspect them manually."
+                ) from exc
             return _with_commit(f"Transaction committed: {message}", commit)
 
         @mcp.tool(

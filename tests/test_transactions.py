@@ -1641,3 +1641,41 @@ class TestMCPAutocommitTools:
             # genuinely was not reverted -- the tool must not have lied about it.
             assert (path / "README.md").read_text() == "corrupted"
             assert tm.open_transaction_count == 0
+
+    @pytest.mark.asyncio
+    async def test_commit_tool_translates_a_failed_commit_into_a_clear_error(self):
+        """end_transaction can raise RuntimeError when git commit itself fails
+        (e.g. a malformed author -- test_end_transaction_destroys_the_transaction_
+        even_when_commit_fails proves this is deterministically reachable, not
+        hypothetical). The MCP tool must not let that surface as an unexplained
+        raw git error: the caller must see a ValueError (never the bare
+        RuntimeError), stating plainly that the commit failed, the transaction
+        is gone, and the touched files are left dirty and unstaged."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                await (await mcp.get_tool("start_content_transaction")).run({})
+                create = await mcp.get_tool("create_content")
+                await create.run({"path": "orphan.md", "content": "stuck"})
+                commit_tool = await mcp.get_tool("commit_content_transaction")
+                with pytest.raises(ValueError) as exc_info:
+                    # Malformed author makes the underlying `git commit` fail
+                    # deterministically -- the raw RuntimeError must not reach
+                    # the caller as-is: pytest.raises(ValueError) itself is the
+                    # proof it was translated rather than propagated bare.
+                    await commit_tool.run({"message": "msg", "author": "not a valid author"})
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            message = str(exc_info.value)
+            assert "commit failed" in message.lower()
+            assert "dirty" in message.lower() or "unstaged" in message.lower()
+            assert not message.lower().startswith("transaction committed")
+            # The transaction was closed (the deliberate, documented decision)
+            # but the file survives on disk, dirty and unstaged -- not silently
+            # dropped, and not falsely reported as committed.
+            assert (path / "orphan.md").read_text() == "stuck"
+            assert tm.open_transaction_count == 0
+            assert not tm.git.has_staged_changes()
