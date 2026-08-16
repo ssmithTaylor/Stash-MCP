@@ -17,26 +17,30 @@ from stash_mcp.transactions import TransactionError, TransactionManager
 # ---------------------------------------------------------------------------
 
 
+def _git_setup(*args: str) -> None:
+    """Run a git setup command, surfacing git's own stderr when it fails.
+
+    ``check=True`` alone raises a CalledProcessError that reports only a
+    return code, which makes a one-off setup failure (e.g. ``git commit``
+    exiting 128) impossible to root-cause from CI output.
+    """
+    try:
+        subprocess.run(list(args), check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"Test git setup failed ({' '.join(args)}): exit {exc.returncode}\n"
+            f"stdout: {exc.stdout}\nstderr: {exc.stderr}"
+        ) from exc
+
+
 def _init_repo(path: Path) -> None:
     """Initialise a bare git repo at *path* with a single commit."""
-    subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(path), "config", "user.email", "test@example.com"],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(path), "config", "user.name", "Test User"],
-        check=True,
-        capture_output=True,
-    )
+    _git_setup("git", "init", str(path))
+    _git_setup("git", "-C", str(path), "config", "user.email", "test@example.com")
+    _git_setup("git", "-C", str(path), "config", "user.name", "Test User")
     (path / "README.md").write_text("# Test\n")
-    subprocess.run(["git", "-C", str(path), "add", "."], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(path), "commit", "-m", "Initial commit"],
-        check=True,
-        capture_output=True,
-    )
+    _git_setup("git", "-C", str(path), "add", ".")
+    _git_setup("git", "-C", str(path), "commit", "-m", "Initial commit")
 
 
 def _make_tm(tmpdir: Path) -> tuple[TransactionManager, FileSystem]:
@@ -319,6 +323,96 @@ class TestGitBackendNewMethods:
             _init_repo(path)
             assert GitBackend(path).ahead_count("origin", "main") == 0
 
+    def test_merge_in_progress_is_false_on_a_clean_repo(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            assert GitBackend(path).merge_in_progress() is False
+
+    def test_merge_in_progress_detects_a_conflicted_merge(self):
+        """A pull that conflicts leaves MERGE_HEAD behind, and from then on
+        every `git commit -- <pathspec>` fails with 'cannot do a partial
+        commit during a merge'."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            base = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "HEAD"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            # Two branches that both rewrite README.md -> guaranteed conflict.
+            (path / "README.md").write_text("# ours\n")
+            _git_setup("git", "-C", str(path), "commit", "-qam", "ours")
+            _git_setup("git", "-C", str(path), "checkout", "-q", "-b", "theirs", base)
+            (path / "README.md").write_text("# theirs\n")
+            _git_setup("git", "-C", str(path), "commit", "-qam", "theirs")
+            _git_setup("git", "-C", str(path), "checkout", "-q", "-")
+            merge = subprocess.run(
+                ["git", "-C", str(path), "merge", "theirs"], capture_output=True, text=True
+            )
+            assert merge.returncode != 0                   # the merge really conflicted
+            assert git.merge_in_progress() is True
+            (path / "other.md").write_text("unrelated")
+            with pytest.raises(RuntimeError, match="git commit failed"):
+                git.commit_paths(["other.md"], "should not be possible mid-merge")
+
+    def test_push_timeout_becomes_a_runtime_error(self):
+        """A blackholed remote must not hang forever under the write lock, and
+        the TimeoutExpired must not escape as a type callers do not handle."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path, network_timeout=7.0)
+            seen: list[dict] = []
+
+            def fake_run(args, **kwargs):
+                seen.append(kwargs)
+                raise subprocess.TimeoutExpired(cmd=args, timeout=7.0)
+
+            with patch.object(git, "_run", side_effect=fake_run):
+                with pytest.raises(RuntimeError, match="git push timed out after 7s"):
+                    git.push("origin", "main")
+            assert seen and seen[0]["timeout"] == 7.0       # the bound was actually passed
+
+    def test_pull_timeout_is_a_failed_pull_result(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path, network_timeout=7.0)
+            real_run = git._run
+            seen: list[dict] = []
+
+            def fake_run(args, **kwargs):
+                if args[:2] == ["git", "pull"]:
+                    seen.append(kwargs)
+                    raise subprocess.TimeoutExpired(cmd=args, timeout=7.0)
+                return real_run(args, **kwargs)
+
+            with patch.object(git, "_run", side_effect=fake_run):
+                result = git.pull("origin", "main")
+            assert result.success is False and "timed out" in result.message
+            assert seen and seen[0]["timeout"] == 7.0
+
+    def test_is_valid_author_requires_the_name_and_email_shape(self):
+        from stash_mcp.git_backend import is_valid_author
+
+        assert is_valid_author("doc-writer <dw@agents>")
+        assert is_valid_author("Bot  <bot@example.com>  ")
+        assert is_valid_author("A B <>")                    # git accepts an empty email
+        assert not is_valid_author("doc-writer")            # the plausible agent mistake
+        assert not is_valid_author("not a valid author")
+        assert not is_valid_author("<only@email>")
+        assert not is_valid_author("")
+
 
 # ---------------------------------------------------------------------------
 # TransactionManager — write gating
@@ -422,6 +516,21 @@ class TestTransactionManagerWriteGating:
         with TemporaryDirectory() as tmpdir:
             tm, fs = _make_tm(Path(tmpdir))
             assert tm.file_exists("README.md")
+
+    def test_wrapper_write_in_autocommit_mode_names_the_misconfiguration(self):
+        """The delegated write methods always demand a transaction, so
+        installing this wrapper as the filesystem in autocommit mode would
+        make every MCP write fail. The invariant lives here, next to the code
+        that depends on it, and must say what is actually wrong."""
+        with TemporaryDirectory() as tmpdir:
+            from stash_mcp.git_backend import GitBackend
+
+            path = Path(tmpdir)
+            _init_repo(path)
+            tm = TransactionManager(FileSystem(path), GitBackend(path), autocommit=True)
+            with pytest.raises(TransactionError, match="autocommit") as exc_info:
+                tm.write_file("test.txt", "content")
+            assert "No active transaction" not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +692,28 @@ class TestTransactionManagerTimeout:
             txn_id = await tm.start_transaction("session-1", timeout=0, lock_wait=5)
             assert txn_id is not None
             await tm.abort_transaction("session-1")
+
+    @pytest.mark.asyncio
+    async def test_auto_abort_rearms_its_timer_when_the_lock_is_unavailable(self):
+        """The timeout task *is* the current task, so _cancel_timeout skips it
+        and nothing else re-arms it. An auto-abort that cannot take the write
+        lock must therefore re-arm itself, or the transaction stays open
+        forever — keeping periodic git pulls paused with it."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            tm.lock_wait = 0.05
+            await tm.start_transaction("s1", timeout=0.1)
+            txn = tm._txns["s1"]
+            await tm.write_lock.acquire()          # auto-abort cannot get in
+            try:
+                await asyncio.sleep(0.4)           # first attempt fails
+                assert tm.open_transaction_count == 1
+                assert txn.timeout_task is not None and not txn.timeout_task.done()
+            finally:
+                tm.write_lock.release()
+            await asyncio.sleep(0.5)               # the re-armed timer succeeds
+            assert tm.open_transaction_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1324,9 +1455,9 @@ class TestPathScopedTransactions:
         The caller's edit remains on disk, dirty and unstaged, but the
         transaction that owned it is gone -- it cannot be retried or aborted.
 
-        A malformed ``author`` makes ``git commit`` fail deterministically,
-        the same trigger ``test_commit_paths_unstages_on_commit_failure`` uses
-        for ``GitBackend.commit_paths`` directly.
+        The failure is injected at ``commit_paths`` rather than triggered by a
+        malformed ``author``: since author strings are now validated before
+        anything is torn down, that trigger no longer reaches the commit.
         """
         with TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
@@ -1335,14 +1466,55 @@ class TestPathScopedTransactions:
             async with tm.guard("s1"):
                 fs.write_file("orphan.md", "stuck")
                 await tm.after_write(["orphan.md"], session_id="s1")
-            with pytest.raises(RuntimeError, match="git commit failed"):
-                await tm.end_transaction("s1", "msg", author="not a valid author")
+            with patch.object(
+                tm.git, "commit_paths", side_effect=RuntimeError("git commit failed: boom")
+            ):
+                with pytest.raises(RuntimeError, match="git commit failed"):
+                    await tm.end_transaction("s1", "msg")
             assert tm.open_transaction_count == 0            # transaction destroyed...
             assert not tm.write_lock.locked()                 # ...and the lock released
             assert (path / "orphan.md").read_text() == "stuck"   # ...edit survives, orphaned
             assert not tm.git.has_staged_changes()             # index invariant still holds
             with pytest.raises(TransactionError, match="No active transaction"):
                 await tm.end_transaction("s1", "retry")       # cannot retry: nothing to retry
+
+    @pytest.mark.asyncio
+    async def test_end_transaction_rejects_a_malformed_author_up_front(self):
+        """`author` is free text from an agent. A bare name is the plausible
+        mistake and `git commit --author` exits 128 on it unless it happens to
+        match an existing author in history. Reaching the commit with it would
+        destroy the transaction and orphan every edit it held; rejected before
+        _acquire it is just a retryable input error."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=30)
+            async with tm.guard("s1"):
+                fs.write_file("keep.md", "safe")
+                await tm.after_write(["keep.md"], session_id="s1")
+            with pytest.raises(TransactionError, match="Invalid author"):
+                await tm.end_transaction("s1", "msg", author="doc-writer")
+            assert tm.open_transaction_count == 1              # transaction intact...
+            assert not tm.write_lock.locked()                  # ...lock never taken
+            assert tm._txns["s1"].touched == ["keep.md"]       # ...edits still held
+            commit = await tm.end_transaction("s1", "msg", author="doc-writer <dw@agents>")
+            assert commit and "keep.md" in _show_names(path)   # the retry lands
+
+    @pytest.mark.asyncio
+    async def test_end_transaction_never_pushes(self):
+        """A push here would add a network round-trip under the write lock and
+        give a *successful* commit a second way to be reported as a failure.
+        The periodic sync loop pushes whenever the branch is ahead."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=30)
+            async with tm.guard("s1"):
+                fs.write_file("p.md", "p")
+                await tm.after_write(["p.md"], session_id="s1")
+            with patch.object(tm.git, "push") as push:
+                assert await tm.end_transaction("s1", "no push please")
+            push.assert_not_called()
 
 
 class TestAutocommit:
@@ -1388,6 +1560,24 @@ class TestAutocommit:
             tm, fs = self._make_autocommit_tm(Path(tmpdir))
             async with tm.guard(None):
                 assert await tm.after_write(["README.md"], session_id=None) is None
+
+    @pytest.mark.asyncio
+    async def test_after_write_rejects_a_malformed_author(self):
+        """Autocommit callers get the same clear error as transaction callers,
+        before the write is attributed."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = self._make_autocommit_tm(path)
+            async with tm.guard(None):
+                fs.write_file("doc.md", "hello")
+                with pytest.raises(TransactionError, match="Invalid author"):
+                    await tm.after_write(["doc.md"], session_id=None, author="doc-writer")
+            assert "doc.md" not in _show_names(path)          # nothing committed
+            assert not tm.git.has_staged_changes()            # index invariant holds
+            async with tm.guard(None):                        # and a valid retry lands
+                assert await tm.after_write(
+                    ["doc.md"], session_id=None, author="doc-writer <dw@agents>"
+                )
 
     @pytest.mark.asyncio
     async def test_open_transaction_still_groups_in_autocommit_mode(self):
@@ -1552,6 +1742,83 @@ class TestMCPAutocommitTools:
             assert "a.md" in shown and "b.md" in shown and "Update 2 files" in shown
 
     @pytest.mark.asyncio
+    async def test_batch_edit_notifies_after_the_write_lock_is_released(self):
+        """send_resource_updated feeds this session's SSE stream, so a slow
+        (not disconnected) client applies backpressure on the await. Inside the
+        guard that would hold the process-wide write lock across a client
+        round-trip and make every other writer fail 'server busy'."""
+        import hashlib
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            fs.write_file("docs/README.md", "aa")          # a registered resource
+            fs.write_file("plain.md", "bb")
+            locked_when_notified: list[bool] = []
+
+            async def record(uri):
+                locked_when_notified.append(tm.write_lock.locked())
+
+            ctx, token = self._mock_context()
+            ctx.session.send_resource_updated = AsyncMock(side_effect=record)
+            try:
+                tool = await mcp.get_tool("edit_content_batch")
+                result = await tool.run({"edit_operations": [
+                    {"file_path": "docs/README.md", "sha": hashlib.sha256(b"aa").hexdigest(),
+                     "edits": [{"old_string": "aa", "new_string": "AA"}]},
+                    {"file_path": "plain.md", "sha": hashlib.sha256(b"bb").hexdigest(),
+                     "edits": [{"old_string": "bb", "new_string": "BB"}]},
+                ]})
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            data = json.loads(str(result.content[0].text))
+            assert [r["path"] for r in data["results"]] == ["docs/README.md", "plain.md"]
+            assert data["commit"]                            # the commit still happened
+            assert locked_when_notified == [False]           # ...and the lock was free
+
+    @pytest.mark.asyncio
+    async def test_single_move_batch_uses_the_move_arrow_message(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                tool = await mcp.get_tool("move_content_batch")
+                await tool.run({"moves": [
+                    {"source_path": "README.md", "dest_path": "docs/README.md"},
+                ]})
+                assert "Move README.md -> docs/README.md" in _show_names(path)
+                fs.write_file("a.md", "a")
+                fs.write_file("b.md", "b")
+                await tool.run({"moves": [
+                    {"source_path": "a.md", "dest_path": "x.md"},
+                    {"source_path": "b.md", "dest_path": "y.md"},
+                ]})
+                assert "Move 2 files" in _show_names(path)   # batches keep the count form
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_write_with_a_malformed_author_fails_clearly_and_commits_nothing(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                tool = await mcp.get_tool("create_content")
+                with pytest.raises(ValueError, match="Invalid author"):
+                    await tool.run({
+                        "path": "new.md", "content": "hi", "author": "doc-writer",
+                    })
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            assert "new.md" not in _show_names(path)
+            assert not tm.git.has_staged_changes()
+
+    @pytest.mark.asyncio
     async def test_move_and_delete_autocommit(self):
         import hashlib
 
@@ -1645,12 +1912,11 @@ class TestMCPAutocommitTools:
     @pytest.mark.asyncio
     async def test_commit_tool_translates_a_failed_commit_into_a_clear_error(self):
         """end_transaction can raise RuntimeError when git commit itself fails
-        (e.g. a malformed author -- test_end_transaction_destroys_the_transaction_
-        even_when_commit_fails proves this is deterministically reachable, not
-        hypothetical). The MCP tool must not let that surface as an unexplained
-        raw git error: the caller must see a ValueError (never the bare
-        RuntimeError), stating plainly that the commit failed, the transaction
-        is gone, and the touched files are left dirty and unstaged."""
+        (index.lock contention, a conflicted merge, a hook rejection). The MCP
+        tool must not let that surface as an unexplained raw git error: the
+        caller must see a ValueError (never the bare RuntimeError), stating
+        plainly that the commit failed, the transaction is gone, and the
+        touched files are left dirty and unstaged."""
         with TemporaryDirectory() as tmpdir:
             path = Path(tmpdir)
             mcp, tm, fs = self._make_mcp(path)
@@ -1660,12 +1926,17 @@ class TestMCPAutocommitTools:
                 create = await mcp.get_tool("create_content")
                 await create.run({"path": "orphan.md", "content": "stuck"})
                 commit_tool = await mcp.get_tool("commit_content_transaction")
-                with pytest.raises(ValueError) as exc_info:
-                    # Malformed author makes the underlying `git commit` fail
-                    # deterministically -- the raw RuntimeError must not reach
-                    # the caller as-is: pytest.raises(ValueError) itself is the
-                    # proof it was translated rather than propagated bare.
-                    await commit_tool.run({"message": "msg", "author": "not a valid author"})
+                with (
+                    patch.object(
+                        tm.git, "commit_paths",
+                        side_effect=RuntimeError("git commit failed: boom"),
+                    ),
+                    pytest.raises(ValueError) as exc_info,
+                ):
+                    # The raw RuntimeError must not reach the caller as-is:
+                    # pytest.raises(ValueError) itself is the proof it was
+                    # translated rather than propagated bare.
+                    await commit_tool.run({"message": "msg"})
             finally:
                 from fastmcp.server.context import _current_context
                 _current_context.reset(token)

@@ -438,3 +438,44 @@ class TestRestAutocommit:
             client = TestClient(create_api(FileSystem(Path(tmp))))
             r = client.post("/api/content/x.md", json={"content": "x"})
             assert r.status_code == 201 and r.json().get("commit") is None
+
+    def test_rest_commits_even_with_autocommit_off(self):
+        """REST callers pass session_id=None, so they skip the transaction gate
+        and commit immediately even in the default STASH_GIT_AUTOCOMMIT=false
+        deployment. That is a real behavior change for existing
+        tracking=true/autocommit=false servers — whose REST writes used to
+        leave the working tree dirty — so it is pinned here rather than only
+        at manager level."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            _init_git_repo(path)
+            fs = FileSystem(path)
+            tm = TransactionManager(
+                fs, GitBackend(path), autocommit=False, author_default="Bot <bot@x>"
+            )
+            client = TestClient(create_api(fs, transaction_manager=tm))
+
+            r = client.post("/api/content/gated.md", json={"content": "G"})
+            assert r.status_code == 201 and r.json()["commit"]
+            assert "Create gated.md" in self._last_commit(path)
+
+            r = client.put("/api/content/gated.md", json={"content": "G2"})
+            assert r.status_code == 200 and r.json()["commit"]
+            assert "Update gated.md" in self._last_commit(path)
+
+            assert tm.open_transaction_count == 0        # no transaction was involved
+            assert not tm.git.has_staged_changes()       # index invariant holds
+
+    def test_rest_rejects_a_malformed_author(self):
+        """`author` is an unauthenticated query parameter; a bare name would
+        make `git commit --author` exit 128 after the file is already on disk."""
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            client = self._client(path)
+            r = client.post("/api/content/bad.md", json={"content": "B"},
+                            params={"author": "doc-writer"})
+            assert r.status_code == 500
+            assert "Invalid author" in r.json()["detail"]
+            assert "bad.md" not in self._last_commit(path)

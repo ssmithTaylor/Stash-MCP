@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from .events import CONTENT_DELETED, CONTENT_UPDATED, emit
+from .git_backend import is_valid_author
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,25 @@ _NO_ACTIVE_TRANSACTION = "No active transaction. Call start_content_transaction 
 
 class TransactionError(Exception):
     """Raised when a transaction operation is invalid."""
+
+
+def _check_author(author: str | None) -> None:
+    """Reject an *author* git would refuse, before anything irreversible runs.
+
+    ``git commit --author`` exits 128 on a bare name that matches nothing in
+    the repository's history, and that failure would otherwise surface deep in
+    the commit path — where :meth:`TransactionManager.end_transaction` destroys
+    the transaction and orphans every edit it held.
+
+    Raises:
+        TransactionError: If *author* is not of the form ``"Name <email>"``.
+    """
+    if author is None or is_valid_author(author):
+        return
+    raise TransactionError(
+        f'Invalid author {author!r}: git requires the form "Name <email>" '
+        "(for example \"doc-writer <doc-writer@agents>\"). Nothing was committed."
+    )
 
 
 def _get_current_session_id() -> str | None:
@@ -206,7 +226,11 @@ class TransactionManager:
 
         Returns the short commit hash when a commit was made, otherwise None
         (recorded in an open transaction, or nothing changed).
+
+        Raises:
+            TransactionError: If *author* is malformed, or if the commit fails.
         """
+        _check_author(author)
         clean = _clean_paths(paths)
         if not clean:
             return None
@@ -265,8 +289,6 @@ class TransactionManager:
         session_id: str,
         message: str,
         author: str | None = None,
-        sync_remote: str | None = None,
-        sync_branch: str | None = None,
     ) -> str | None:
         """Commit the transaction's touched paths and close it.
 
@@ -274,12 +296,21 @@ class TransactionManager:
         the commit body as bullets. Returns the short commit hash, or None
         when nothing changed.
 
+        Does not push: the periodic sync loop pushes whenever the branch is
+        ahead, so a push here would only add a network round-trip under the
+        write lock and a second way for a *successful* commit to be reported
+        as a failure.
+
         Raises:
-            TransactionError: If *session_id* does not own an open transaction,
-                or if that transaction was closed while this call waited for
-                the write lock.
-            RuntimeError: If the git commit or push fails.
+            TransactionError: If *author* is malformed, if *session_id* does
+                not own an open transaction, or if that transaction was closed
+                while this call waited for the write lock.
+            RuntimeError: If the git commit fails.
         """
+        # Before _acquire and before anything is torn down: a malformed author
+        # would otherwise fail inside the commit, which destroys the
+        # transaction and orphans every edit it held.
+        _check_author(author)
         txn = self._require_txn(session_id)
         await self._acquire()  # if this times out the txn stays open with its timer armed
         try:
@@ -295,8 +326,6 @@ class TransactionManager:
             commit_hash = await asyncio.to_thread(
                 self.git.commit_paths, list(txn.touched), body, author or self.author_default
             )
-            if sync_remote and sync_branch and commit_hash:
-                await asyncio.to_thread(self.git.push, sync_remote, sync_branch)
         finally:
             self._close(txn)
             self._lock.release()
@@ -371,6 +400,12 @@ class TransactionManager:
             await self._abort(txn)
         except Exception as exc:  # never let the timer task die noisily
             logger.error("Auto-abort of %s failed: %s", txn.txn_id, exc)
+            # This task *is* the timer, so _cancel_timeout skipped it and
+            # nothing else will re-arm it. Without this the transaction would
+            # stay open until its session wrote again, keeping periodic pulls
+            # paused indefinitely.
+            if self._txns.get(txn.session_id) is txn:
+                self._reset_timeout(txn)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -404,7 +439,21 @@ class TransactionManager:
             self._notify_sync(self._resume_sync, "resume")
 
     def _resolve_txn_for_wrapper_write(self) -> _Txn:
-        """Gated-mode check for the delegated write methods."""
+        """Gated-mode check for the delegated write methods.
+
+        Unlike :meth:`guard`'s gate this one does *not* understand autocommit:
+        it always demands an open transaction. Installing this wrapper as the
+        filesystem in autocommit mode would therefore make every MCP write
+        fail, so that misconfiguration is named here rather than reported as a
+        generic "No active transaction".
+        """
+        if self.autocommit:
+            raise TransactionError(
+                "Misconfigured server: the TransactionManager is installed as the "
+                "filesystem while autocommit is on. Autocommit writes must use the "
+                "raw FileSystem plus guard()/after_write() — see fs_for_mcp in "
+                "stash_mcp.main.create_app."
+            )
         if not self._txns:
             raise TransactionError(_NO_ACTIVE_TRANSACTION)
         session_id = _get_current_session_id()

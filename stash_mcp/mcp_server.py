@@ -807,14 +807,15 @@ def create_mcp_server(
                         originals[op.file_path], op.edits, op.file_path
                     )
 
-                # Phase 3: write all files and send notifications
+                # Phase 3: write all files, collecting what to notify about.
+                # Notifications are deliberately deferred until the guard has
+                # closed (see below).
                 results = []
+                updated_uris: list[AnyUrl] = []
                 for op in edit_operations:
                     filesystem.write_file(op.file_path, new_contents[op.file_path])
                     if _is_resource_file(op.file_path):
-                        uri = AnyUrl(f"stash://{op.file_path}")
-                        await ctx.session.send_resource_updated(uri=uri)
-                    emit(CONTENT_UPDATED, op.file_path)
+                        updated_uris.append(AnyUrl(f"stash://{op.file_path}"))
                     logger.info(f"Edited: {op.file_path}")
                     new_sha = hashlib.sha256(new_contents[op.file_path].encode("utf-8")).hexdigest()
                     results.append({"path": op.file_path, "result": "ok", "new_sha": new_sha})
@@ -826,6 +827,15 @@ def create_mcp_server(
                     author,
                     default_commit_message([op.file_path for op in edit_operations]),
                 )
+
+            # send_resource_updated writes to this session's SSE stream, so a
+            # slow (not disconnected) client applies backpressure here. Doing
+            # it inside the guard would hold the process-wide write lock
+            # across a client round-trip and stall every other writer.
+            for uri in updated_uris:
+                await ctx.session.send_resource_updated(uri=uri)
+            for op in edit_operations:
+                emit(CONTENT_UPDATED, op.file_path)
 
             return {"results": results, "commit": commit}
 
@@ -1459,12 +1469,19 @@ def create_mcp_server(
                         "result": "ok",
                     })
 
+                # A one-move batch reads as a plain move, so it gets the same
+                # "Move <src> -> <dst>" subject move_content produces.
+                default_message = (
+                    f"Move {moves[0].source_path} -> {moves[0].dest_path}"
+                    if len(moves) == 1
+                    else default_commit_message([m.dest_path for m in moves], "Move")
+                )
                 commit = await _after_write(
                     ctx,
                     [p for m in moves for p in (m.source_path, m.dest_path)],
                     commit_message,
                     author,
-                    default_commit_message([m.dest_path for m in moves], "Move"),
+                    default_message,
                 )
 
             if resources_changed:
@@ -1741,9 +1758,9 @@ def create_mcp_server(
 
             Per-write commit_message values passed to individual write calls
             during the transaction are appended to this commit's body as
-            bullets. When GIT_SYNC_ENABLED is true, also pushes to the
-            configured remote. Releases the transaction lock so other
-            sessions may proceed.
+            bullets. When GIT_SYNC_ENABLED is true the commit is pushed to the
+            configured remote by the periodic sync task, not by this call.
+            Releases the transaction lock so other sessions may proceed.
 
             Args:
                 message: Commit message describing the changes
@@ -1753,12 +1770,8 @@ def create_mcp_server(
                 Confirmation string, including the commit hash when one was made
             """
             session_id = str(id(ctx.session))
-            sync_remote = Config.GIT_SYNC_REMOTE if Config.GIT_SYNC_ENABLED else None
-            sync_branch = Config.GIT_SYNC_BRANCH if Config.GIT_SYNC_ENABLED else None
             try:
-                commit = await tm.end_transaction(
-                    session_id, message, author, sync_remote, sync_branch
-                )
+                commit = await tm.end_transaction(session_id, message, author)
             except TransactionError as exc:
                 raise ValueError(str(exc))
             except RuntimeError as exc:
