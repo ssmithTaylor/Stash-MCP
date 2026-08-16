@@ -150,3 +150,78 @@ class TestMergeFrontmatter:
     def test_bom_preserved(self):
         new, _ = merge_frontmatter("\ufeff# T\n", {"a": "1"})
         assert new.startswith("\ufeff---\n")
+
+
+class TestMergeFrontmatterSurgicalEdits:
+    """merge_frontmatter must touch only the lines of keys it sets/unsets."""
+
+    def test_comments_survive_an_unrelated_set(self):
+        content = (
+            "---\n"
+            "# TODO: re-verify this quarterly\n"
+            "verified: 2026-01-01\n"
+            "owner: taylor  # primary owner\n"
+            "---\n"
+            "body\n"
+        )
+        new, _ = merge_frontmatter(content, {"layer": "core"})
+        block = split_frontmatter_block(new)[0]
+        assert "# TODO: re-verify this quarterly" in block
+        assert "owner: taylor  # primary owner" in block
+        assert "verified: 2026-01-01" in block
+        assert "layer: core" in block
+        # Every original line is untouched; only a new line was appended.
+        old_block = split_frontmatter_block(content)[0]
+        for line in old_block.splitlines():
+            assert line in block
+
+    def test_set_matches_on_disk_key_regardless_of_case_no_duplicate(self):
+        content = "---\nLayer: frogpilot\ndescribes: x\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"layer": "moretore"})
+        block = split_frontmatter_block(new)[0]
+        assert block.count("\n") == 1  # still exactly two lines -> one \n between them
+        assert "Layer: moretore" in block  # on-disk spelling kept, value updated in place
+        assert "frogpilot" not in block
+        assert "layer:" not in block  # no second, normalized-form duplicate
+        assert meta == {"layer": "moretore", "describes": "x"}
+
+    def test_unset_matches_normalized_on_disk_key(self):
+        content = "---\nLayer: frogpilot\ndescribes: x\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {}, ["layer"])
+        block = split_frontmatter_block(new)[0]
+        assert "layer" not in block.lower()
+        assert "describes: x" in block
+        assert meta == {"describes": "x"}
+
+    def test_set_then_unset_leaves_no_trace_of_either_casing(self):
+        content = "---\nLayer: frogpilot\ndescribes: x\n---\nbody\n"
+        updated, _ = merge_frontmatter(content, {"layer": "moretore"})
+        final, meta = merge_frontmatter(updated, {}, ["layer"])
+        block = split_frontmatter_block(final)[0]
+        assert "layer" not in block.lower()
+        assert "moretore" not in block
+        assert "frogpilot" not in block
+        assert meta == {"describes": "x"}
+
+    def test_flow_style_list_unchanged_by_unrelated_set(self):
+        content = "---\ntags: [a, b]\nowner: me\n---\nbody\n"
+        new, _ = merge_frontmatter(content, {"owner": "you"})
+        block = split_frontmatter_block(new)[0]
+        assert "tags: [a, b]" in block
+
+    def test_multiline_block_list_survives_unrelated_set(self):
+        content = "---\ntags:\n  - a\n  - b\nowner: me\n---\nbody\n"
+        new, _ = merge_frontmatter(content, {"owner": "you"})
+        block = split_frontmatter_block(new)[0]
+        assert "tags:\n  - a\n  - b" in block
+        assert "owner: you" in block
+
+    def test_merge_key_document_falls_back_instead_of_lying(self):
+        # `shared` only exists via the `<<: *b` anchor merge, not as its own
+        # top-level entry -- surgical span-matching can't remove it, so this
+        # must fall back rather than report success while leaving it in place.
+        content = "---\nbase: &b\n  shared: 1\nlayer: fm\n<<: *b\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {}, ["shared"])
+        reparsed, _ = extract_metadata(new)
+        assert "shared" not in reparsed
+        assert meta == reparsed
