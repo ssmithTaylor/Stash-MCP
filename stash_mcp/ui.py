@@ -9,6 +9,7 @@ import json as _json
 import logging
 import posixpath
 import re
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
@@ -21,6 +22,7 @@ from .events import CONTENT_CREATED, CONTENT_DELETED, CONTENT_MOVED, CONTENT_UPD
 from .filesystem import FileNotFoundError as FSFileNotFoundError
 from .filesystem import FileSystem, InvalidPathError
 from .mcp_server import MIME_TYPES
+from .transactions import TransactionManager
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -2075,6 +2077,7 @@ def create_ui_router(
     filesystem: FileSystem,
     search_engine=None,
     read_only: bool = False,
+    transaction_manager: TransactionManager | None = None,
 ) -> APIRouter:
     """Create UI router with content browser & editor.
 
@@ -2083,12 +2086,32 @@ def create_ui_router(
         search_engine: Optional SearchEngine for vector search
         read_only: When True, editing UI elements are hidden and write
             endpoints return HTTP 403.
+        transaction_manager: Optional TransactionManager. When given, save/
+            move/delete routes take its write lock and autocommit through it
+            (a UI write is never part of a transaction, so it always passes
+            session_id=None and commits immediately, even in gated mode);
+            when None, those routes behave exactly as before (no locking,
+            no commits).
 
     Returns:
         FastAPI router for UI
     """
     _search_enabled = search_engine is not None
     router = APIRouter()
+
+    tm = transaction_manager
+
+    @asynccontextmanager
+    async def _write_guard():
+        if tm is None:
+            yield
+            return
+        async with tm.guard(None):
+            yield
+
+    async def _after_write(paths: list[str], default_message: str) -> None:
+        if tm is not None:
+            await tm.after_write(paths, session_id=None, default_message=default_message)
 
     # --- redirect /ui to /ui/browse/ ---
     @router.get("/ui", response_class=RedirectResponse)
@@ -2605,8 +2628,10 @@ def create_ui_router(
             return Response(content="This Stash-MCP instance is read-only. Set STASH_READ_ONLY=false to enable editing.", status_code=403)
         path = path.strip("/")
         try:
-            is_new = not filesystem.file_exists(path)
-            filesystem.write_file(path, content)
+            async with _write_guard():
+                is_new = not filesystem.file_exists(path)
+                filesystem.write_file(path, content)
+                await _after_write([path], f"UI: save {path}")
             emit(CONTENT_CREATED if is_new else CONTENT_UPDATED, path)
         except Exception as exc:
             logger.error(f"UI save error: {exc}")
@@ -2623,7 +2648,9 @@ def create_ui_router(
         path = path.strip("/")
         destination = destination.strip("/")
         try:
-            filesystem.move_file(path, destination)
+            async with _write_guard():
+                filesystem.move_file(path, destination)
+                await _after_write([path, destination], f"UI: move {path} -> {destination}")
             emit(CONTENT_MOVED, destination, source_path=path)
         except Exception as exc:
             logger.error(f"UI move error: {exc}")
@@ -2641,7 +2668,9 @@ def create_ui_router(
         if parent == ".":
             parent = ""
         try:
-            filesystem.delete_file(path)
+            async with _write_guard():
+                filesystem.delete_file(path)
+                await _after_write([path], f"UI: delete {path}")
             emit(CONTENT_DELETED, path)
         except Exception as exc:
             logger.error(f"UI delete error: {exc}")
