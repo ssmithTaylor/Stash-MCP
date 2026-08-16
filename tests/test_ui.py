@@ -278,6 +278,73 @@ class TestUIMarkdown:
         assert "README</h1>" in body
         assert "Some content here." in body
 
+    def test_frontmatter_rendered_as_metadata_card(self, ui_client):
+        # write via the REST API so the fixture's filesystem is used
+        ui_client.put("/api/content/meta.md", json={
+            "content": "---\nlayer: frogpilot\nverified: 2026-08-16\n---\n# Doc\n\nBody text",
+        })
+        response = ui_client.get("/ui/browse/meta.md")
+        html_text = response.text
+        assert 'class="doc-meta"' in html_text
+        assert "<th>layer</th><td>frogpilot</td>" in html_text
+        # the raw YAML must not leak into the rendered body
+        assert "layer: frogpilot" not in html_text
+        assert "<h1" in html_text and "Body text" in html_text
+
+    def test_no_frontmatter_no_card(self, ui_client):
+        response = ui_client.get("/ui/browse/hello.md")
+        assert 'class="doc-meta"' not in response.text
+
+    def test_frontmatter_key_and_value_are_html_escaped(self, ui_client):
+        """Metadata card must not be an HTML/attribute injection vector."""
+        ui_client.put("/api/content/danger.md", json={
+            "content": (
+                '---\n'
+                '"<b>xss</b>": "<script>alert(1)</script>"\n'
+                'commit: \'a" onmouseover="x\'\n'
+                '---\n'
+                '# Doc\n'
+            ),
+        })
+        response = ui_client.get("/ui/browse/danger.md")
+        html_text = response.text
+        # neither the raw tag nor the raw attribute-breakout string appears
+        assert "<script>alert(1)</script>" not in html_text
+        assert "<b>xss</b>" not in html_text
+        assert 'a" onmouseover="x' not in html_text
+        # the escaped forms are present, for both a key and a value
+        assert "&lt;b&gt;xss&lt;/b&gt;" in html_text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_text
+        assert "a&quot; onmouseover=&quot;x" in html_text
+
+    def test_frontmatter_only_document_renders_without_error(self, ui_client):
+        """A document that is only frontmatter (no body) must not break the page."""
+        ui_client.put("/api/content/onlymeta.md", json={
+            "content": "---\nlayer: frogpilot\n---\n",
+        })
+        response = ui_client.get("/ui/browse/onlymeta.md")
+        assert response.status_code == 200
+        assert 'class="doc-meta"' in response.text
+        assert "<th>layer</th><td>frogpilot</td>" in response.text
+
+    def test_leading_blockquote_metadata_card_and_blockquote_both_render(self, ui_client):
+        """Blockquote-derived fields populate the card; the blockquote itself stays
+        in the rendered body (only the YAML frontmatter block is stripped)."""
+        ui_client.put("/api/content/quoted.md", json={
+            "content": (
+                "# Doc Title\n\n"
+                "> describes: something | commit: abc123\n\n"
+                "Body prose here.\n"
+            ),
+        })
+        response = ui_client.get("/ui/browse/quoted.md")
+        html_text = response.text
+        assert "<th>describes</th><td>something</td>" in html_text
+        assert "<th>commit</th><td>abc123</td>" in html_text
+        assert "<blockquote>" in html_text
+        assert "describes: something" in html_text
+        assert "Body prose here." in html_text
+
 
 _SAMPLE_OPENAPI = """{
   "openapi": "3.0.0",

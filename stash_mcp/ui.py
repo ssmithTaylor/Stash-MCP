@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from .events import CONTENT_CREATED, CONTENT_DELETED, CONTENT_MOVED, CONTENT_UPDATED, emit
 from .filesystem import FileNotFoundError as FSFileNotFoundError
 from .filesystem import FileSystem, InvalidPathError
+from .frontmatter import extract_metadata
 from .mcp_server import MIME_TYPES
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -1098,6 +1099,17 @@ def _render_markdown(
     return rendered, getattr(converter, "toc", "")
 
 
+def _render_frontmatter_card(meta: dict[str, str]) -> str:
+    """Render document frontmatter as a compact key/value table (or "")."""
+    if not meta:
+        return ""
+    rows = "".join(
+        f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>"
+        for k, v in meta.items()
+    )
+    return f'<table class="doc-meta">{rows}</table>'
+
+
 _RELATIVE_URL_RE = re.compile(
     r'(<(?:img|source|video|audio|iframe)\b[^>]*?\b(?:src)='
     r'["\'])(?!https?://|data:|/|#)'
@@ -1362,6 +1374,10 @@ border-bottom:1px solid #313244;font-weight:500}
 /* viewer - typography for comfortable reading */
 .viewer-content{background:transparent;padding:24px 32px;border-radius:6px;overflow-x:auto;
 font-size:18px;line-height:1.6;color:#cdd6f4;margin-top:12px;flex:1;width:100%}
+.doc-meta{border-collapse:collapse;font-size:13px;margin:0 0 20px;color:#a6adc8}
+.doc-meta th{text-align:left;font-weight:600;color:#7f849c;padding:2px 14px 2px 0;
+white-space:nowrap;vertical-align:top}
+.doc-meta td{padding:2px 0}
 .viewer-content pre{font-family:'Monaco','Menlo','Ubuntu Mono',monospace;
 white-space:pre-wrap;word-wrap:break-word;margin:0}
 .viewer-content h1{color:#e0e4f0;font-size:28px;margin-bottom:1.5rem;margin-top:0}
@@ -2263,10 +2279,12 @@ def create_ui_router(
                 base_dir = str(PurePosixPath(path).parent)
                 if base_dir == ".":
                     base_dir = ""
-                rendered, toc_html = _render_markdown(content, filesystem, base_dir)
+                fm_meta, md_body = extract_metadata(content)
+                rendered, toc_html = _render_markdown(md_body, filesystem, base_dir)
                 rendered = _rewrite_relative_urls(rendered, base_dir)
                 center = (
-                    f'<div class="viewer-content markdown-body">{rendered}</div>'
+                    f'<div class="viewer-content markdown-body">'
+                    f'{_render_frontmatter_card(fm_meta)}{rendered}</div>'
                 )
             elif suffix == ".json":
                 oas_rendered = False
