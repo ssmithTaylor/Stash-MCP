@@ -1859,6 +1859,50 @@ async def test_find_content_invalid_path_prefix(temp_fs):
         await tool.run({"pattern": "x", "path_prefix": "../escape"})
 
 
+@pytest.mark.anyio
+async def test_find_content_exclude_patterns(temp_fs):
+    """exclude_patterns skips matching paths."""
+    temp_fs.write_file("_reports/scan.md", "needle here")
+    temp_fs.write_file("docs/keep.md", "needle here")
+    mcp = create_mcp_server(temp_fs)
+    tool = await mcp.get_tool("find_content")
+    data = _find_data(await tool.run({
+        "pattern": "needle", "exclude_patterns": "**/_reports/**",
+    }))
+    paths = {m["file_path"] for m in data["matches"]}
+    assert paths == {"docs/keep.md"}
+
+
+@pytest.mark.anyio
+async def test_find_content_exclude_patterns_empty_string(temp_fs):
+    """Empty exclude_patterns string means no exclusions."""
+    temp_fs.write_file("_reports/scan.md", "needle here")
+    temp_fs.write_file("docs/keep.md", "needle here")
+    mcp = create_mcp_server(temp_fs)
+    tool = await mcp.get_tool("find_content")
+    data = _find_data(await tool.run({
+        "pattern": "needle", "exclude_patterns": "",
+    }))
+    paths = {m["file_path"] for m in data["matches"]}
+    assert paths == {"_reports/scan.md", "docs/keep.md"}
+
+
+@pytest.mark.anyio
+async def test_find_content_exclude_patterns_multiple(temp_fs):
+    """Multiple exclude_patterns separated by comma."""
+    temp_fs.write_file("_reports/scan.md", "needle here")
+    temp_fs.write_file("logs/app.log", "needle here")
+    temp_fs.write_file("docs/keep.md", "needle here")
+    mcp = create_mcp_server(temp_fs)
+    tool = await mcp.get_tool("find_content")
+    data = _find_data(await tool.run({
+        "pattern": "needle",
+        "exclude_patterns": "**/_reports/**, **/logs/**",
+    }))
+    paths = {m["file_path"] for m in data["matches"]}
+    assert paths == {"docs/keep.md"}
+
+
 def test_get_description_skips_frontmatter_blockquote_and_comments(temp_fs):
     temp_fs.write_file(
         "README.md",

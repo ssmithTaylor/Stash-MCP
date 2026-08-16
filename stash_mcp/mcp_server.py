@@ -1079,6 +1079,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
         file_types: str | None = None,
         path_prefix: str | None = None,
         context_lines: int = 0,
+        exclude_patterns: str | None = None,
     ) -> dict:
         """Find every line matching a literal string or regex.
 
@@ -1101,6 +1102,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 (e.g. "docs/" restricts to that subtree).
             context_lines: Lines of context to include before and after
                 each match. Default 0, max 10.
+            exclude_patterns: Optional comma-separated globs to skip (e.g. "**/_reports/**");
+                the search tool's default exclusions do not apply here —
+                find_content is exhaustive unless you exclude explicitly.
         Returns:
             A dict with 'matches' (list of {file_path, line_number, line,
             context_before, context_after}), 'truncated' (bool), and
@@ -1132,6 +1136,13 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
         if file_types:
             types_list = [t.strip() for t in file_types.split(",") if t.strip()]
 
+        exclude_res = []
+        if exclude_patterns:
+            exclude_res = [
+                glob_to_regex(normalize_glob(p))
+                for p in exclude_patterns.split(",") if p.strip()
+            ]
+
         try:
             all_files = await asyncio.to_thread(
                 filesystem.list_all_files, path_prefix or ""
@@ -1145,6 +1156,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
 
         for fp in all_files:
             if not _is_searchable(fp):
+                continue
+            if exclude_res and any(rx.match(fp) for rx in exclude_res):
                 continue
             if types_list and not any(fp.endswith(ext) for ext in types_list):
                 continue
