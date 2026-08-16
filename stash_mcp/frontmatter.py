@@ -30,6 +30,28 @@ def _stringify(value: object) -> str:
     return str(value)
 
 
+def split_frontmatter_block(text: str) -> tuple[str, str] | None:
+    """Return (raw_yaml_block, body) when *text* starts with a well-formed block, else None."""
+    if not text.startswith("---"):
+        return None
+    first_nl = text.find("\n")
+    if first_nl == -1 or text[:first_nl].strip() != "---":
+        return None
+    lines = text.split("\n")
+    for i in range(1, len(lines)):
+        if _FM_TERMINATOR_RE.match(lines[i]):
+            return "\n".join(lines[1:i]), "\n".join(lines[i + 1:])
+    return None
+
+
+def _scalars(data: dict) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in data.items():
+        if isinstance(value, _SCALAR_TYPES) and value is not None:
+            out[normalize_key(str(key))] = _stringify(value)
+    return out
+
+
 def parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
     """Return ``(metadata, body)`` for a document with optional YAML frontmatter.
 
@@ -39,20 +61,10 @@ def parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
     missing terminator means "no frontmatter": ``({}, content)``.
     """
     text = content[1:] if content.startswith("﻿") else content
-    if not text.startswith("---"):
+    split = split_frontmatter_block(text)
+    if split is None:
         return {}, content
-    first_nl = text.find("\n")
-    if first_nl == -1 or text[:first_nl].strip() != "---":
-        return {}, content
-    lines = text.split("\n")
-    end_idx = None
-    for i in range(1, len(lines)):
-        if _FM_TERMINATOR_RE.match(lines[i]):
-            end_idx = i
-            break
-    if end_idx is None:
-        return {}, content
-    raw_block = "\n".join(lines[1:end_idx])
+    raw_block, body = split
     try:
         data = yaml.safe_load(raw_block)
     except yaml.YAMLError as exc:
@@ -60,12 +72,40 @@ def parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
         return {}, content
     if not isinstance(data, dict):
         return {}, content
-    metadata: dict[str, str] = {}
-    for key, value in data.items():
-        if isinstance(value, _SCALAR_TYPES) and value is not None:
-            metadata[normalize_key(str(key))] = _stringify(value)
-    body = "\n".join(lines[end_idx + 1:])
-    return metadata, body
+    return _scalars(data), body
+
+
+def merge_frontmatter(
+    content: str, set_values: dict[str, str], unset_keys: list[str] | tuple[str, ...] = (),
+) -> tuple[str, dict[str, str]]:
+    """Merge *set_values* / remove *unset_keys* in the frontmatter.
+
+    Returns (new_content, metadata).
+    """
+    bom = "\ufeff" if content.startswith("\ufeff") else ""
+    text = content[len(bom):]
+    data: dict = {}
+    body = text
+    split = split_frontmatter_block(text)
+    if split is not None:
+        raw_block, body = split
+        try:
+            loaded = yaml.safe_load(raw_block) if raw_block.strip() else {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"frontmatter is not valid YAML: {exc}") from exc
+        if loaded is None:
+            loaded = {}
+        if not isinstance(loaded, dict):
+            raise ValueError("frontmatter is not a mapping")
+        data = dict(loaded)
+    for key in unset_keys:
+        data.pop(key, None)
+    for key, value in set_values.items():
+        data[key] = value
+    if not data:
+        return bom + body, {}
+    dumped = yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
+    return f"{bom}---\n{dumped}---\n{body}", _scalars(data)
 
 
 def parse_leading_blockquote(body: str) -> dict[str, str]:

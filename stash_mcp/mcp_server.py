@@ -27,7 +27,7 @@ from .filesystem import (
     glob_to_regex,
     normalize_glob,
 )
-from .frontmatter import extract_metadata
+from .frontmatter import extract_metadata, merge_frontmatter
 from .headings import scan_headings
 from .metrics import get_metrics
 from .search import reject_path_traversal
@@ -751,6 +751,68 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             logger.info(f"Deleted: {path}")
             return f"Deleted: {path}"
 
+        @_write_tool(
+            annotations=ToolAnnotations(
+                title="Update document metadata",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            )
+        )
+        async def update_metadata(
+            path: ContentPath,
+            values: Annotated[
+                dict[str, str],
+                Field(description="Frontmatter keys to set (values are written as strings)"),
+            ],
+            ctx: Context,
+            unset: Annotated[
+                list[str], Field(description="Frontmatter keys to remove"),
+            ] = [],
+            sha: Annotated[
+                str | None,
+                Field(description="Optional SHA-256 of the current full content; omit for a "
+                      "merge that only requires the frontmatter to be valid YAML"),
+            ] = None,
+        ) -> dict:
+            """Set or remove keys in a file's YAML frontmatter without touching the body.
+
+            Creates the frontmatter block when the file has none, preserves the
+            other keys and their order, and leaves the body byte-for-byte
+            unchanged. Use this for provenance/freshness fields (verified,
+            review_every, owner, describes, layer, status, stale_anchors)
+            instead of string-editing the YAML.
+
+            Args:
+                path: File path relative to content root
+                values: Keys to set
+                unset: Keys to remove
+                sha: Optional current content sha (as returned by read_content)
+            Returns:
+                A dict with 'path', 'metadata' (the resulting scalar metadata)
+                and 'new_sha'
+            """
+            if not values and not unset:
+                raise ValueError("Provide at least one key in values or unset.")
+            current = filesystem.read_file(path)
+            if sha is not None:
+                current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
+                if sha != current_sha:
+                    raise ValueError(
+                        f"SHA mismatch for '{path}': expected {current_sha}, got {sha}. "
+                        "The file may have changed since it was last read."
+                    )
+            new_content, metadata = merge_frontmatter(current, values, unset)
+            filesystem.write_file(path, new_content)
+            if _is_resource_file(path):
+                uri = AnyUrl(f"stash://{path}")
+                await ctx.session.send_resource_updated(uri=uri)
+            emit(CONTENT_UPDATED, path)
+            logger.info(f"Metadata updated: {path}")
+            new_sha = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
+            return {"path": path, "metadata": metadata, "new_sha": new_sha}
+
     # --- Read-only tools (always registered) ---
 
     @mcp.tool(
@@ -777,12 +839,14 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 point, call again without max_lines.
         Returns:
             A dict with 'content' (file text), 'sha' (SHA-256 hex digest of
-            the FULL file, even when truncated), 'truncated' (bool), and
-            'total_lines' (line count of the full file)
+            the FULL file, even when truncated), 'truncated' (bool),
+            'total_lines' (line count of the full file), and 'metadata'
+            (frontmatter/blockquote key-values)
         """
         content = await asyncio.to_thread(filesystem.read_file, path)
         sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
         total_lines = _count_lines(content)
+        metadata = extract_metadata(content)[0]
         truncated = False
         if max_lines is not None:
             if max_lines < 1:
@@ -793,6 +857,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             "sha": sha,
             "truncated": truncated,
             "total_lines": total_lines,
+            "metadata": metadata,
         }
 
     @mcp.tool(
@@ -824,8 +889,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 beginning of each file. If omitted, returns full content.
         Returns:
             A dict with 'results' list, each containing 'path', 'content',
-            'sha', 'truncated', 'total_lines', and 'error' (null on success;
-            per-file failures set 'error' without failing the whole call)
+            'sha', 'truncated', 'total_lines', 'metadata' (frontmatter/blockquote
+            key-values; null on error), and 'error' (null on success; per-file
+            failures set 'error' without failing the whole call)
         """
         if not paths:
             raise ValueError("At least one path is required.")
@@ -842,19 +908,20 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 content = await asyncio.to_thread(filesystem.read_file, path)
                 sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 total_lines = _count_lines(content)
+                metadata = extract_metadata(content)[0]
                 truncated = False
                 if max_lines is not None:
                     content, truncated = _truncate_lines(content, max_lines)
                 results.append({
                     "path": path, "content": content, "sha": sha,
                     "truncated": truncated, "total_lines": total_lines,
-                    "error": None,
+                    "metadata": metadata, "error": None,
                 })
             except (FileNotFoundError, InvalidPathError) as exc:
                 results.append({
                     "path": path, "content": None, "sha": None,
                     "truncated": False, "total_lines": None,
-                    "error": str(exc),
+                    "metadata": None, "error": str(exc),
                 })
         return {"results": results}
 
@@ -977,8 +1044,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
         Args:
             path: File path relative to content root (must be a .md or .markdown file)
         Returns:
-            A dict with 'path', 'title' (first h1 if present), and 'sections'
-            (nested list of {heading, level, line_number, children} entries)
+            A dict with 'path', 'title' (first h1 if present), 'sections'
+            (nested list of {heading, level, line_number, children} entries),
+            and 'metadata' (frontmatter/blockquote key-values)
         """
         suffix = PurePosixPath(path).suffix.lower()
         if suffix not in {".md", ".markdown"}:
@@ -992,7 +1060,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             if heading["level"] == 1:
                 title = heading["heading"]
                 break
-        return {"path": path, "title": title, "sections": sections}
+        metadata = extract_metadata(content)[0]
+        return {"path": path, "title": title, "sections": sections, "metadata": metadata}
 
     @mcp.tool(
         annotations=ToolAnnotations(
@@ -1022,7 +1091,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             paths: List of markdown file paths relative to content root (max 10)
         Returns:
             A dict with 'results' list, each containing the path, title, sections
-            (nested {heading, level, line_number, children} entries), and error
+            (nested {heading, level, line_number, children} entries), metadata
+            (frontmatter/blockquote key-values; null on error), and error
             (null on success; per-file failures set 'error' without failing
             the whole call)
         """
@@ -1049,10 +1119,12 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                     if s["level"] == 1:
                         title = s["heading"]
                         break
+                metadata = extract_metadata(content)[0]
                 results.append({
                     "path": path,
                     "title": title,
                     "sections": sections,
+                    "metadata": metadata,
                     "error": None,
                 })
             except (FileNotFoundError, InvalidPathError, ValueError) as exc:
@@ -1060,6 +1132,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                     "path": path,
                     "title": None,
                     "sections": None,
+                    "metadata": None,
                     "error": str(exc),
                 })
         return {"results": results}

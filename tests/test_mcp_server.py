@@ -1663,6 +1663,34 @@ async def test_inspect_content_structure_batch_all_missing(temp_fs):
         assert r["error"] is not None
 
 
+# --- update_metadata tests ---
+
+
+async def test_update_metadata_tool_and_read_metadata(mcp_server, temp_fs, mock_context):
+    temp_fs.write_file("docs/x.md", "# X\n\nbody\n")
+    update = await mcp_server.get_tool("update_metadata")
+    data = json.loads(str((await update.run({
+        "path": "docs/x.md", "values": {"verified": "2026-08-16", "layer": "a"},
+    })).content[0].text))
+    assert data["metadata"] == {"verified": "2026-08-16", "layer": "a"}
+    read = await mcp_server.get_tool("read_content")
+    got = json.loads(str((await read.run({"path": "docs/x.md"})).content[0].text))
+    assert got["metadata"] == {"verified": "2026-08-16", "layer": "a"}
+    assert got["sha"] == data["new_sha"]
+    assert got["content"].endswith("# X\n\nbody\n")
+
+    data2 = json.loads(str((await update.run({
+        "path": "docs/x.md", "values": {}, "unset": ["layer"], "sha": data["new_sha"],
+    })).content[0].text))
+    assert data2["metadata"] == {"verified": "2026-08-16"}
+    with pytest.raises(ValueError, match="SHA mismatch"):
+        await update.run({"path": "docs/x.md", "values": {"k": "v"}, "sha": "stale"})
+
+    inspect = await mcp_server.get_tool("inspect_content_structure")
+    info = json.loads(str((await inspect.run({"path": "docs/x.md"})).content[0].text))
+    assert info["metadata"] == {"verified": "2026-08-16"} and info["title"] == "X"
+
+
 # --- find_content tests ---
 
 

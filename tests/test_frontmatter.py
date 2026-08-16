@@ -2,9 +2,11 @@
 
 from stash_mcp.frontmatter import (
     extract_metadata,
+    merge_frontmatter,
     normalize_key,
     parse_frontmatter,
     parse_leading_blockquote,
+    split_frontmatter_block,
 )
 
 
@@ -115,3 +117,36 @@ class TestExtractMetadata:
     def test_normalize_key(self):
         assert normalize_key("  Describes Ref ") == "describes_ref"
         assert normalize_key("last-verified") == "last_verified"
+
+
+class TestMergeFrontmatter:
+    def test_creates_block_when_missing(self):
+        new, meta = merge_frontmatter("# T\n\nbody\n", {"verified": "2026-08-16"})
+        assert new.startswith("---\nverified: '2026-08-16'\n---\n# T\n\nbody\n") or \
+               new.startswith("---\nverified: 2026-08-16\n---\n# T\n\nbody\n")
+        assert meta == {"verified": "2026-08-16"}
+
+    def test_merges_preserving_order_and_body(self):
+        content = "---\nlayer: fm\ntags: [a, b]\nowner: me\n---\n# T\n> quote\nbody\n"
+        new, meta = merge_frontmatter(
+            content, {"owner": "you", "verified": "2026-01-01"}, ["layer"]
+        )
+        assert new.endswith("---\n# T\n> quote\nbody\n")
+        block = split_frontmatter_block(new)[0]
+        assert block.index("tags") < block.index("owner") < block.index("verified")
+        assert "layer" not in block
+        assert meta == {"owner": "you", "verified": "2026-01-01"}   # tags (list) not a scalar
+
+    def test_removes_block_when_empty(self):
+        new, meta = merge_frontmatter("---\nlayer: x\n---\nbody", {}, ["layer"])
+        assert new == "body" and meta == {}
+
+    def test_invalid_yaml_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError):
+            merge_frontmatter("---\nkey: [unclosed\n---\nbody", {"a": "b"})
+
+    def test_bom_preserved(self):
+        new, _ = merge_frontmatter("\ufeff# T\n", {"a": "1"})
+        assert new.startswith("\ufeff---\n")
