@@ -21,6 +21,7 @@ from pydantic import AnyUrl, BaseModel, Field
 from .config import Config
 from .events import CONTENT_CREATED, CONTENT_DELETED, CONTENT_MOVED, CONTENT_UPDATED, emit
 from .filesystem import FileNotFoundError, FileSystem, InvalidPathError
+from .headings import scan_headings
 from .metrics import get_metrics
 from .transactions import TransactionError, TransactionManager
 
@@ -290,10 +291,6 @@ def _apply_edits(content: str, edits: list[EditOperation], path: str) -> str:
     return content
 
 
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
-_FENCE_RE = re.compile(r"^```")
-
-
 def _build_heading_tree(flat: list[dict]) -> list[dict]:
     """Convert a flat list of headings into a nested tree."""
     root: list[dict] = []
@@ -315,26 +312,10 @@ def _build_heading_tree(flat: list[dict]) -> list[dict]:
 
 def parse_markdown_structure(content: str) -> list[dict]:
     """Parse markdown content and return a nested heading structure."""
-    in_code_block = False
-    flat_headings: list[dict] = []
-
-    for line_num, line in enumerate(content.splitlines(), start=1):
-        if _FENCE_RE.match(line.strip()):
-            in_code_block = not in_code_block
-            continue
-        if in_code_block:
-            continue
-        match = _HEADING_RE.match(line.strip())
-        if match:
-            level = len(match.group(1))
-            text = match.group(2).strip()
-            flat_headings.append({
-                "heading": text,
-                "level": level,
-                "line_number": line_num,
-                "children": [],
-            })
-
+    flat_headings = [
+        {"heading": h.text, "level": h.level, "line_number": h.line, "children": []}
+        for h in scan_headings(content)
+    ]
     return _build_heading_tree(flat_headings)
 
 

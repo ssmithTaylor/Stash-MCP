@@ -15,11 +15,17 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .filesystem import glob_to_regex
+from .frontmatter import extract_metadata
+from .headings import heading_path_at, scan_headings
 
 logger = logging.getLogger(__name__)
 
 # Maximum characters to pass to contextual retrieval model (~200k tokens ≈ 150k chars)
 MAX_CONTEXTUAL_DOCUMENT_CHARS = 150_000
+
+# Bump when the per-chunk metadata layout changes; a mismatch clears the
+# index on startup so build_index re-embeds and repopulates every chunk.
+INDEX_SCHEMA_VERSION = 1
 
 
 def _normalize_path(path: str) -> str:
@@ -47,6 +53,8 @@ class ChunkMetadata:
     content: str
     context: str | None = None
     content_hash: str = ""
+    metadata: dict[str, str] = field(default_factory=dict)
+    heading_path: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -61,6 +69,8 @@ class SearchResult:
     last_changed_at: str | None = None
     changed_by: str | None = None
     commit_message: str | None = None
+    metadata: dict[str, str] = field(default_factory=dict)
+    heading_path: list[str] = field(default_factory=list)
 
 
 def _normalize_exclude_pattern(pattern: str) -> str:
@@ -753,11 +763,30 @@ def _rrf_fuse(
     return [{**meta_by_id[key], "score": s} for key, s in fused]
 
 
-def _chunk_text_sliding_window(
+def _chunk_text_sliding_window_with_offsets(
     text: str,
     chunk_size: int = 1000,
     chunk_overlap: int = 100,
-) -> list[str]:
+) -> list[tuple[str, int]]:
+    """Sliding-window chunks with the start offset of each chunk in ``text.strip()``."""
+    if not text or not text.strip():
+        return []
+    text = text.strip()
+    if len(text) <= chunk_size:
+        return [(text, 0)]
+    pairs: list[tuple[str, int]] = []
+    start = 0
+    while start < len(text):
+        raw = text[start:start + chunk_size]
+        lead = len(raw) - len(raw.lstrip())
+        chunk = raw.strip()
+        if chunk:
+            pairs.append((chunk, start + lead))
+        start += chunk_size - chunk_overlap
+    return pairs
+
+
+def _chunk_text_sliding_window(text, chunk_size=1000, chunk_overlap=100) -> list[str]:
     """Split text into fixed-size overlapping chunks.
 
     Simple sliding window — no structural parsing, no boundary detection.
@@ -770,23 +799,7 @@ def _chunk_text_sliding_window(
     Returns:
         List of text chunks.
     """
-    if not text or not text.strip():
-        return []
-
-    text = text.strip()
-
-    if len(text) <= chunk_size:
-        return [text]
-
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end].strip())
-        start += chunk_size - chunk_overlap
-
-    # Drop any trailing empty chunk
-    return [c for c in chunks if c.strip()]
+    return [c for c, _ in _chunk_text_sliding_window_with_offsets(text, chunk_size, chunk_overlap)]
 
 
 def _chunk_text(text: str, max_chunk_size: int = 1500) -> list[str]:
@@ -866,6 +879,7 @@ class IndexMeta:
     file_hashes: dict[str, str] = field(default_factory=dict)
     chunk_counts: dict[str, int] = field(default_factory=dict)
     embedder_model: str = ""
+    schema_version: int = INDEX_SCHEMA_VERSION
 
     def save(self, path: Path) -> None:
         """Persist to JSON file."""
@@ -876,6 +890,7 @@ class IndexMeta:
                     "file_hashes": self.file_hashes,
                     "chunk_counts": self.chunk_counts,
                     "embedder_model": self.embedder_model,
+                    "schema_version": self.schema_version,
                 },
                 f,
                 indent=2,
@@ -897,6 +912,7 @@ class IndexMeta:
                 file_hashes=data.get("file_hashes", {}),
                 chunk_counts=data.get("chunk_counts", {}),
                 embedder_model=data.get("embedder_model", ""),
+                schema_version=data.get("schema_version", 0),
             )
         except Exception as e:
             logger.warning(f"Failed to load index meta: {e}")
@@ -1023,6 +1039,18 @@ class SearchEngine:
             logger.warning(
                 f"Embedder model changed from '{self.meta.embedder_model}' "
                 f"to '{embedder_model}'. Clearing stale index for rebuild."
+            )
+            self.store.clear()
+            self.bm25_store.clear()
+            self.meta = IndexMeta()
+            self.meta.save(self.index_dir / "index_meta.json")
+
+        # Chunk-metadata layout changed (e.g. the `metadata` dict was added):
+        # clear everything so the startup build re-embeds and repopulates.
+        if self.meta.schema_version != INDEX_SCHEMA_VERSION:
+            logger.warning(
+                "Search index schema version %s != %s; clearing index for rebuild.",
+                self.meta.schema_version, INDEX_SCHEMA_VERSION,
             )
             self.store.clear()
             self.bm25_store.clear()
@@ -1269,18 +1297,22 @@ class SearchEngine:
                 logger.warning(f"Could not read {normalized_path}: {e}")
                 return 0
 
-        chunks = _chunk_text_sliding_window(content, self.chunk_size, self.chunk_overlap)
-        if not chunks:
+        doc_metadata, body = extract_metadata(content)
+        chunk_pairs = _chunk_text_sliding_window_with_offsets(
+            body, self.chunk_size, self.chunk_overlap
+        )
+        if not chunk_pairs:
             return 0
+        headings = scan_headings(body.strip())   # offsets are relative to the stripped body
 
         content_h = _content_hash(content)
         metadata_list: list[dict] = []
         texts_to_embed: list[str] = []
 
-        for i, chunk in enumerate(chunks):
+        for i, (chunk, start) in enumerate(chunk_pairs):
             context = None
             if self.contextual_retrieval:
-                context = await self._contextualise_chunk(chunk, content)
+                context = await self._contextualise_chunk(chunk, body)
 
             embed_text = f"{context}\n\n{chunk}" if context else chunk
             texts_to_embed.append(embed_text)
@@ -1291,6 +1323,8 @@ class SearchEngine:
                 content=chunk,
                 context=context,
                 content_hash=content_h,
+                metadata=doc_metadata,
+                heading_path=heading_path_at(headings, start),
             )
             metadata_list.append(asdict(meta))
 
@@ -1299,9 +1333,9 @@ class SearchEngine:
         self.bm25_store.mark_dirty()
 
         self.meta.file_hashes[normalized_path] = content_h
-        self.meta.chunk_counts[normalized_path] = len(chunks)
+        self.meta.chunk_counts[normalized_path] = len(chunk_pairs)
 
-        return len(chunks)
+        return len(chunk_pairs)
 
     async def index_file(
         self, relative_path: str, *, content: str | None = None
@@ -1524,6 +1558,8 @@ class SearchEngine:
                     content=r.get("content", ""),
                     context=r.get("context"),
                     score=r.get("score", 0.0),
+                    metadata=dict(r.get("metadata") or {}),
+                    heading_path=list(r.get("heading_path") or []),
                 )
             )
             if len(results) >= max_results:

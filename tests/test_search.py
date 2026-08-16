@@ -330,6 +330,20 @@ class TestIndexMeta:
             assert meta.file_hashes == {}
             assert meta.chunk_counts == {}
 
+    def test_schema_version_round_trip_and_legacy_default(self):
+        from stash_mcp.search import INDEX_SCHEMA_VERSION
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "index_meta.json"
+            meta = IndexMeta()
+            assert meta.schema_version == INDEX_SCHEMA_VERSION
+            meta.save(path)
+            assert IndexMeta.load(path).schema_version == INDEX_SCHEMA_VERSION
+
+            # Legacy file without the field loads as version 0
+            path.write_text('{"file_hashes": {}, "chunk_counts": {}, "embedder_model": ""}')
+            assert IndexMeta.load(path).schema_version == 0
+
 
 # --- Content hash tests ---
 
@@ -575,6 +589,66 @@ class TestSearchEngine:
         chunks = await engine.index_file("large.md")
         # With chunk_size=500, overlap=50, step=450, ~2000 chars => more than 1 chunk
         assert chunks > 1
+
+    async def test_chunks_carry_metadata_and_frontmatter_is_not_embedded(self, engine_dirs):
+        content_dir, index_dir = engine_dirs
+        (content_dir / "doc.md").write_text(
+            "---\nlayer: frogpilot\nverified: 2026-08-16\n---\n# Doc\n\nOAuth flow text.\n"
+        )
+        engine = SearchEngine(content_dir=content_dir, index_dir=index_dir, embed_fn=mock_embed)
+        await engine.build_index(["doc.md"])
+        chunk = engine.store._metadata[0]
+        assert chunk["metadata"] == {"layer": "frogpilot", "verified": "2026-08-16"}
+        assert chunk["heading_path"] == ["Doc"]
+        assert "layer: frogpilot" not in chunk["content"]
+        results = await engine.search("oauth flow")
+        assert results[0].metadata == {"layer": "frogpilot", "verified": "2026-08-16"}
+        assert results[0].heading_path == ["Doc"]
+
+    async def test_chunk_heading_path_follows_sections(self, engine_dirs):
+        content_dir, index_dir = engine_dirs
+        body = "# Svc\n\n## Role\n\n" + ("auth " * 300) + "\n\n## Config\n\n" + ("oauth " * 300)
+        (content_dir / "svc.md").write_text(body)
+        engine = SearchEngine(
+            content_dir=content_dir, index_dir=index_dir, embed_fn=mock_embed,
+            chunk_size=400, chunk_overlap=0,
+        )
+        await engine.build_index(["svc.md"])
+        paths = [tuple(m["heading_path"]) for m in engine.store._metadata]
+        assert paths[0] == ("Svc",)                       # first chunk starts on the H1 line
+        assert ("Svc", "Role") in paths and ("Svc", "Config") in paths
+        assert paths[-1] == ("Svc", "Config")
+
+    def test_sliding_window_offsets_align_with_chunks(self):
+        from stash_mcp.search import _chunk_text_sliding_window_with_offsets
+
+        text = "  " + "abcdefghij" * 5 + "  "
+        pairs = _chunk_text_sliding_window_with_offsets(text, chunk_size=20, chunk_overlap=5)
+        stripped = text.strip()
+        assert [c for c, _ in pairs] == _chunk_text_sliding_window(text, 20, 5)
+        for chunk, start in pairs:
+            assert stripped[start:start + len(chunk)] == chunk
+
+    async def test_schema_mismatch_clears_index_for_rebuild(self, engine_dirs):
+        import json
+
+        content_dir, index_dir = engine_dirs
+        (content_dir / "a.md").write_text("# A\n\nauth text")
+        engine1 = SearchEngine(content_dir=content_dir, index_dir=index_dir, embed_fn=mock_embed)
+        await engine1.build_index(["a.md"])
+        assert engine1.indexed_chunks > 0
+
+        meta_path = index_dir / "index_meta.json"
+        data = json.loads(meta_path.read_text())
+        data.pop("schema_version", None)          # simulate a pre-metadata index
+        meta_path.write_text(json.dumps(data))
+
+        engine2 = SearchEngine(content_dir=content_dir, index_dir=index_dir, embed_fn=mock_embed)
+        assert engine2.indexed_chunks == 0        # cleared
+        assert engine2.meta.file_hashes == {}     # so build_index re-embeds everything
+        total = await engine2.build_index(["a.md"])
+        assert total > 0
+        assert engine2.store._metadata[0].get("metadata") == {}
 
 
 # --- REST API search endpoint tests ---
