@@ -1,5 +1,6 @@
 """Filesystem layer for content management."""
 
+import functools
 import logging
 import re
 from pathlib import Path
@@ -20,6 +21,39 @@ class FileNotFoundError(FileSystemError):
 class InvalidPathError(FileSystemError):
     """Invalid path error."""
     pass
+
+
+@functools.lru_cache(maxsize=256)
+def glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Convert a glob pattern to an anchored regex.
+
+    Handles ``*`` (within a segment), ``?`` and ``**`` (zero or more path
+    segments). Shared by content-path filtering and search exclusions so
+    both use one dialect.
+    """
+    i = 0
+    n = len(pattern)
+    res = ""
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if i + 1 < n and pattern[i + 1] == "*":
+                i += 2
+                if i < n and pattern[i] == "/":
+                    i += 1
+                    res += "(?:.+/)?"
+                else:
+                    res += ".*"
+            else:
+                res += "[^/]*"
+                i += 1
+        elif c == "?":
+            res += "[^/]"
+            i += 1
+        else:
+            res += re.escape(c)
+            i += 1
+    return re.compile(res + r"\Z")
 
 
 class FileSystem:
@@ -68,33 +102,8 @@ class FileSystem:
 
     @staticmethod
     def _glob_to_regex(pattern: str) -> re.Pattern[str]:
-        """Convert a glob pattern to a regex.
-
-        Handles *, ?, and ** (zero or more path segments).
-        """
-        i = 0
-        n = len(pattern)
-        res = ""
-        while i < n:
-            c = pattern[i]
-            if c == "*":
-                if i + 1 < n and pattern[i + 1] == "*":
-                    i += 2
-                    if i < n and pattern[i] == "/":
-                        i += 1
-                        res += "(?:.+/)?"
-                    else:
-                        res += ".*"
-                else:
-                    res += "[^/]*"
-                    i += 1
-            elif c == "?":
-                res += "[^/]"
-                i += 1
-            else:
-                res += re.escape(c)
-                i += 1
-        return re.compile(res + r"\Z")
+        """Backward-compatible alias for :func:`glob_to_regex`."""
+        return glob_to_regex(pattern)
 
     def _matches_patterns(self, relative_path: str) -> bool:
         """Check if a relative path matches any of the include patterns.

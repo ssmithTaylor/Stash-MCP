@@ -367,3 +367,32 @@ def test_list_all_files_with_patterns_and_subpath(populated_dir):
     assert "docs/api.md" in files
     assert "docs/deep/nested.md" in files
     assert all(f.startswith("docs/") for f in files)
+
+
+# --- glob_to_regex module-level function tests ---
+
+
+from stash_mcp.filesystem import glob_to_regex
+
+
+class TestGlobToRegex:
+    def test_double_star_prefix_matches_any_depth(self):
+        rx = glob_to_regex("**/_reports/**")
+        assert rx.match("_reports/scan.md")
+        assert rx.match("openpilot/_reports/fork-deltas/x.md")
+        assert rx.match("a/b/_reports/y.md")
+        assert rx.match("openpilot/services/pandad.md") is None
+
+    def test_root_anchored_pattern_does_not_match_nested(self):
+        rx = glob_to_regex("_reports/**")
+        assert rx.match("_reports/scan.md")
+        assert rx.match("openpilot/_reports/scan.md") is None
+
+    def test_single_star_stays_within_segment(self):
+        rx = glob_to_regex("docs/*.md")
+        assert rx.match("docs/a.md")
+        assert rx.match("docs/sub/a.md") is None
+
+    def test_static_method_still_delegates(self):
+        from stash_mcp.filesystem import FileSystem
+        assert FileSystem._glob_to_regex("x/**").match("x/y/z")
