@@ -120,6 +120,113 @@ class TestGitBackendNewMethods:
             with pytest.raises(RuntimeError, match="git push failed"):
                 git.push("nonexistent-remote", "main")
 
+    def _log(self, path: Path, *fmt: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), "log", *fmt], capture_output=True, text=True,
+        ).stdout
+
+    def test_commit_paths_commits_only_the_given_paths(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "a.md").write_text("A")
+            (path / "b.md").write_text("B")           # dirty but not part of the commit
+            short = git.commit_paths(["a.md"], "Add a", author="Agent A <a@example.com>")
+            assert short and len(short) >= 7
+            names = subprocess.run(
+                ["git", "-C", tmpdir, "show", "--name-only", "--format=%an", "HEAD"],
+                capture_output=True, text=True,
+            ).stdout
+            assert "Agent A" in names and "a.md" in names and "b.md" not in names
+            status = subprocess.run(
+                ["git", "-C", tmpdir, "status", "--porcelain"], capture_output=True, text=True,
+            ).stdout
+            assert "?? b.md" in status                # b.md still untracked, not staged
+            assert not git.has_staged_changes()
+
+    def test_commit_paths_records_deletion_and_move(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "old.md").write_text("x")
+            git.commit_paths(["old.md"], "Add old")
+            (path / "old.md").rename(path / "new.md")
+            assert git.commit_paths(["old.md", "new.md"], "Move old -> new")
+            (path / "new.md").unlink()
+            assert git.commit_paths(["new.md"], "Delete new")
+            assert "Delete new" in self._log(path, "--oneline")
+            tracked = subprocess.run(
+                ["git", "-C", tmpdir, "ls-files"], capture_output=True, text=True,
+            ).stdout.split()
+            assert "new.md" not in tracked and "old.md" not in tracked
+
+    def test_commit_paths_noop_when_nothing_changed_or_path_unknown(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            assert git.commit_paths(["README.md"], "no change") is None
+            assert git.commit_paths(["never-existed.md"], "ghost") is None
+            assert git.commit_paths([], "empty") is None
+
+    def test_restore_paths_checks_out_tracked_and_deletes_untracked(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "README.md").write_text("corrupted")
+            (path / "brand-new.md").write_text("temp")
+            (path / "other.md").write_text("keep me")   # not part of the restore
+            restored, deleted = git.restore_paths(["README.md", "brand-new.md"])
+            assert restored == ["README.md"] and deleted == ["brand-new.md"]
+            assert (path / "README.md").read_text() == "# Test\n"
+            assert not (path / "brand-new.md").exists()
+            assert (path / "other.md").read_text() == "keep me"
+
+    def test_restore_paths_recreates_deleted_tracked_file(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "README.md").unlink()
+            restored, deleted = git.restore_paths(["README.md"])
+            assert restored == ["README.md"] and deleted == []
+            assert (path / "README.md").exists()
+
+    def test_unstage_and_has_staged_changes(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "s.md").write_text("s")
+            subprocess.run(["git", "-C", tmpdir, "add", "s.md"], check=True, capture_output=True)
+            assert git.has_staged_changes()
+            git.unstage()
+            assert not git.has_staged_changes()
+            assert (path / "s.md").exists()      # worktree untouched
+
+    def test_ahead_count_without_remote_is_zero(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            assert GitBackend(path).ahead_count("origin", "main") == 0
+
 
 # ---------------------------------------------------------------------------
 # TransactionManager — write gating

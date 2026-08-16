@@ -393,6 +393,123 @@ class GitBackend:
 
         logger.info("Committed: %s", message)
 
+    # ------------------------------------------------------------------
+    # Path-scoped operations (autocommit / concurrent transactions)
+    # ------------------------------------------------------------------
+
+    def _stageable(self, paths: list[str]) -> list[str]:
+        """Return the subset of *paths* that exist on disk or are tracked.
+
+        ``git add -A -- <path>`` errors on a pathspec that matches nothing
+        (neither worktree nor index), e.g. a file created and deleted within
+        one transaction. Filtering keeps the commit robust.
+        """
+        clean = [p.strip("/") for p in paths if p and p.strip("/")]
+        if not clean:
+            return []
+        existing = [p for p in clean if (self.content_dir / p).exists()]
+        missing = [p for p in clean if p not in existing]
+        tracked: set[str] = set()
+        if missing:
+            result = self._run(["git", "ls-files", "-z", "--", *missing])
+            if result.returncode == 0:
+                tracked = {p for p in result.stdout.split("\0") if p}
+        ordered = []
+        for p in clean:
+            if (p in existing or p in tracked) and p not in ordered:
+                ordered.append(p)
+        return ordered
+
+    def has_staged_changes(self, paths: list[str] | None = None) -> bool:
+        """True when the index differs from HEAD (optionally only for *paths*)."""
+        args = ["git", "diff", "--cached", "--quiet"]
+        if paths:
+            args += ["--", *paths]
+        result = self._run(args)
+        if result.returncode == 0:
+            return False
+        if result.returncode == 1:
+            return True
+        raise RuntimeError(f"git diff --cached failed: {result.stderr.strip()}")
+
+    def unstage(self, paths: list[str] | None = None) -> None:
+        """``git reset -q [-- paths]`` — clears the index, leaves the worktree alone."""
+        args = ["git", "reset", "-q"]
+        if paths:
+            args += ["--", *paths]
+        result = self._run(args)
+        if result.returncode != 0:
+            logger.warning("git reset failed: %s", result.stderr.strip())
+
+    def commit_paths(
+        self, paths: list[str], message: str, author: str | None = None
+    ) -> str | None:
+        """Stage exactly *paths* and commit them.
+
+        Returns the short commit hash, or ``None`` when none of the paths
+        changed relative to HEAD. On commit failure the paths are unstaged
+        again and ``RuntimeError`` is raised.
+        """
+        stageable = self._stageable(paths)
+        if not stageable:
+            return None
+        add_result = self._run(["git", "add", "-A", "--", *stageable])
+        if add_result.returncode != 0:
+            raise RuntimeError(f"git add failed: {add_result.stderr.strip()}")
+        if not self.has_staged_changes(stageable):
+            return None
+        commit_args = ["git", "commit", "-q", "-m", message]
+        if author:
+            commit_args.extend(["--author", author])
+        commit_result = self._run(commit_args)
+        if commit_result.returncode != 0:
+            self.unstage(stageable)
+            raise RuntimeError(f"git commit failed: {commit_result.stderr.strip()}")
+        head = self._run(["git", "rev-parse", "--short", "HEAD"])
+        short = head.stdout.strip() if head.returncode == 0 else ""
+        logger.info("Committed %s: %s", short or "?", message.splitlines()[0] if message else "")
+        return short or None
+
+    def restore_paths(self, paths: list[str]) -> tuple[list[str], list[str]]:
+        """Revert *paths* to HEAD without touching anything else.
+
+        Paths present in HEAD are checked out (restoring deletions too);
+        paths unknown to HEAD are removed from the worktree.
+
+        Returns:
+            ``(restored, deleted)`` lists of relative paths.
+        """
+        clean = [p.strip("/") for p in paths if p and p.strip("/")]
+        if not clean:
+            return [], []
+        ls = self._run(["git", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", *clean])
+        in_head = {p for p in ls.stdout.split("\0") if p} if ls.returncode == 0 else set()
+        to_checkout = [p for p in clean if p in in_head]
+        to_delete = [p for p in clean if p not in in_head]
+        restored: list[str] = []
+        if to_checkout:
+            result = self._run(["git", "checkout", "-q", "HEAD", "--", *to_checkout])
+            if result.returncode != 0:
+                raise RuntimeError(f"git checkout failed: {result.stderr.strip()}")
+            restored = to_checkout
+        deleted: list[str] = []
+        for p in to_delete:
+            full = self.content_dir / p
+            if full.is_file():
+                full.unlink()
+                deleted.append(p)
+        return restored, deleted
+
+    def ahead_count(self, remote: str, branch: str) -> int:
+        """Number of local commits not on ``remote/branch`` (0 if that ref is unknown)."""
+        result = self._run(["git", "rev-list", "--count", f"{remote}/{branch}..HEAD"])
+        if result.returncode != 0:
+            return 0
+        try:
+            return int(result.stdout.strip() or "0")
+        except ValueError:
+            return 0
+
     def reset_hard(self) -> None:
         """Discard all uncommitted changes with ``git reset --hard HEAD``.
 
