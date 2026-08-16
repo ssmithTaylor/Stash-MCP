@@ -918,6 +918,88 @@ class TestMCPSearchTool:
             try:
                 with pytest.raises(ValueError, match="path_prefix"):
                     await tool.run({"query": "auth", "path_prefix": "../etc"})
+
+                # Backslash-spelled traversal must be caught the same way as the
+                # forward-slash form — _normalize_path (search.py) treats '\\' as a
+                # path separator too, so the validation must match that convention.
+                with pytest.raises(ValueError, match="path_prefix"):
+                    await tool.run({"query": "auth", "path_prefix": "..\\etc"})
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_path_prefix_narrows_results(self):
+        """A valid path_prefix actually scopes results, not just the rejection path."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {
+                    "docs/auth.md": "# Auth\n\nauth oauth flow",
+                    "other/auth.md": "# Auth\n\nauth oauth flow",
+                },
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                text = str((await tool.run({
+                    "query": "auth oauth", "path_prefix": "docs",
+                })).content)
+                assert "docs/auth.md" in text
+                assert "other/auth.md" not in text
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_exclude_patterns_filters_results(self):
+        """The exclude_patterns tool argument is threaded through, not just
+        the engine-level default_exclude_patterns."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {
+                    "docs/auth.md": "# Auth\n\nauth oauth flow",
+                    "scratch/auth.md": "# Auth\n\nauth oauth flow",
+                },
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                text = str((await tool.run({
+                    "query": "auth oauth", "exclude_patterns": "scratch/**",
+                })).content)
+                assert "docs/auth.md" in text
+                assert "scratch/auth.md" not in text
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_omits_section_and_meta_labels_when_absent(self):
+        """A chunk with no heading and a document with no frontmatter must not
+        emit dangling Section:/Meta: labels."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {"plain.md": "auth oauth flow with no heading and no frontmatter"},
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                text = str((await tool.run({"query": "auth oauth"})).content)
+                assert "plain.md" in text
+                assert "Section:" not in text
+                assert "Meta:" not in text
             finally:
                 _current_context.reset(token)
 

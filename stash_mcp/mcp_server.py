@@ -1344,8 +1344,10 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             Returns:
                 Search results formatted as a string; each result shows the
                 path, score, the Section (heading path) the chunk came from,
-                optional Meta/Context/Last changed lines, and a snippet. Use
-                read_section with the Section value to fetch just that part.
+                optional Meta/Context/Last changed lines, and a snippet. The
+                Section line names the heading the snippet came from, so
+                after read_content you can jump straight to that part of the
+                file instead of scanning the whole thing.
             """
             types_list = None
             if file_types:
@@ -1359,7 +1361,12 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 ]
             for label, value in (("path_prefix", path_prefix), ("boost_prefix", boost_prefix)):
                 for part in (value or "").split(","):
-                    if part.strip() and ".." in PurePosixPath(part.strip()).parts:
+                    stripped = part.strip()
+                    # Normalize '\' -> '/' before checking, matching _normalize_path
+                    # (search.py) so a backslash-spelled traversal (Windows-style
+                    # input) is caught exactly like the forward-slash form instead
+                    # of silently reaching the engine as a no-op prefix.
+                    if stripped and ".." in PurePosixPath(stripped.replace("\\", "/")).parts:
                         raise ValueError(f"{label} must not contain '..' segments")
 
             t0 = time.perf_counter()
