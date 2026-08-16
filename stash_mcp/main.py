@@ -153,6 +153,11 @@ def _create_git_backend():
 
     Raises SystemExit on misconfiguration so the server fails fast.
     """
+    if Config.GIT_AUTOCOMMIT and not Config.GIT_TRACKING:
+        logger.warning(
+            "STASH_GIT_AUTOCOMMIT=true has no effect without STASH_GIT_TRACKING=true; ignoring."
+        )
+
     if Config.GIT_SYNC_ENABLED and not Config.GIT_TRACKING:
         logger.error(
             "STASH_GIT_SYNC_ENABLED=true requires STASH_GIT_TRACKING=true. "
@@ -176,6 +181,15 @@ def _create_git_backend():
     except RuntimeError as exc:
         logger.error("Git tracking enabled but validation failed: %s", exc)
         raise SystemExit(1) from exc
+
+    # Nothing should be staged between operations; clear anything left by a
+    # crashed sequence (mixed reset — the worktree is untouched).
+    try:
+        if backend.has_staged_changes():
+            logger.warning("Found staged changes at startup; unstaging (worktree kept).")
+            backend.unstage()
+    except RuntimeError as exc:
+        logger.warning("Could not inspect the git index at startup: %s", exc)
 
     logger.info("Git tracking active (content_dir=%s)", Config.CONTENT_DIR)
 
@@ -207,18 +221,33 @@ def _task_done_callback(task: asyncio.Task) -> None:
 
 
 async def _git_sync_loop(
-    git_backend, search_engine, sync_event: asyncio.Event | None = None
+    git_backend,
+    search_engine,
+    sync_event: asyncio.Event | None = None,
+    transaction_manager=None,
 ) -> None:
-    """Periodic git pull task.  Runs until cancelled."""
+    """Periodic git pull (+ push when ahead) task. Runs until cancelled.
+
+    Pull and push run under the write lock so they never interleave with a
+    write+commit; pull is skipped while any transaction is open (the event
+    is cleared by the TransactionManager's sync callbacks).
+    """
     remote = Config.GIT_SYNC_REMOTE
     branch = Config.GIT_SYNC_BRANCH
     interval = Config.GIT_SYNC_INTERVAL
     recursive = Config.GIT_SYNC_RECURSIVE
+    lock = transaction_manager.write_lock if transaction_manager is not None else None
+
+    async def _locked(fn, *args):
+        if lock is None:
+            return await asyncio.to_thread(fn, *args)
+        async with lock:
+            return await asyncio.to_thread(fn, *args)
 
     while True:
         try:
             if sync_event is None or sync_event.is_set():
-                result = await asyncio.to_thread(git_backend.pull, remote, branch, recursive)
+                result = await _locked(git_backend.pull, remote, branch, recursive)
                 if result.success:
                     logger.info("Git sync: %s", result.message or "up to date")
                     for path in result.added_files:
@@ -230,7 +259,12 @@ async def _git_sync_loop(
                 else:
                     logger.warning("Git sync pull failed: %s", result.message)
             else:
-                logger.debug("Git sync skipped: transaction in progress")
+                logger.debug("Git sync pull skipped: transaction in progress")
+            if Config.GIT_SYNC_ENABLED:
+                ahead = await asyncio.to_thread(git_backend.ahead_count, remote, branch)
+                if ahead > 0:
+                    await _locked(git_backend.push, remote, branch)
+                    logger.info("Git sync: pushed %d commit(s)", ahead)
         except Exception as exc:
             logger.warning("Git sync error: %s", exc)
         await asyncio.sleep(interval)
@@ -262,21 +296,35 @@ def create_app():
     if git_backend is not None and search_engine is not None:
         search_engine._git_backend = git_backend
 
-    # When git tracking and writes are both active, wrap the filesystem in a
-    # TransactionManager so that all mutating MCP tool calls are gated behind
-    # an active transaction.
     transaction_manager = None
     fs_for_mcp = filesystem
     if not Config.READ_ONLY and git_backend is not None:
         from .transactions import TransactionManager
 
-        transaction_manager = TransactionManager(filesystem, git_backend)
-        fs_for_mcp = transaction_manager
+        transaction_manager = TransactionManager(
+            filesystem,
+            git_backend,
+            autocommit=Config.GIT_AUTOCOMMIT,
+            author_default=Config.GIT_AUTHOR_DEFAULT,
+            lock_wait=Config.TRANSACTION_LOCK_WAIT,
+        )
+        # Gated mode installs the delegating wrapper so writes outside a
+        # transaction are rejected; autocommit mode uses the raw filesystem
+        # and the manager only for the write lock / commits.
+        fs_for_mcp = filesystem if Config.GIT_AUTOCOMMIT else transaction_manager
+        logger.info(
+            "Git write mode: %s", "autocommit" if Config.GIT_AUTOCOMMIT else "transactions"
+        )
 
     # Create MCP http app first so we can wire its lifespan into FastAPI.
     # In read-only mode, use stateless HTTP so each request is self-contained
     # and any pod can serve any client (safe for horizontal scaling).
-    mcp = create_mcp_server(fs_for_mcp, search_engine=search_engine, git_backend=git_backend)
+    mcp = create_mcp_server(
+        fs_for_mcp,
+        search_engine=search_engine,
+        git_backend=git_backend,
+        transaction_manager=transaction_manager,
+    )
     mcp_http_app = mcp.http_app(path="/", stateless_http=Config.READ_ONLY)
 
     # Build a combined lifespan that wraps the MCP lifespan and also
@@ -313,7 +361,7 @@ def create_app():
             sync_task = None
             if git_backend is not None and Config.GIT_SYNC_ENABLED:
                 sync_task = asyncio.create_task(
-                    _git_sync_loop(git_backend, search_engine, sync_event),
+                    _git_sync_loop(git_backend, search_engine, sync_event, transaction_manager),
                     name="git-sync",
                 )
                 sync_task.add_done_callback(_task_done_callback)
@@ -330,8 +378,14 @@ def create_app():
             get_metrics().record_server_event("shutdown")
             get_metrics().close()
 
-    app = create_api(filesystem, lifespan=_combined_lifespan, search_engine=search_engine)
-    ui_router = create_ui_router(filesystem, search_engine=search_engine, read_only=Config.READ_ONLY)
+    app = create_api(
+        filesystem, lifespan=_combined_lifespan, search_engine=search_engine,
+        transaction_manager=transaction_manager,
+    )
+    ui_router = create_ui_router(
+        filesystem, search_engine=search_engine, read_only=Config.READ_ONLY,
+        transaction_manager=transaction_manager,
+    )
     app.include_router(ui_router)
 
     # Serve vendored static assets (highlight.js, mermaid.js, etc.)
@@ -414,6 +468,8 @@ def main():
         logger.info("Read-only mode enabled — write tools will not be registered")
     if Config.GIT_TRACKING:
         logger.info("Git tracking enabled")
+    if Config.GIT_TRACKING and Config.GIT_AUTOCOMMIT:
+        logger.info("Git autocommit enabled")
     if Config.GIT_SYNC_ENABLED:
         logger.info(
             f"Git sync enabled: remote={Config.GIT_SYNC_REMOTE} "

@@ -111,6 +111,10 @@ class Config:
     # Git tracking
     GIT_TRACKING: bool = os.getenv("STASH_GIT_TRACKING", "false").lower() == "true"
 
+    # Commit every write outside a transaction immediately (requires GIT_TRACKING).
+    # When false, writes require an open transaction (gated mode).
+    GIT_AUTOCOMMIT: bool = os.getenv("STASH_GIT_AUTOCOMMIT", "false").lower() == "true"
+
     # Git sync (requires GIT_TRACKING=true)
     GIT_SYNC_ENABLED: bool = os.getenv("STASH_GIT_SYNC_ENABLED", "false").lower() == "true"
     GIT_SYNC_URL: str | None = os.getenv("STASH_GIT_SYNC_URL")
