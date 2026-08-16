@@ -21,6 +21,7 @@ from pydantic import AnyUrl, BaseModel, Field
 from .config import Config
 from .events import CONTENT_CREATED, CONTENT_DELETED, CONTENT_MOVED, CONTENT_UPDATED, emit
 from .filesystem import FileNotFoundError, FileSystem, InvalidPathError
+from .frontmatter import extract_metadata
 from .headings import scan_headings
 from .metrics import get_metrics
 from .search import reject_path_traversal
@@ -224,17 +225,30 @@ def _is_searchable(path: str) -> bool:
 
 
 def _get_description(fs: FileSystem, path: str) -> str:
-    """Get description for a file from frontmatter or first line."""
+    """Describe a file by its first content line.
+
+    Skips YAML frontmatter, a leading provenance blockquote, blank lines and
+    HTML comments so the description is the title, not the metadata.
+    """
     try:
         content = fs.read_file(path)
-        lines = content.strip().splitlines()
-        if not lines:
-            return f"Content file: {path}"
-        first_line = lines[0].strip()
-        # Strip markdown heading markers
-        if first_line.startswith("#"):
-            first_line = first_line.lstrip("# ").strip()
-        return first_line[:100] if first_line else f"Content file: {path}"
+        _, body = extract_metadata(content)
+        in_comment = False
+        for raw in body.splitlines():
+            line = raw.strip()
+            if in_comment:
+                if "-->" in line:
+                    in_comment = False
+                continue
+            if not line or line.startswith(">"):
+                continue
+            if line.startswith("<!--"):
+                in_comment = "-->" not in line
+                continue
+            if line.startswith("#"):
+                line = line.lstrip("# ").strip()
+            return line[:100] if line else f"Content file: {path}"
+        return f"Content file: {path}"
     except Exception:
         return f"Content file: {path}"
 

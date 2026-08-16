@@ -1,7 +1,7 @@
 """Tests for MCP server implementation."""
 
-import json
 import hashlib
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +14,7 @@ from stash_mcp.mcp_server import (
     FileEditOperation,
     MoveOperation,
     _build_heading_tree,
+    _get_description,
     _get_mime_type,
     create_mcp_server,
     parse_markdown_structure,
@@ -483,14 +484,14 @@ async def test_create_sends_list_changed(temp_fs, mock_context):
     """Test that create_content sends resource_list_changed only for README.md files."""
     mcp = create_mcp_server(temp_fs)
     tool = await mcp.get_tool("create_content")
-    
+
     # Creating README.md should send notification
     await tool.run({"path": "README.md", "content": "# New"})
     mock_context.send_resource_list_changed.assert_awaited_once()
-    
+
     # Reset mock
     mock_context.send_resource_list_changed.reset_mock()
-    
+
     # Creating non-README file should NOT send notification
     await tool.run({"path": "other.md", "content": "# Other"})
     mock_context.send_resource_list_changed.assert_not_awaited()
@@ -562,7 +563,7 @@ async def test_delete_sends_list_changed(mcp_server, temp_fs, mock_context):
 async def test_move_updates_resources(mcp_server, temp_fs, mock_context):
     """Test that move_content updates resource registry for README.md."""
     tool = await mcp_server.get_tool("move_content")
-    
+
     # Moving README.md to another README.md location
     await tool.run({"source_path": "README.md", "dest_path": "other/README.md"})
     resources = await mcp_server.get_resources()
@@ -573,14 +574,14 @@ async def test_move_updates_resources(mcp_server, temp_fs, mock_context):
 async def test_move_sends_list_changed(mcp_server, temp_fs, mock_context):
     """Test that move_content sends notification when README.md is involved."""
     tool = await mcp_server.get_tool("move_content")
-    
+
     # Moving README.md to another location should send notification
     await tool.run({"source_path": "README.md", "dest_path": "other/README.md"})
     mock_context.send_resource_list_changed.assert_awaited_once()
-    
+
     # Reset mock
     mock_context.send_resource_list_changed.reset_mock()
-    
+
     # Moving non-README file should NOT send notification
     await tool.run({"source_path": "data.json", "dest_path": "moved.json"})
     mock_context.send_resource_list_changed.assert_not_awaited()
@@ -1820,3 +1821,17 @@ async def test_find_content_invalid_path_prefix(temp_fs):
     tool = await mcp.get_tool("find_content")
     with pytest.raises(ValueError):
         await tool.run({"pattern": "x", "path_prefix": "../escape"})
+
+
+def test_get_description_skips_frontmatter_blockquote_and_comments(temp_fs):
+    temp_fs.write_file(
+        "README.md",
+        "---\nlayer: x\n---\n\n> Describes: repo@ref · layer: x\n"
+        "<!-- template hint\n   spanning lines -->\n# Real Title\n\nBody",
+    )
+    assert _get_description(temp_fs, "README.md") == "Real Title"
+
+
+def test_get_description_plain_first_line_unchanged(temp_fs):
+    temp_fs.write_file("README.md", "# Root README\nmore")
+    assert _get_description(temp_fs, "README.md") == "Root README"
