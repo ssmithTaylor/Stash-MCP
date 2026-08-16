@@ -30,6 +30,18 @@ def _get_mime_type(path: str) -> str:
     return MIME_TYPES.get(suffix, "text/plain")
 
 
+def _require_writable() -> None:
+    """Raise 403 when the server is in read-only mode."""
+    if Config.READ_ONLY:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This Stash-MCP instance is read-only. "
+                "Set STASH_READ_ONLY=false to enable editing."
+            ),
+        )
+
+
 class ContentItem(BaseModel):
     """Content item model."""
 
@@ -238,6 +250,7 @@ def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> Fas
     @app.post("/api/content/{path:path}", status_code=201)
     async def create_content(path: str, data: ContentCreate):
         """Create a new content file. Returns 409 if file already exists."""
+        _require_writable()
         try:
             if filesystem.file_exists(path):
                 raise HTTPException(
@@ -258,6 +271,7 @@ def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> Fas
     @app.put("/api/content/{path:path}")
     async def update_content(path: str, data: ContentCreate):
         """Update an existing content file (also allows creation)."""
+        _require_writable()
         try:
             is_new = not filesystem.file_exists(path)
             filesystem.write_file(path, data.content)
@@ -272,6 +286,7 @@ def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> Fas
     @app.delete("/api/content/{path:path}")
     async def delete_content(path: str):
         """Delete content file."""
+        _require_writable()
         try:
             filesystem.delete_file(path)
             emit(CONTENT_DELETED, path)
@@ -287,6 +302,7 @@ def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> Fas
     @app.patch("/api/content/{path:path}")
     async def move_content(path: str, data: ContentMove):
         """Move or rename a content file."""
+        _require_writable()
         try:
             filesystem.move_file(path, data.destination)
             emit(CONTENT_MOVED, data.destination, source_path=path)
