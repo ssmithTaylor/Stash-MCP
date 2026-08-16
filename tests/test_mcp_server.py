@@ -1,7 +1,7 @@
 """Tests for MCP server implementation."""
 
-import hashlib
 import json
+import hashlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1835,3 +1835,15 @@ def test_get_description_skips_frontmatter_blockquote_and_comments(temp_fs):
 def test_get_description_plain_first_line_unchanged(temp_fs):
     temp_fs.write_file("README.md", "# Root README\nmore")
     assert _get_description(temp_fs, "README.md") == "Root README"
+
+
+def test_get_description_frontmatter_only_no_prose(temp_fs):
+    temp_fs.write_file("only_fm.md", "---\nlayer: x\ntitle: something\n---")
+    assert _get_description(temp_fs, "only_fm.md") == "Content file: only_fm.md"
+
+
+def test_get_description_unterminated_frontmatter(temp_fs):
+    temp_fs.write_file(
+        "README.md", "---\nlayer: x\ntitle: something\n\n# Real Title\nBody"
+    )
+    assert _get_description(temp_fs, "README.md") == "Real Title"

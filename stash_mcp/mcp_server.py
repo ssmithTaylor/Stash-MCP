@@ -234,6 +234,7 @@ def _get_description(fs: FileSystem, path: str) -> str:
         content = fs.read_file(path)
         _, body = extract_metadata(content)
         in_comment = False
+        after_delimiter = False
         for raw in body.splitlines():
             line = raw.strip()
             if in_comment:
@@ -241,7 +242,14 @@ def _get_description(fs: FileSystem, path: str) -> str:
                     in_comment = False
                 continue
             if not line or line.startswith(">"):
+                after_delimiter = False
                 continue
+            if line in ("---", "..."):
+                after_delimiter = True
+                continue
+            if after_delimiter and ":" in line and not line.startswith("#"):
+                continue
+            after_delimiter = False
             if line.startswith("<!--"):
                 in_comment = "-->" not in line
                 continue
