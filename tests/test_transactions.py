@@ -1,6 +1,7 @@
 """Tests for TransactionManager and git backend transaction methods."""
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -1316,6 +1317,33 @@ class TestPathScopedTransactions:
             await tm.abort_transaction("s1")
             await tm.abort_transaction("s2")
 
+    @pytest.mark.asyncio
+    async def test_end_transaction_destroys_the_transaction_even_when_commit_fails(self):
+        """Documents current, deliberately-kept behavior (see Task 3's report):
+        a commit failure still closes the transaction and releases the lock.
+        The caller's edit remains on disk, dirty and unstaged, but the
+        transaction that owned it is gone -- it cannot be retried or aborted.
+
+        A malformed ``author`` makes ``git commit`` fail deterministically,
+        the same trigger ``test_commit_paths_unstages_on_commit_failure`` uses
+        for ``GitBackend.commit_paths`` directly.
+        """
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=30)
+            async with tm.guard("s1"):
+                fs.write_file("orphan.md", "stuck")
+                await tm.after_write(["orphan.md"], session_id="s1")
+            with pytest.raises(RuntimeError, match="git commit failed"):
+                await tm.end_transaction("s1", "msg", author="not a valid author")
+            assert tm.open_transaction_count == 0            # transaction destroyed...
+            assert not tm.write_lock.locked()                 # ...and the lock released
+            assert (path / "orphan.md").read_text() == "stuck"   # ...edit survives, orphaned
+            assert not tm.git.has_staged_changes()             # index invariant still holds
+            with pytest.raises(TransactionError, match="No active transaction"):
+                await tm.end_transaction("s1", "retry")       # cannot retry: nothing to retry
+
 
 class TestAutocommit:
     def _make_autocommit_tm(self, tmpdir: Path):
@@ -1423,3 +1451,193 @@ class TestAutocommit:
             for line in lines:
                 author, subject = line.split("|")
                 assert subject.startswith(author)      # each commit attributed to its writer
+
+
+# ---------------------------------------------------------------------------
+# MCP write tools — guard, after_write, commit_message/author
+# ---------------------------------------------------------------------------
+
+
+class TestMCPAutocommitTools:
+    def _make_mcp(self, tmpdir: Path):
+        from stash_mcp.git_backend import GitBackend
+        from stash_mcp.mcp_server import create_mcp_server
+
+        _init_repo(tmpdir)
+        fs = FileSystem(tmpdir)
+        git = GitBackend(tmpdir)
+        tm = TransactionManager(fs, git, autocommit=True, author_default="Bot <bot@x>")
+        with (
+            patch("stash_mcp.mcp_server.Config.READ_ONLY", False),
+            patch("stash_mcp.mcp_server.Config.GIT_SYNC_ENABLED", False),
+        ):
+            mcp = create_mcp_server(fs, git_backend=git, transaction_manager=tm)
+        return mcp, tm, fs
+
+    def _mock_context(self, session_obj=None):
+        from fastmcp.server.context import Context, _current_context
+
+        ctx = MagicMock(spec=Context)
+        ctx.session = session_obj or MagicMock()
+        ctx.session.send_resource_updated = AsyncMock()
+        ctx.send_resource_list_changed = AsyncMock()
+        token = _current_context.set(ctx)
+        return ctx, token
+
+    @pytest.mark.asyncio
+    async def test_create_autocommits_with_message_and_author(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                tool = await mcp.get_tool("create_content")
+                result = await tool.run({
+                    "path": "new.md", "content": "hello",
+                    "commit_message": "doc-writer s7 describes=openpilot@v0.11.1",
+                    "author": "doc-writer <dw@agents>",
+                })
+                text = str(result.content)
+                assert "Created: new.md" in text and "(commit " in text
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            shown = _show_names(path)
+            assert "new.md" in shown and "doc-writer s7" in shown and "doc-writer" in shown
+
+    @pytest.mark.asyncio
+    async def test_edit_returns_commit_and_uses_default_message(self):
+        import hashlib
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                sha = hashlib.sha256(b"# Test\n").hexdigest()
+                tool = await mcp.get_tool("edit_content")
+                result = await tool.run({
+                    "file_path": "README.md", "sha": sha,
+                    "edits": [{"old_string": "Test", "new_string": "Tested"}],
+                })
+                data = json.loads(str(result.content[0].text))
+                assert data["result"] == "ok" and data["commit"]
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            assert "Update README.md" in _show_names(path)
+
+    @pytest.mark.asyncio
+    async def test_batch_edit_is_one_commit(self):
+        import hashlib
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            fs.write_file("a.md", "aa")
+            fs.write_file("b.md", "bb")
+            ctx, token = self._mock_context()
+            try:
+                tool = await mcp.get_tool("edit_content_batch")
+                await tool.run({"edit_operations": [
+                    {"file_path": "a.md", "sha": hashlib.sha256(b"aa").hexdigest(),
+                     "edits": [{"old_string": "aa", "new_string": "AA"}]},
+                    {"file_path": "b.md", "sha": hashlib.sha256(b"bb").hexdigest(),
+                     "edits": [{"old_string": "bb", "new_string": "BB"}]},
+                ]})
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            shown = _show_names(path)
+            assert "a.md" in shown and "b.md" in shown and "Update 2 files" in shown
+
+    @pytest.mark.asyncio
+    async def test_move_and_delete_autocommit(self):
+        import hashlib
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                move = await mcp.get_tool("move_content")
+                text = str((await move.run({
+                    "source_path": "README.md", "dest_path": "docs/README.md",
+                })).content)
+                assert "(commit " in text
+                assert "Move README.md -> docs/README.md" in _show_names(path)
+                delete = await mcp.get_tool("delete_content")
+                text = str((await delete.run({
+                    "path": "docs/README.md", "sha": hashlib.sha256(b"# Test\n").hexdigest(),
+                })).content)
+                assert "(commit " in text
+                assert "Delete docs/README.md" in _show_names(path)
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_transaction_groups_writes_and_folds_messages(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            session_obj = MagicMock()
+            ctx, token = self._mock_context(session_obj)
+            try:
+                await (await mcp.get_tool("start_content_transaction")).run({})
+                create = await mcp.get_tool("create_content")
+                await create.run({"path": "x.md", "content": "x", "commit_message": "made x"})
+                await create.run({"path": "y.md", "content": "y"})
+                assert "x.md" not in _show_names(path)          # not committed yet
+                result = await (await mcp.get_tool("commit_content_transaction")).run(
+                    {"message": "Group"}
+                )
+                assert "committed" in str(result.content).lower()
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            shown = _show_names(path)
+            assert "x.md" in shown and "y.md" in shown
+            assert "- made x" in _git_log(path, "-1", "--format=%b")
+
+    @pytest.mark.asyncio
+    async def test_instructions_and_note_mention_autocommit(self):
+        with TemporaryDirectory() as tmpdir:
+            mcp, tm, fs = self._make_mcp(Path(tmpdir))
+            assert "committed to git automatically" in (mcp.instructions or "")
+            tool = await mcp.get_tool("create_content")
+            assert "commit_message" in (tool.description or "")
+
+    @pytest.mark.asyncio
+    async def test_abort_tool_translates_a_failed_restore_into_a_clear_error(self):
+        """abort_transaction can raise RuntimeError when the restore itself
+        fails; the MCP tool must not let that surface as an unexplained raw
+        git error, and must not claim the abort succeeded either way."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                await (await mcp.get_tool("start_content_transaction")).run({})
+                overwrite = await mcp.get_tool("overwrite_content")
+                import hashlib
+
+                sha = hashlib.sha256(b"# Test\n").hexdigest()
+                await overwrite.run({"path": "README.md", "content": "corrupted", "sha": sha})
+                lock = path / ".git" / "index.lock"
+                lock.write_text("")
+                try:
+                    with pytest.raises(ValueError) as exc_info:
+                        await (await mcp.get_tool("abort_content_transaction")).run({})
+                finally:
+                    lock.unlink(missing_ok=True)
+                message = str(exc_info.value)
+                assert "not reverted" in message.lower()
+                assert "aborted." != message.strip()   # must not read as a plain success
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            # The transaction was closed (Task 2's design) but the file content
+            # genuinely was not reverted -- the tool must not have lied about it.
+            assert (path / "README.md").read_text() == "corrupted"
+            assert tm.open_transaction_count == 0
