@@ -397,6 +397,17 @@ class GitBackend:
     # Path-scoped operations (autocommit / concurrent transactions)
     # ------------------------------------------------------------------
 
+    def _normalize_paths(self, paths: list[str] | None) -> list[str]:
+        """Strip leading/trailing ``/`` from each path and drop empties.
+
+        Shared by every path-taking method in this section so pathspecs
+        handed to git are always POSIX-relative to ``content_dir`` with no
+        leading slash.
+        """
+        if not paths:
+            return []
+        return [p.strip("/") for p in paths if p and p.strip("/")]
+
     def _stageable(self, paths: list[str]) -> list[str]:
         """Return the subset of *paths* that exist on disk or are tracked.
 
@@ -404,7 +415,7 @@ class GitBackend:
         (neither worktree nor index), e.g. a file created and deleted within
         one transaction. Filtering keeps the commit robust.
         """
-        clean = [p.strip("/") for p in paths if p and p.strip("/")]
+        clean = self._normalize_paths(paths)
         if not clean:
             return []
         existing = [p for p in clean if (self.content_dir / p).exists()]
@@ -423,8 +434,9 @@ class GitBackend:
     def has_staged_changes(self, paths: list[str] | None = None) -> bool:
         """True when the index differs from HEAD (optionally only for *paths*)."""
         args = ["git", "diff", "--cached", "--quiet"]
-        if paths:
-            args += ["--", *paths]
+        normalized = self._normalize_paths(paths)
+        if normalized:
+            args += ["--", *normalized]
         result = self._run(args)
         if result.returncode == 0:
             return False
@@ -435,8 +447,9 @@ class GitBackend:
     def unstage(self, paths: list[str] | None = None) -> None:
         """``git reset -q [-- paths]`` — clears the index, leaves the worktree alone."""
         args = ["git", "reset", "-q"]
-        if paths:
-            args += ["--", *paths]
+        normalized = self._normalize_paths(paths)
+        if normalized:
+            args += ["--", *normalized]
         result = self._run(args)
         if result.returncode != 0:
             logger.warning("git reset failed: %s", result.stderr.strip())
@@ -461,6 +474,7 @@ class GitBackend:
         commit_args = ["git", "commit", "-q", "-m", message]
         if author:
             commit_args.extend(["--author", author])
+        commit_args.extend(["--", *stageable])
         commit_result = self._run(commit_args)
         if commit_result.returncode != 0:
             self.unstage(stageable)
@@ -479,7 +493,7 @@ class GitBackend:
         Returns:
             ``(restored, deleted)`` lists of relative paths.
         """
-        clean = [p.strip("/") for p in paths if p and p.strip("/")]
+        clean = self._normalize_paths(paths)
         if not clean:
             return [], []
         ls = self._run(["git", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", *clean])

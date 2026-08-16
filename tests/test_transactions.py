@@ -11,7 +11,6 @@ import pytest
 from stash_mcp.filesystem import FileSystem
 from stash_mcp.transactions import TransactionError, TransactionManager
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -176,6 +175,47 @@ class TestGitBackendNewMethods:
             assert git.commit_paths(["README.md"], "no change") is None
             assert git.commit_paths(["never-existed.md"], "ghost") is None
             assert git.commit_paths([], "empty") is None
+
+    def test_commit_paths_does_not_sweep_in_unrelated_staged_changes(self):
+        """Regression test: ``git commit`` with no trailing pathspec commits the
+        *entire* index, not just the paths this call just staged. A concurrent
+        writer's own staged-but-uncommitted path must survive untouched."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "a.md").write_text("A")
+            (path / "other.md").write_text("OTHER")
+            # Simulate a second, concurrent session that staged its own change
+            # but hasn't committed yet.
+            subprocess.run(
+                ["git", "-C", tmpdir, "add", "other.md"], check=True, capture_output=True,
+            )
+            short = git.commit_paths(["a.md"], "Add a")
+            assert short
+            names = subprocess.run(
+                ["git", "-C", tmpdir, "show", "--name-only", "--format=", "HEAD"],
+                capture_output=True, text=True,
+            ).stdout
+            assert "a.md" in names and "other.md" not in names
+            assert git.has_staged_changes(["other.md"])      # untouched: still staged
+            assert not git.has_staged_changes(["a.md"])       # committed: index clean
+
+    def test_commit_paths_unstages_on_commit_failure(self):
+        """A malformed --author makes ``git commit`` fail deterministically;
+        the index invariant requires the just-staged paths to be unstaged."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "b.md").write_text("B")
+            with pytest.raises(RuntimeError, match="git commit failed"):
+                git.commit_paths(["b.md"], "msg", author="not a valid author")
+            assert not git.has_staged_changes(["b.md"])
 
     def test_restore_paths_checks_out_tracked_and_deletes_untracked(self):
         from stash_mcp.git_backend import GitBackend
