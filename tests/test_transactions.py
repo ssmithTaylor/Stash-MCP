@@ -245,6 +245,33 @@ class TestGitBackendNewMethods:
             assert restored == ["README.md"] and deleted == []
             assert (path / "README.md").exists()
 
+    def test_restore_paths_raises_on_checkout_failure(self):
+        """Pre-creating an empty ``.git/index.lock`` makes the underlying
+        ``git checkout`` fail deterministically (exit 128, "Unable to create
+        ... index.lock: File exists") with no second process and no repo
+        corruption — the same class of clean trigger as a malformed
+        --author. The lock is removed in ``finally`` so a failing assertion
+        can't leave it behind and break the temp repo's teardown."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "README.md").write_text("corrupted")
+            lock = path / ".git" / "index.lock"
+            lock.write_text("")
+            try:
+                with pytest.raises(RuntimeError, match="git checkout failed"):
+                    git.restore_paths(["README.md"])
+            finally:
+                lock.unlink(missing_ok=True)
+            # Repo is fully functional again once the lock is gone — no
+            # corruption from the failed attempt.
+            restored, deleted = git.restore_paths(["README.md"])
+            assert restored == ["README.md"] and deleted == []
+            assert (path / "README.md").read_text() == "# Test\n"
+
     def test_unstage_and_has_staged_changes(self):
         from stash_mcp.git_backend import GitBackend
 
@@ -258,6 +285,30 @@ class TestGitBackendNewMethods:
             git.unstage()
             assert not git.has_staged_changes()
             assert (path / "s.md").exists()      # worktree untouched
+
+    def test_degenerate_paths_are_a_noop_not_whole_index(self):
+        """A non-empty ``paths`` that normalizes to nothing (e.g. ``["/"]``)
+        must be a no-op for has_staged_changes/unstage — it must never
+        silently widen to the whole index, which is reserved for
+        paths=None."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "x.md").write_text("x")
+            subprocess.run(["git", "-C", tmpdir, "add", "x.md"], check=True, capture_output=True)
+
+            assert not git.has_staged_changes(["/"])
+            assert not git.has_staged_changes([""])
+            git.unstage(["/"])
+            assert git.has_staged_changes()           # x.md still staged: no-op confirmed
+            assert git.has_staged_changes(["x.md"])
+
+            # paths=None keeps its documented whole-index meaning.
+            git.unstage()
+            assert not git.has_staged_changes()
 
     def test_ahead_count_without_remote_is_zero(self):
         from stash_mcp.git_backend import GitBackend

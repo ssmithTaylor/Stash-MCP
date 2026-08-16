@@ -432,10 +432,18 @@ class GitBackend:
         return ordered
 
     def has_staged_changes(self, paths: list[str] | None = None) -> bool:
-        """True when the index differs from HEAD (optionally only for *paths*)."""
+        """True when the index differs from HEAD (optionally only for *paths*).
+
+        A non-empty *paths* that normalizes to nothing (e.g. ``["/"]``) is a
+        no-op and reports ``False`` — it must never silently widen to the
+        whole index. Only ``paths=None`` (or an empty list) means "check the
+        whole index".
+        """
         args = ["git", "diff", "--cached", "--quiet"]
-        normalized = self._normalize_paths(paths)
-        if normalized:
+        if paths:
+            normalized = self._normalize_paths(paths)
+            if not normalized:
+                return False
             args += ["--", *normalized]
         result = self._run(args)
         if result.returncode == 0:
@@ -445,10 +453,17 @@ class GitBackend:
         raise RuntimeError(f"git diff --cached failed: {result.stderr.strip()}")
 
     def unstage(self, paths: list[str] | None = None) -> None:
-        """``git reset -q [-- paths]`` — clears the index, leaves the worktree alone."""
+        """``git reset -q [-- paths]`` — clears the index, leaves the worktree alone.
+
+        A non-empty *paths* that normalizes to nothing (e.g. ``["/"]``) is a
+        no-op — it must never silently widen to a whole-index reset. Only
+        ``paths=None`` (or an empty list) resets the whole index.
+        """
         args = ["git", "reset", "-q"]
-        normalized = self._normalize_paths(paths)
-        if normalized:
+        if paths:
+            normalized = self._normalize_paths(paths)
+            if not normalized:
+                return
             args += ["--", *normalized]
         result = self._run(args)
         if result.returncode != 0:
