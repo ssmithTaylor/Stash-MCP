@@ -300,7 +300,7 @@ environment:
 
 ### Transactions
 
-When `STASH_GIT_TRACKING=true` and `STASH_READ_ONLY=false`, writes are gated behind transactions by default: an agent must open one before it can write, and a batch of related changes lands in git as a single, path-scoped commit. Set `STASH_GIT_AUTOCOMMIT=true` to commit every write immediately instead and make transactions optional.
+When `STASH_GIT_TRACKING=true` and `STASH_READ_ONLY=false`, writes are gated behind transactions by default: an agent must open one before it can write, and a batch of related changes lands in git as a single, path-scoped commit. Set `STASH_GIT_AUTOCOMMIT=true` to commit every write immediately instead and make transactions optional. The gate applies to MCP writes only: REST (`/api/content/...`) and web-UI writes take the write lock but are never transaction-gated, so they commit immediately regardless of `STASH_GIT_AUTOCOMMIT`.
 
 Workflow:
 
@@ -313,14 +313,17 @@ Workflow:
 
 ### Mode matrix
 
-| `STASH_READ_ONLY` | `STASH_GIT_TRACKING` | `STASH_GIT_SYNC_ENABLED` | Behavior |
-|---|---|---|---|
-| `false` | `false` | — | Default: writes go directly to disk, no git |
-| `true`  | `false` | — | Read-only: no write tools registered |
-| `false` | `true`  | `false` | Writes committed to local git via transactions |
-| `true`  | `true`  | `false` | Read-only + git history/blame tools available |
-| `false` | `true`  | `true`  | Writes committed to git + periodic pulls from remote |
-| `true`  | `true`  | `true`  | Read-only + git history/blame + auto-sync from remote |
+| `STASH_READ_ONLY` | `STASH_GIT_TRACKING` | `STASH_GIT_AUTOCOMMIT` | `STASH_GIT_SYNC_ENABLED` | Behavior |
+|---|---|---|---|---|
+| `false` | `false` | — | — | Default: writes go directly to disk, no git |
+| `true`  | `false` | — | — | Read-only: no write tools registered |
+| `false` | `true`  | `false` | `false` | MCP writes gated behind transactions; REST/UI writes commit immediately |
+| `false` | `true`  | `true`  | `false` | Every write commits immediately; transactions optional, for grouping |
+| `true`  | `true`  | — | `false` | Read-only + git history/blame tools available |
+| `false` | `true`  | either | `true`  | As the matching row above, plus periodic pulls from the remote and a push whenever the branch is ahead |
+| `true`  | `true`  | — | `true`  | Read-only + git history/blame + auto-sync from remote |
+
+`STASH_GIT_AUTOCOMMIT=true` without `STASH_GIT_TRACKING=true` is ignored with a warning; it never fails startup.
 
 ### Docker Compose examples
 

@@ -378,7 +378,7 @@ Stash-MCP can track every write in a local git repository, giving you file histo
 
 ### Autocommit vs. transactions
 
-With `STASH_GIT_TRACKING=true` every write runs under one short write lock. Set `STASH_GIT_AUTOCOMMIT=true` to commit each write immediately — every write tool and REST endpoint accepts an optional `commit_message` and `author`, so `git log`/`blame_content` show which agent wrote what (the web UI's editor commits automatically instead, tagged `UI: save/move/delete <path>`). To land several writes as one commit, open a transaction first (`start_content_transaction` … `commit_content_transaction`); transactions are per-session, may be open concurrently, and commit/abort only the files they touched. With autocommit off (default) writes outside a transaction are rejected, as before.
+With `STASH_GIT_TRACKING=true` every write runs under one short write lock. Set `STASH_GIT_AUTOCOMMIT=true` to commit each write immediately — every write tool and REST endpoint accepts an optional `commit_message` and `author`, so `git log`/`blame_content` show which agent wrote what (the web UI's editor commits automatically instead, tagged `UI: save/move/delete <path>`). To land several writes as one commit, open a transaction first (`start_content_transaction` … `commit_content_transaction`); transactions are per-session, may be open concurrently, and commit/abort only the files they touched. With autocommit off (default) *MCP* writes outside a transaction are rejected, as before — but the REST API and the web UI are never transaction-gated: they take the write lock and commit each write immediately whatever `STASH_GIT_AUTOCOMMIT` is set to.
 
 ## Content Organization
 
