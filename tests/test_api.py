@@ -432,6 +432,19 @@ def test_move_content_blocked_when_read_only(test_client, monkeypatch):
     assert dest.status_code == 404
 
 
+def test_delete_nonexistent_content_returns_403_when_read_only(
+    test_client, monkeypatch
+):
+    """DELETE on nonexistent path returns 403 (not 404) in read-only mode.
+
+    The 403 guard is the first statement in the route body, ensuring
+    it runs before the existence check that would otherwise return 404.
+    """
+    monkeypatch.setattr("stash_mcp.api.Config.READ_ONLY", True)
+    response = test_client.delete("/api/content/does-not-exist.md")
+    assert response.status_code == 403
+
+
 def test_write_routes_work_when_not_read_only(test_client, monkeypatch):
     """READ_ONLY=False leaves all four write routes fully functional.
 
