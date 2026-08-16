@@ -23,6 +23,7 @@ from .events import CONTENT_CREATED, CONTENT_DELETED, CONTENT_MOVED, CONTENT_UPD
 from .filesystem import FileNotFoundError, FileSystem, InvalidPathError
 from .headings import scan_headings
 from .metrics import get_metrics
+from .search import reject_path_traversal
 from .transactions import TransactionError, TransactionManager
 
 logger = logging.getLogger(__name__)
@@ -1360,14 +1361,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                     p.strip() for p in exclude_patterns.split(",") if p.strip()
                 ]
             for label, value in (("path_prefix", path_prefix), ("boost_prefix", boost_prefix)):
-                for part in (value or "").split(","):
-                    stripped = part.strip()
-                    # Normalize '\' -> '/' before checking, matching _normalize_path
-                    # (search.py) so a backslash-spelled traversal (Windows-style
-                    # input) is caught exactly like the forward-slash form instead
-                    # of silently reaching the engine as a no-op prefix.
-                    if stripped and ".." in PurePosixPath(stripped.replace("\\", "/")).parts:
-                        raise ValueError(f"{label} must not contain '..' segments")
+                reject_path_traversal(label, value)
 
             t0 = time.perf_counter()
             results = await search_engine.search(

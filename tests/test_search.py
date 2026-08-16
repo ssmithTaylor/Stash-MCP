@@ -669,17 +669,23 @@ class TestSearchAPI:
         with TemporaryDirectory() as content_dir:
             with TemporaryDirectory() as index_dir:
                 fs = FileSystem(Path(content_dir))
-                fs.write_file("docs/auth.md", "# Auth\n\nOAuth2 flow here.")
+                fs.write_file(
+                    "docs/auth.md", "---\nlayer: frogpilot\n---\n# Auth\n\nOAuth2 flow here."
+                )
                 fs.write_file("notes.md", "# Notes\n\nMeeting notes.")
+                fs.write_file("_reports/scan.md", "# Scan\n\nOAuth2 flow auth auth.")
 
                 engine = SearchEngine(
                     content_dir=Path(content_dir),
                     index_dir=Path(index_dir),
                     embed_fn=mock_embed,
+                    default_exclude_patterns=["**/_reports/**"],
                 )
 
                 # Build index directly since reindex endpoint is now non-blocking
-                asyncio.run(engine.build_index(["docs/auth.md", "notes.md"]))
+                asyncio.run(
+                    engine.build_index(["docs/auth.md", "notes.md", "_reports/scan.md"])
+                )
 
                 app = create_api(fs, search_engine=engine)
                 client = TestClient(app)
@@ -724,6 +730,81 @@ class TestSearchAPI:
         data = response.json()
         for result in data["results"]:
             assert result["file_path"].endswith(".md")
+
+    def test_search_default_exclusion_and_include_excluded(self, search_client):
+        data = search_client.get("/api/search", params={"q": "oauth flow"}).json()
+        paths = [r["file_path"] for r in data["results"]]
+        assert "docs/auth.md" in paths and "_reports/scan.md" not in paths
+        data = search_client.get(
+            "/api/search", params={"q": "oauth flow", "include_excluded": "true"},
+        ).json()
+        assert "_reports/scan.md" in [r["file_path"] for r in data["results"]]
+
+    def test_search_result_fields_and_metadata_filter(self, search_client):
+        data = search_client.get(
+            "/api/search", params={"q": "oauth flow", "filter": ["layer:frogpilot"]},
+        ).json()
+        assert [r["file_path"] for r in data["results"]] == ["docs/auth.md"]
+        item = data["results"][0]
+        assert item["metadata"] == {"layer": "frogpilot"}
+        assert item["heading_path"] == ["Auth"]
+        for key in ("last_changed_at", "changed_by", "commit_message"):
+            assert key in item
+
+    def test_search_boost_prefix_reorders(self, search_client):
+        plain = search_client.get(
+            "/api/search", params={"q": "oauth flow", "include_excluded": "true"},
+        ).json()["results"]
+        boosted = search_client.get(
+            "/api/search",
+            params={"q": "oauth flow", "include_excluded": "true", "boost_prefix": "_reports/"},
+        ).json()["results"]
+        assert plain[0]["file_path"] == "docs/auth.md"
+        assert boosted[0]["file_path"] == "_reports/scan.md"
+
+    def test_search_path_prefix_and_bad_filter(self, search_client):
+        data = search_client.get(
+            "/api/search", params={"q": "oauth flow", "path_prefix": "docs"},
+        ).json()
+        assert all(r["file_path"].startswith("docs/") for r in data["results"])
+        resp = search_client.get("/api/search", params={"q": "x", "filter": ["nocolon"]})
+        assert resp.status_code == 400
+
+    def test_search_status_reports_default_excludes(self, search_client):
+        data = search_client.get("/api/search/status").json()
+        assert data["default_exclude_patterns"] == ["**/_reports/**"]
+        assert data["boost_weight"] == 0.15
+
+    def test_search_rejects_parent_traversal_prefix(self, search_client):
+        """REST must reject '..' path segments exactly like the MCP tool does
+        (see TestMCPSearchTool.test_search_tool_rejects_parent_traversal_prefix),
+        including the backslash-spelled form, for both path_prefix and
+        boost_prefix."""
+        resp = search_client.get(
+            "/api/search", params={"q": "auth", "path_prefix": "../etc"},
+        )
+        assert resp.status_code == 400
+        assert "path_prefix" in resp.json()["detail"]
+
+        resp = search_client.get(
+            "/api/search", params={"q": "auth", "path_prefix": "..\\etc"},
+        )
+        assert resp.status_code == 400
+        assert "path_prefix" in resp.json()["detail"]
+
+        resp = search_client.get(
+            "/api/search", params={"q": "auth", "boost_prefix": "../etc"},
+        )
+        assert resp.status_code == 400
+        assert "boost_prefix" in resp.json()["detail"]
+
+    def test_search_accepts_prefix_merely_containing_dotdot(self, search_client):
+        """A legitimate name that contains '..' without it being its own path
+        segment (e.g. "archive..old") is not a traversal and must be accepted."""
+        resp = search_client.get(
+            "/api/search", params={"q": "oauth flow", "path_prefix": "archive..old"},
+        )
+        assert resp.status_code == 200
 
 
 # --- API without search engine ---
@@ -924,6 +1005,31 @@ class TestMCPSearchTool:
                 # path separator too, so the validation must match that convention.
                 with pytest.raises(ValueError, match="path_prefix"):
                     await tool.run({"query": "auth", "path_prefix": "..\\etc"})
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_accepts_prefix_merely_containing_dotdot(self):
+        """A legitimate name that contains '..' without it being its own path
+        segment (e.g. "archive..old") is not a traversal and must be accepted
+        — mirrors TestSearchAPI.test_search_accepts_prefix_merely_containing_dotdot,
+        confirming REST and MCP share the same accept/reject decision."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {"archive..old/notes.md": "# A\n\nauth oauth flow"},
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                text = str((await tool.run({
+                    "query": "auth oauth", "path_prefix": "archive..old",
+                })).content)
+                assert "archive..old/notes.md" in text
             finally:
                 _current_context.reset(token)
 

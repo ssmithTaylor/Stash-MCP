@@ -12,7 +12,7 @@ import pickle
 import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .filesystem import glob_to_regex
 from .frontmatter import extract_metadata, normalize_key
@@ -100,6 +100,32 @@ def path_under_any(path: str, prefixes: list[str]) -> bool:
         if path == p or path.startswith(p + "/"):
             return True
     return False
+
+
+def reject_path_traversal(label: str, value: str | None) -> None:
+    """Raise ValueError if any comma-separated part of *value* is a '..' escape.
+
+    Shared by the MCP ``search_content`` tool and the REST ``/api/search``
+    endpoint so a ``path_prefix``/``boost_prefix`` value gets the same
+    accept/reject decision regardless of which surface it arrives through.
+    Backslashes are normalized to forward slashes first (matching
+    ``_normalize_path``) so a Windows-style traversal (``"..\\etc"``) is
+    rejected exactly like the POSIX form (``"../etc"``) instead of silently
+    reaching the engine as a no-op prefix. A name that merely contains
+    ``".."`` without it being its own path segment (e.g.
+    ``"archive..old/notes.md"``) is not rejected.
+
+    Args:
+        label: Parameter name used in the error message (e.g. "path_prefix").
+        value: Raw, comma-separated caller input (or None).
+
+    Raises:
+        ValueError: If any segment is exactly "..".
+    """
+    for part in (value or "").split(","):
+        stripped = part.strip()
+        if stripped and ".." in PurePosixPath(stripped.replace("\\", "/")).parts:
+            raise ValueError(f"{label} must not contain '..' segments")
 
 
 @dataclass
