@@ -565,16 +565,23 @@ class TestTransactionManagerTimeout:
             assert tm.open_transaction_count == 0
 
     @pytest.mark.asyncio
-    async def test_second_session_acquires_lock_after_timeout(self):
+    async def test_timeout_reverts_writes_and_frees_the_session(self):
+        """After the idle timeout the transaction is gone, its writes are
+        reverted and it leaves nothing staged, so the same session can open a
+        fresh one."""
         with TemporaryDirectory() as tmpdir:
-            tm, _ = _make_tm(Path(tmpdir))
+            path = Path(tmpdir)
+            tm, _ = _make_tm(path)
             await tm.start_transaction("session-1", timeout=0.1, lock_wait=5)
+            tm.write_file("scratch.md", "in flight")
             # Wait for auto-abort
             await asyncio.sleep(0.5)
-            # Session 2 should now be able to acquire
-            txn_id = await tm.start_transaction("session-2", timeout=30, lock_wait=5)
+            assert tm.open_transaction_count == 0
+            assert not (path / "scratch.md").exists()
+            assert not tm.git.has_staged_changes()
+            txn_id = await tm.start_transaction("session-1", timeout=0, lock_wait=5)
             assert txn_id is not None
-            await tm.abort_transaction("session-2")
+            await tm.abort_transaction("session-1")
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +634,40 @@ class TestTransactionManagerSyncCallbacks:
             await tm.start_transaction("session-1", timeout=0.1, lock_wait=5)
             await asyncio.sleep(0.5)
             resume.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_fires_once_when_the_same_transaction_closes_twice(self):
+        """``_close`` must only resume sync on the path that actually removed
+        the transaction; a racing double-close would otherwise resume twice."""
+        with TemporaryDirectory() as tmpdir:
+            tm, _ = _make_tm(Path(tmpdir))
+            pause = MagicMock()
+            resume = MagicMock()
+            tm.set_sync_callbacks(pause, resume)
+            await tm.start_transaction("session-1", timeout=0)
+            txn = tm._txns["session-1"]
+            await tm.abort_transaction("session-1")   # closes it for real
+            resume.assert_called_once()
+            tm._close(txn)                            # a racing path closes it again
+            resume.assert_called_once()               # still exactly once
+
+    @pytest.mark.asyncio
+    async def test_raising_sync_callback_cannot_strand_the_write_lock(self):
+        """Sync callbacks come from the host app. ``resume`` runs inside the
+        ``finally`` that releases the write lock, so a raising one must not
+        take writes down server-wide."""
+        with TemporaryDirectory() as tmpdir:
+            tm, _ = _make_tm(Path(tmpdir))
+
+            def boom():
+                raise RuntimeError("sync callback exploded")
+
+            tm.set_sync_callbacks(pause=boom, resume=boom)
+            await tm.start_transaction("session-1", timeout=0)   # pause raises
+            assert tm.open_transaction_count == 1
+            await tm.abort_transaction("session-1")              # resume raises
+            assert tm.open_transaction_count == 0
+            assert not tm.write_lock.locked()
 
 
 # ---------------------------------------------------------------------------
@@ -1138,6 +1179,79 @@ class TestPathScopedTransactions:
             assert (path / "keep.md").read_text() == "v2"    # v2 survives
             assert tm.open_transaction_count == 1
             await tm.abort_transaction("s1")
+
+    @pytest.mark.asyncio
+    async def test_end_transaction_refuses_once_its_transaction_was_closed(self):
+        """A commit that wakes after its own transaction was aborted must not
+        commit whatever another writer has since put in those paths.
+
+        ``_txns`` is cleared directly to stand in for the idle timer, which
+        would need the very lock this test holds to create the queue.
+        """
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=0)
+            async with tm.guard("s1"):
+                fs.write_file("shared.md", "s1 content")
+                await tm.after_write(["shared.md"], session_id="s1")
+            await tm.write_lock.acquire()                # force the commit to queue
+            task = asyncio.create_task(tm.end_transaction("s1", "s1 commit"))
+            await asyncio.sleep(0.05)                    # task is now waiting
+            tm._txns.clear()                             # s1's txn is aborted meanwhile
+            fs.write_file("shared.md", "s2 content")     # another writer moves in
+            tm.write_lock.release()
+            with pytest.raises(TransactionError, match="No active transaction"):
+                await task
+            assert (path / "shared.md").read_text() == "s2 content"
+            assert "shared.md" not in _show_names(path)  # nothing was committed
+            assert not tm.write_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_abort_propagates_a_failed_restore(self):
+        """An abort that could not revert must not report success.
+
+        A pre-created ``.git/index.lock`` makes ``git checkout`` fail
+        deterministically; it is removed in ``finally`` so a failing assertion
+        cannot break the temp repo's teardown.
+        """
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=0)
+            async with tm.guard("s1"):
+                fs.write_file("README.md", "corrupted")
+                await tm.after_write(["README.md"], session_id="s1")
+            lock = path / ".git" / "index.lock"
+            lock.write_text("")
+            try:
+                with pytest.raises(RuntimeError, match="git checkout failed"):
+                    await tm.abort_transaction("s1")
+            finally:
+                lock.unlink(missing_ok=True)
+            assert (path / "README.md").read_text() == "corrupted"  # really not reverted
+            assert tm.open_transaction_count == 0      # still closed …
+            assert not tm.write_lock.locked()          # … and the lock still released
+
+    @pytest.mark.asyncio
+    async def test_timeout_still_swallows_a_failed_restore(self):
+        """The idle timer must never die noisily, even when the restore fails."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=0)   # drive the timer by hand
+            txn = tm._txns["s1"]
+            async with tm.guard("s1"):
+                fs.write_file("README.md", "corrupted")
+                await tm.after_write(["README.md"], session_id="s1")
+            lock = path / ".git" / "index.lock"
+            lock.write_text("")
+            try:
+                await tm._auto_abort(txn, 0)              # must not raise
+            finally:
+                lock.unlink(missing_ok=True)
+            assert tm.open_transaction_count == 0
+            assert not tm.write_lock.locked()
 
     @pytest.mark.asyncio
     async def test_abort_emits_content_events_for_reverted_paths(self):

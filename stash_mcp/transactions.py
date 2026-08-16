@@ -126,6 +126,21 @@ class TransactionManager:
         self._pause_sync = pause
         self._resume_sync = resume
 
+    def _notify_sync(self, callback: Callable[[], None] | None, label: str) -> None:
+        """Invoke a git-sync callback without letting it corrupt our state.
+
+        These come from the host application. ``resume`` runs inside the
+        ``finally`` that releases the write lock, so a raising callback would
+        strand the lock and take writes down server-wide; a raising ``pause``
+        would leave a transaction registered with no idle timer armed.
+        """
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            logger.error("Git-sync %s callback failed", label, exc_info=True)
+
     # ------------------------------------------------------------------
     # Write lock
     # ------------------------------------------------------------------
@@ -239,8 +254,8 @@ class TransactionManager:
         )
         first = not self._txns
         self._txns[session_id] = txn
-        if first and self._pause_sync is not None:
-            self._pause_sync()
+        if first:
+            self._notify_sync(self._pause_sync, "pause")
         self._reset_timeout(txn)
         logger.info("Transaction started: %s (session=%s)", txn.txn_id, session_id)
         return txn.txn_id
@@ -260,12 +275,19 @@ class TransactionManager:
         when nothing changed.
 
         Raises:
-            TransactionError: If *session_id* does not own an open transaction.
+            TransactionError: If *session_id* does not own an open transaction,
+                or if that transaction was closed while this call waited for
+                the write lock.
             RuntimeError: If the git commit or push fails.
         """
         txn = self._require_txn(session_id)
         await self._acquire()  # if this times out the txn stays open with its timer armed
         try:
+            if self._txns.get(session_id) is not txn:
+                # Timed out or aborted while we queued for the lock. Committing
+                # its paths now would sweep up whoever has written them since,
+                # under this session's message and author.
+                raise TransactionError(_NO_ACTIVE_TRANSACTION)
             self._cancel_timeout(txn)
             body = message
             if txn.messages:
@@ -285,6 +307,9 @@ class TransactionManager:
 
         Raises:
             TransactionError: If *session_id* does not own an open transaction.
+            RuntimeError: If restoring the touched paths fails. The
+                transaction is still closed, but the working tree was *not*
+                reverted — callers must not report the abort as successful.
         """
         txn = self._require_txn(session_id)
         await self._abort(txn)
@@ -302,8 +327,13 @@ class TransactionManager:
             restored, deleted = await asyncio.to_thread(
                 self._restore_and_unstage, list(txn.touched)
             )
-        except Exception as exc:
-            logger.error("Restore on abort failed for %s: %s", txn.txn_id, exc)
+        except Exception:
+            # Close and release (in the finally) but let the caller know the
+            # working tree was not actually reverted; reporting a clean abort
+            # here would be a lie the caller can no longer retry. The timeout
+            # path swallows this again in :meth:`_auto_abort`.
+            logger.error("Restore on abort failed for %s", txn.txn_id, exc_info=True)
+            raise
         finally:
             self._close(txn)
             self._lock.release()
@@ -370,8 +400,8 @@ class TransactionManager:
         if self._txns.get(txn.session_id) is not txn:
             return  # Already closed by a concurrent commit/abort/timeout
         del self._txns[txn.session_id]
-        if not self._txns and self._resume_sync is not None:
-            self._resume_sync()
+        if not self._txns:
+            self._notify_sync(self._resume_sync, "resume")
 
     def _resolve_txn_for_wrapper_write(self) -> _Txn:
         """Gated-mode check for the delegated write methods."""
