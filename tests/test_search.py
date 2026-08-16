@@ -7,6 +7,7 @@ import pytest
 
 from stash_mcp.search import (
     BM25Store,
+    ChunkFilter,
     IndexMeta,
     SearchEngine,
     SearchResult,
@@ -876,6 +877,73 @@ class TestNormalizePath:
     def test_empty_string(self):
         """Test that empty string stays empty."""
         assert _normalize_path("") == ""
+
+
+# --- ChunkFilter tests ---
+
+
+class TestChunkFilter:
+    def _chunk(self, path, **meta):
+        return {"file_path": path, "chunk_index": 0, "content": "", "metadata": meta}
+
+    def test_inactive_when_empty(self):
+        assert ChunkFilter().active is False
+        assert ChunkFilter(path_prefixes=["docs"]).active is True
+
+    def test_path_prefix_is_subtree_not_string_prefix(self):
+        pred = ChunkFilter(path_prefixes=["docs/"]).compile()
+        assert pred(self._chunk("docs/a.md"))
+        assert pred(self._chunk("docs/sub/a.md"))
+        assert not pred(self._chunk("docs2/a.md"))
+        assert not pred(self._chunk("a.md"))
+
+    def test_multiple_prefixes_are_any_of(self):
+        pred = ChunkFilter(path_prefixes=["projects/stash-mcp", "systems/homelab/"]).compile()
+        assert pred(self._chunk("projects/stash-mcp/services/x.md"))
+        assert pred(self._chunk("systems/homelab/operations/y.md"))
+        assert not pred(self._chunk("projects/openpilot/services/z.md"))
+
+    def test_normalize_prefixes_and_path_under_any(self):
+        from stash_mcp.search import normalize_prefixes, path_under_any
+
+        assert normalize_prefixes("projects/a/, /systems/b ,,") == ["projects/a", "systems/b"]
+        assert normalize_prefixes(["x/"]) == ["x"]
+        assert normalize_prefixes(None) == []
+        assert path_under_any("projects/a/f.md", ["projects/a"])
+        assert path_under_any("projects/a", ["projects/a"])
+        assert not path_under_any("projects/ab/f.md", ["projects/a"])
+
+    def test_exclude_any_depth_vs_root_anchored(self):
+        pred = ChunkFilter(exclude_patterns=["**/_reports/**"]).compile()
+        assert not pred(self._chunk("_reports/scan.md"))
+        assert not pred(self._chunk("openpilot/_reports/x.md"))
+        assert pred(self._chunk("openpilot/services/pandad.md"))
+
+        pred_root = ChunkFilter(exclude_patterns=["_reports/"]).compile()
+        assert not pred_root(self._chunk("_reports/scan.md"))
+        assert pred_root(self._chunk("openpilot/_reports/x.md"))
+
+    def test_file_types(self):
+        pred = ChunkFilter(file_types=[".md", ".py"]).compile()
+        assert pred(self._chunk("a.md"))
+        assert pred(self._chunk("b.py"))
+        assert not pred(self._chunk("c.json"))
+
+    def test_metadata_equality_all_keys_must_match(self):
+        pred = ChunkFilter(metadata={"layer": "frogpilot", "verified": "2026-08-16"}).compile()
+        assert pred(self._chunk("a.md", layer="frogpilot", verified="2026-08-16"))
+        assert not pred(self._chunk("a.md", layer="frogpilot"))
+        assert not pred(self._chunk("a.md", layer="moretore", verified="2026-08-16"))
+        assert not pred({"file_path": "a.md"})  # no metadata key at all
+
+    def test_combined(self):
+        pred = ChunkFilter(
+            path_prefixes=["openpilot"], exclude_patterns=["**/_reports/**"], file_types=[".md"],
+        ).compile()
+        assert pred(self._chunk("openpilot/services/x.md"))
+        assert not pred(self._chunk("openpilot/_reports/x.md"))
+        assert not pred(self._chunk("openpilot/services/x.py"))
+        assert not pred(self._chunk("services/x.md"))
 
 
 # --- Search index integrity tests (delete/move) ---

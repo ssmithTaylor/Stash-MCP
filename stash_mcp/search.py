@@ -10,8 +10,11 @@ import json
 import logging
 import pickle
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from .filesystem import glob_to_regex
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,96 @@ class SearchResult:
     last_changed_at: str | None = None
     changed_by: str | None = None
     commit_message: str | None = None
+
+
+def _normalize_exclude_pattern(pattern: str) -> str:
+    """Apply the STASH_CONTENT_PATHS conventions to a caller-supplied glob."""
+    p = pattern.strip().replace("\\", "/").lstrip("/")
+    if p.endswith("/"):
+        p += "**"
+    return p
+
+
+def normalize_prefixes(value: str | list[str] | None) -> list[str]:
+    """Comma-separated string or list → normalized, de-duplicated subtree prefixes."""
+    if not value:
+        return []
+    parts = value.split(",") if isinstance(value, str) else list(value)
+    out: list[str] = []
+    for part in parts:
+        p = _normalize_path(str(part).strip())
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def path_under_any(path: str, prefixes: list[str]) -> bool:
+    """True when *path* equals or lies inside any of *prefixes* (subtree, not string prefix)."""
+    for p in prefixes:
+        if path == p or path.startswith(p + "/"):
+            return True
+    return False
+
+
+@dataclass
+class ChunkFilter:
+    """Predicate over chunk-metadata dicts. Every set field must match.
+
+    - ``path_prefixes``: any-of subtrees (``docs`` matches ``docs/a.md`` and
+      ``docs/x/b.md``, not ``docs2/a.md``).
+    - ``exclude_patterns``: globs in the ``STASH_CONTENT_PATHS`` dialect,
+      anchored at the content root; any match excludes the chunk.
+    - ``file_types``: extension allow-list.
+    - ``metadata``: string equality on the chunk's ``metadata`` dict.
+    """
+
+    path_prefixes: list[str] | None = None
+    exclude_patterns: list[str] | None = None
+    file_types: list[str] | None = None
+    metadata: dict[str, str] | None = None
+
+    @property
+    def active(self) -> bool:
+        return bool(
+            self.path_prefixes or self.exclude_patterns or self.file_types or self.metadata
+        )
+
+    def compile(self) -> Callable[[dict], bool]:
+        prefixes = normalize_prefixes(self.path_prefixes)
+        excludes = [
+            glob_to_regex(_normalize_exclude_pattern(p))
+            for p in (self.exclude_patterns or [])
+            if p and p.strip()
+        ]
+        types = tuple(self.file_types or ())
+        meta = dict(self.metadata or {})
+        path_cache: dict[str, bool] = {}
+
+        def path_ok(path: str) -> bool:
+            cached = path_cache.get(path)
+            if cached is not None:
+                return cached
+            ok = True
+            if prefixes and not path_under_any(path, prefixes):
+                ok = False
+            elif types and not path.endswith(types):
+                ok = False
+            elif any(rx.match(path) for rx in excludes):
+                ok = False
+            path_cache[path] = ok
+            return ok
+
+        def predicate(chunk: dict) -> bool:
+            if not path_ok(_normalize_path(chunk.get("file_path", ""))):
+                return False
+            if meta:
+                chunk_meta = chunk.get("metadata") or {}
+                for key, value in meta.items():
+                    if chunk_meta.get(key) != value:
+                        return False
+            return True
+
+        return predicate
 
 
 class VectorStore:
