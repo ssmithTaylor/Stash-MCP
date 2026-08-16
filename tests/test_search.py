@@ -847,6 +847,80 @@ class TestMCPSearchTool:
                 finally:
                     _current_context.reset(token)
 
+    async def _tool_with_store(self, content_dir, index_dir, files, **engine_kw):
+        from stash_mcp.filesystem import FileSystem
+        from stash_mcp.mcp_server import create_mcp_server
+
+        fs = FileSystem(Path(content_dir))
+        for path, text in files.items():
+            fs.write_file(path, text)
+        engine = SearchEngine(
+            content_dir=Path(content_dir), index_dir=Path(index_dir),
+            embed_fn=mock_embed, **engine_kw,
+        )
+        await engine.build_index(list(files))
+        mcp = create_mcp_server(fs, search_engine=engine)
+        return await mcp.get_tool("search_content")
+
+    async def test_search_tool_default_exclusion_and_override(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {
+                    "_reports/scan.md": "# Scan\n\nauth oauth flow",
+                    "docs/auth.md": "---\nlayer: frogpilot\n---\n# Auth\n\nauth oauth flow",
+                },
+                default_exclude_patterns=["**/_reports/**"],
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                text = str((await tool.run({"query": "auth oauth"})).content)
+                assert "docs/auth.md" in text
+                assert "_reports/scan.md" not in text
+                assert "Meta: layer=frogpilot" in text
+                assert "Section: Auth" in text
+
+                text = str((await tool.run({
+                    "query": "auth oauth", "include_excluded": True,
+                })).content)
+                assert "_reports/scan.md" in text
+
+                text = str((await tool.run({
+                    "query": "auth oauth", "include_excluded": True, "boost_prefix": "_reports/",
+                })).content)
+                assert text.index("_reports/scan.md") < text.index("docs/auth.md")
+
+                text = str((await tool.run({
+                    "query": "auth oauth", "metadata_filters": {"layer": "nope"},
+                })).content)
+                assert "No results found" in text
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_rejects_parent_traversal_prefix(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir, {"a.md": "# A\n\nauth"},
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                with pytest.raises(ValueError, match="path_prefix"):
+                    await tool.run({"query": "auth", "path_prefix": "../etc"})
+            finally:
+                _current_context.reset(token)
+
 
 # --- Startup index build via lifespan ---
 

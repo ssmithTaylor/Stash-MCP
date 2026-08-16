@@ -1298,6 +1298,11 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             query: str,
             max_results: int = 5,
             file_types: str | None = None,
+            path_prefix: str | None = None,
+            boost_prefix: str | None = None,
+            exclude_patterns: str | None = None,
+            include_excluded: bool = False,
+            metadata_filters: dict[str, str] | None = None,
         ) -> str:
             """Search for content by meaning using semantic similarity.
 
@@ -1312,23 +1317,61 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             instead — it returns every match up to max_results (see the
             truncated flag) rather than a ranked top-k.
 
+            Scoping: when you work inside one root of a multi-project store,
+            pass boost_prefix=<root> to rank that root first without hiding
+            the rest; pass path_prefix=<root> only when you want nothing
+            else. The server may be configured to exclude working
+            directories (e.g. report/scan output) from results by default;
+            pass include_excluded=true to search them too.
+
             Args:
                 query: Natural language search query
                 max_results: Maximum number of results (default 5)
                 file_types: Optional comma-separated file extensions
                     (e.g. ".md,.py")
+                path_prefix: Optional comma-separated subtree(s) to search;
+                    results must lie under one of them (e.g. "projects/x/")
+                boost_prefix: Optional comma-separated subtree(s) to prefer;
+                    results under them rank first, others still appear
+                exclude_patterns: Optional comma-separated glob patterns to
+                    drop (root-anchored; "**/_reports/**" matches at any
+                    depth). Always applied.
+                include_excluded: Also return files matched by the server's
+                    default exclusion patterns (default false)
+                metadata_filters: Optional {key: value} equality filters on
+                    document metadata (frontmatter keys such as layer,
+                    describes, verified)
             Returns:
-                Search results formatted as a string
+                Search results formatted as a string; each result shows the
+                path, score, the Section (heading path) the chunk came from,
+                optional Meta/Context/Last changed lines, and a snippet. Use
+                read_section with the Section value to fetch just that part.
             """
             types_list = None
             if file_types:
                 types_list = [
                     t.strip() for t in file_types.split(",") if t.strip()
                 ]
+            excludes = None
+            if exclude_patterns:
+                excludes = [
+                    p.strip() for p in exclude_patterns.split(",") if p.strip()
+                ]
+            for label, value in (("path_prefix", path_prefix), ("boost_prefix", boost_prefix)):
+                for part in (value or "").split(","):
+                    if part.strip() and ".." in PurePosixPath(part.strip()).parts:
+                        raise ValueError(f"{label} must not contain '..' segments")
 
             t0 = time.perf_counter()
             results = await search_engine.search(
-                query, max_results=max_results, file_types=types_list
+                query,
+                max_results=max_results,
+                file_types=types_list,
+                path_prefix=path_prefix,
+                exclude_patterns=excludes,
+                metadata_filters=metadata_filters,
+                include_excluded=include_excluded,
+                boost_prefixes=boost_prefix,
             )
             get_metrics().record_search_query(
                 query=query,
@@ -1343,6 +1386,13 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             lines = []
             for r in results:
                 lines.append(f"📄 {r.file_path} (score: {r.score:.2f})")
+                if r.heading_path:
+                    lines.append(f"   Section: {' > '.join(r.heading_path)}")
+                if r.metadata:
+                    meta_str = " ".join(
+                        f"{k}={v[:60]}" for k, v in sorted(r.metadata.items())
+                    )
+                    lines.append(f"   Meta: {meta_str}")
                 if r.context:
                     lines.append(f"   Context: {r.context}")
                 if r.last_changed_at:
