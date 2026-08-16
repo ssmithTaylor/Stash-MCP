@@ -209,6 +209,24 @@ class TestVectorStore:
             with pytest.raises(ValueError):
                 store.search([1.0, 0.0], mask=np.array([True, False]))
 
+    def test_search_mask_all_false_returns_empty(self):
+        """A scope filter that excludes every row must return [], not raise
+        and not fall back to unmasked results."""
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = VectorStore(Path(tmpdir) / "vectors.pkl")
+            store.add(
+                [[1.0, 0.0], [0.9, 0.1], [0.1, 0.9]],
+                [
+                    {"file_path": "a.md", "chunk_index": 0},
+                    {"file_path": "b.md", "chunk_index": 0},
+                    {"file_path": "c.md", "chunk_index": 0},
+                ],
+            )
+            mask = np.array([False, False, False])
+            assert store.search([1.0, 0.0], top_n=5, mask=mask) == []
+
 
 # --- Chunking tests ---
 
@@ -1219,24 +1237,72 @@ class TestVectorStoreMMR:
             assert picked[0]["file_path"] == "a.md"
 
     def test_search_mmr_with_mask_diversifies_within_scope(self):
+        """Masking must leave a real multi-candidate choice for MMR to make,
+        not just a pool that happens to equal top_n.
+
+        _reports/scratch.md has the single highest raw cosine similarity of
+        all four rows (1.0, a perfect match) but is masked out and must
+        never surface. Of the three unmasked survivors, docs/a.md and
+        docs/b.md point in nearly the same direction (high mutual cosine),
+        while docs/c.md is far more diverse but far less relevant. With
+        top_n=2 and mmr_lambda=0.3 (diversity-weighted), the second pick is
+        a genuine 2-way argmax between docs/b.md and docs/c.md — and the
+        redundancy penalty on docs/b.md (near-duplicate of the already
+        selected docs/a.md) flips the choice to docs/c.md, contradicting
+        plain cosine order (which would pick docs/a.md, docs/b.md).
+        """
         import numpy as np
 
         with TemporaryDirectory() as tmpdir:
             store = VectorStore(Path(tmpdir) / "vectors.pkl")
             store.add(
-                [[1.0, 0.0], [0.99, 0.01], [0.98, 0.02], [0.5, 0.5]],
                 [
-                    {"file_path": "_reports/x.md", "chunk_index": 0},
-                    {"file_path": "_reports/x.md", "chunk_index": 1},
-                    {"file_path": "docs/y.md", "chunk_index": 0},
-                    {"file_path": "docs/z.md", "chunk_index": 0},
+                    [1.0, 0.0, 0.0],
+                    [0.999, 0.045, 0.0],
+                    [0.99, 0.1, 0.0],
+                    [0.1, 0.0, 1.0],
+                ],
+                [
+                    {"file_path": "_reports/scratch.md", "chunk_index": 0},
+                    {"file_path": "docs/a.md", "chunk_index": 0},
+                    {"file_path": "docs/b.md", "chunk_index": 0},
+                    {"file_path": "docs/c.md", "chunk_index": 0},
                 ],
             )
-            mask = np.array([False, False, True, True])
+            mask = np.array([False, True, True, True])
             results = store.search_mmr(
-                [1.0, 0.0], top_n=2, candidate_pool=4, mmr_lambda=0.7, max_per_file=2, mask=mask,
+                [1.0, 0.0, 0.0],
+                top_n=2,
+                candidate_pool=4,
+                mmr_lambda=0.3,
+                max_per_file=2,
+                mask=mask,
             )
-            assert [r["file_path"] for r in results] == ["docs/y.md", "docs/z.md"]
+            assert [r["file_path"] for r in results] == ["docs/a.md", "docs/c.md"]
+
+    def test_search_mmr_mask_all_false_returns_empty(self):
+        """A scope filter that excludes every row must return [], not raise
+        and not fall back to unmasked results.
+
+        This is the only input class that reaches the ``if not pool: return
+        []`` early return in search_mmr — masking makes it a realistic
+        caller input (an all-excluding scope filter), not just a defensive
+        branch for an organically all-negative-similarity query.
+        """
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            mask = np.array([False, False, False])
+            assert store.search_mmr([1.0, 0.0, 0.0], top_n=2, mask=mask) == []
+
+    def test_search_mmr_mask_length_mismatch_raises(self):
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            with pytest.raises(ValueError):
+                store.search_mmr([1.0, 0.0, 0.0], mask=np.array([True, False]))
 
 
 # --- SearchEngine recency reranking tests ---

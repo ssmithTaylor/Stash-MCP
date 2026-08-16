@@ -292,6 +292,31 @@ class VectorStore:
 
         return removed
 
+    @staticmethod
+    def _apply_mask(similarities, mask):
+        """Return ``similarities`` with any ``False``-masked rows set to -inf.
+
+        Returns ``similarities`` unchanged when ``mask`` is None — the
+        additive, opt-in default used by every existing caller.
+
+        Args:
+            similarities: 1-D array of cosine similarities, one per stored vector.
+            mask: Optional boolean array aligned with ``similarities``.
+
+        Raises:
+            ValueError: If ``mask``'s length doesn't match ``similarities``.
+        """
+        if mask is None:
+            return similarities
+        if len(mask) != len(similarities):
+            raise ValueError(
+                f"mask length {len(mask)} != vector count {len(similarities)}"
+            )
+
+        import numpy as np
+
+        return np.where(mask, similarities, -np.inf)
+
     def search(
         self, query_embedding: list[float], top_n: int = 10, mask=None
     ) -> list[dict]:
@@ -322,13 +347,7 @@ class VectorStore:
         norms = np.maximum(norms, 1e-10)
         normed = self._vectors / norms
 
-        similarities = normed @ query
-        if mask is not None:
-            if len(mask) != len(similarities):
-                raise ValueError(
-                    f"mask length {len(mask)} != vector count {len(similarities)}"
-                )
-            similarities = np.where(mask, similarities, -np.inf)
+        similarities = self._apply_mask(normed @ query, mask)
         top_k = min(top_n, len(similarities))
         top_indices = np.argsort(similarities)[-top_k:][::-1]
 
@@ -383,13 +402,7 @@ class VectorStore:
         norms = np.maximum(norms, 1e-10)
         normed = self._vectors / norms
 
-        similarities = normed @ query
-        if mask is not None:
-            if len(mask) != len(similarities):
-                raise ValueError(
-                    f"mask length {len(mask)} != vector count {len(similarities)}"
-                )
-            similarities = np.where(mask, similarities, -np.inf)
+        similarities = self._apply_mask(normed @ query, mask)
         pool_size = min(candidate_pool, len(similarities))
         # argpartition is O(n) vs argsort's O(n log n); fine either way at
         # this scale, but argsort makes the post-sort cleaner.
