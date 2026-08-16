@@ -75,26 +75,69 @@ def parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
     return _scalars(data), body
 
 
+def _trim_swallowed_trailer(raw_block: str, start: int, end: int) -> int:
+    """Shrink `end` back past trailing separator newlines, blank lines, and
+    whole comment lines that a block-style value's node span swallowed while
+    PyYAML scanned ahead for the next token (to check whether the collection
+    continues, it must look past intervening blanks/comments -- and it does
+    this even when nothing follows at all, e.g. a trailing comment with no
+    further key). Block scalars and flow/plain values never swallow this, so
+    for them the loop below simply finds real content on the first line it
+    looks at and stops immediately.
+
+    Walking only ever moves toward `start` and only ever removes *trailing*
+    blank/comment lines, so an interior comment inside a block collection
+    (e.g. between two list items, which is real content of the value that
+    comes *before* its true last line) is never at risk: the walk stops the
+    moment it finds a non-blank, non-comment line, which for any value with
+    trailing noise is always its own genuine last content line, encountered
+    before the walk could ever reach further back to an interior comment.
+    """
+    while end > start:
+        probe = end - 1 if raw_block[end - 1] == "\n" else end
+        line_start = raw_block.rfind("\n", start, probe) + 1
+        if line_start < start:
+            line_start = start
+        line = raw_block[line_start:probe].strip()
+        if line == "" or line.startswith("#"):
+            end = line_start
+            continue
+        end = probe
+        break
+    return end
+
+
 def _locate_entries(raw_block: str) -> dict[str, tuple[int, int, str]] | None:
     """Map each top-level key's normalized name to its (start, end, raw_key) span.
 
     ``raw_block[start:end]`` is exactly the on-disk "key: value" text for that
     entry -- key through the last character of its value, however many lines
     the value spans -- with none of the surrounding blank lines / comments /
-    other entries. ``end`` is normalized to exclude any trailing newline(s)
-    that a block-style value's node span swallows to disambiguate itself from
-    a following sibling key (PyYAML only does this for block collections and
-    block scalars, never for plain scalars or flow collections; without the
-    normalization, `end` would sometimes land mid-way into the *next* entry).
+    other entries. ``end`` is trimmed by _trim_swallowed_trailer so it never
+    extends into text that doesn't genuinely belong to the value.
 
     Returns None when the block's structure can't be safely edited key-by-key
     so the caller should fall back to a full reparse/redump instead:
-    a non-scalar top-level key, unparseable text, or a YAML merge key
-    (``<<: *anchor``) -- a merge key can inject top-level keys (e.g. `shared`
-    above) that have no literal span of their own to locate, so surgically
-    touching *those* keys would silently leave the anchor's copy in place
-    while claiming success; the whole-block fallback at least keeps the
-    returned metadata truthful about what's actually on disk.
+
+    - Unparseable text, or a non-scalar top-level key (a sequence/mapping
+      key is unhashable in Python, so this is already rejected earlier by
+      the calling merge_frontmatter's `yaml.safe_load` validation -- kept
+      here anyway as defense-in-depth).
+    - A YAML merge key (``<<: *anchor``): it can inject top-level keys that
+      have no literal span of their own to locate, so surgically touching
+      *those* keys would silently leave the anchor's copy in place while
+      claiming success.
+    - The top-level mapping is flow-styled (``{a: 1, b: 2}``), or any two
+      top-level key spans share a physical line: line-based edits assume
+      one key per line, so unsetting one flow-mapping key would delete its
+      siblings too.
+    - The same normalized key names more than one top-level entry (e.g.
+      ``layer: a`` and ``layer: b`` both present): only one span could be
+      touched, silently leaving the other's stale value behind.
+
+    Every one of these is "refuse to guess, let the caller fall back to the
+    always-correct-but-reformatting whole-block dump" rather than risk
+    silently writing something wrong.
     """
     if not raw_block.strip():
         return {}
@@ -106,18 +149,25 @@ def _locate_entries(raw_block: str) -> dict[str, tuple[int, int, str]] | None:
         return {}
     if not isinstance(root, yaml.MappingNode):
         return None
-    entries: dict[str, tuple[int, int, str]] = {}
+    if root.flow_style:
+        return None
+    spans: list[tuple[str, int, int, str]] = []
+    prev_end: int | None = None
     for key_node, value_node in root.value:
         if not isinstance(key_node, yaml.ScalarNode):
             return None
         if key_node.tag == "tag:yaml.org,2002:merge":
             return None
         start = key_node.start_mark.index
-        end = value_node.end_mark.index
-        while end > start and raw_block[end - 1] == "\n":
-            end -= 1
-        entries[normalize_key(key_node.value)] = (start, end, key_node.value)
-    return entries
+        if prev_end is not None and "\n" not in raw_block[prev_end:start]:
+            return None
+        end = _trim_swallowed_trailer(raw_block, start, value_node.end_mark.index)
+        spans.append((normalize_key(key_node.value), start, end, key_node.value))
+        prev_end = end
+    norms = [norm for norm, *_ in spans]
+    if len(norms) != len(set(norms)):
+        return None
+    return {norm: (start, end, raw_key) for norm, start, end, raw_key in spans}
 
 
 def _dump_pair(key: str, value: str) -> str:
@@ -125,28 +175,23 @@ def _dump_pair(key: str, value: str) -> str:
     return yaml.safe_dump({key: value}, default_flow_style=False, allow_unicode=True).strip()
 
 
-def _splice_block(
+def _redump(data: dict) -> str:
+    """Whole-block reparse/redump of *data*: always correct, but loses
+    comments and re-renders flow collections in block style. The
+    safety-net fallback used whenever the surgical path can't be trusted.
+    """
+    return yaml.safe_dump(
+        data, sort_keys=False, allow_unicode=True, default_flow_style=False
+    ).strip()
+
+
+def _splice_entries(
     raw_block: str,
+    entries: dict[str, tuple[int, int, str]],
     set_values: dict[str, str],
     unset_keys: list[str] | tuple[str, ...],
-    data: dict,
 ) -> str:
-    """Return *raw_block* with only the touched keys' own lines changed.
-
-    Untouched keys, comments, blank lines, and value formatting (flow lists,
-    block scalars, ...) pass through byte-for-byte -- only the exact spans of
-    keys named in *set_values* / *unset_keys* (matched by normalized name,
-    case- and separator-insensitively) are replaced or removed. New keys are
-    appended, written in their normalized form. Falls back to a full
-    reparse-and-redump of *data* (loses comments, re-renders flow collections
-    in block style) when the block's key shapes defeat span-based location.
-    """
-    entries = _locate_entries(raw_block)
-    if entries is None:
-        return yaml.safe_dump(
-            data, sort_keys=False, allow_unicode=True, default_flow_style=False
-        ).strip()
-
+    """Apply set/unset to *raw_block* using *entries*' already-located spans."""
     pending_set = dict(set_values)
     unset_norms = {normalize_key(k) for k in unset_keys}
     edits: list[tuple[int, int, str | None]] = []
@@ -169,6 +214,52 @@ def _splice_block(
         appended = "\n".join(_dump_pair(normalize_key(k), v) for k, v in pending_set.items())
         result = f"{result}\n{appended}" if result else appended
     return result
+
+
+def _is_truthful(candidate: str, data: dict) -> bool:
+    """Does re-parsing *candidate* give back exactly the metadata *data* implies?
+
+    The structural safety net beneath every specific _locate_entries guard:
+    whatever YAML shape defeats (or wasn't anticipated by) those checks,
+    this still catches it -- a surgical result that doesn't reparse back to
+    the metadata it would be returned alongside is never used.
+    """
+    try:
+        reparsed = yaml.safe_load(candidate) if candidate.strip() else {}
+    except yaml.YAMLError:
+        return False
+    if reparsed is None:
+        reparsed = {}
+    if not isinstance(reparsed, dict):
+        return False
+    return _scalars(reparsed) == _scalars(data)
+
+
+def _splice_block(
+    raw_block: str,
+    set_values: dict[str, str],
+    unset_keys: list[str] | tuple[str, ...],
+    data: dict,
+) -> str:
+    """Return *raw_block* with only the touched keys' own lines changed.
+
+    Untouched keys, comments, blank lines, and value formatting (flow lists,
+    block scalars, ...) pass through byte-for-byte -- only the exact spans of
+    keys named in *set_values* / *unset_keys* (matched by normalized name,
+    case- and separator-insensitively) are replaced or removed. New keys are
+    appended, written in their normalized form.
+
+    Falls back to _redump(data) (loses comments, re-renders flow collections
+    in block style, but is always correct) whenever the surgical path can't
+    be trusted: _locate_entries refuses the block's shape outright, or the
+    surgical result fails the _is_truthful check.
+    """
+    entries = _locate_entries(raw_block)
+    if entries is not None:
+        candidate = _splice_entries(raw_block, entries, set_values, unset_keys)
+        if _is_truthful(candidate, data):
+            return candidate
+    return _redump(data)
 
 
 def merge_frontmatter(

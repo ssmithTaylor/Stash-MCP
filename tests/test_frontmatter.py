@@ -225,3 +225,145 @@ class TestMergeFrontmatterSurgicalEdits:
         reparsed, _ = extract_metadata(new)
         assert "shared" not in reparsed
         assert meta == reparsed
+
+
+class TestMergeFrontmatterSwallowedTrailer:
+    """A block-collection value's node span can swallow trailing blank lines
+    and whole comment lines (never interior ones, never for block scalars) --
+    the entry's span must be trimmed back to its own true last content line.
+    """
+
+    def test_unset_block_list_leaves_trailing_comment_block_intact(self):
+        content = (
+            "---\n"
+            "tags:\n  - a\n  - b\n"
+            "\n"
+            "# ------------------\n"
+            "# Provenance block, do not edit\n"
+            "# ------------------\n"
+            "verified: 2026-01-01\n"
+            "---\nbody\n"
+        )
+        new, meta = merge_frontmatter(content, {}, ["tags"])
+        block = split_frontmatter_block(new)[0]
+        assert "# ------------------" in block
+        assert "# Provenance block, do not edit" in block
+        assert "verified: 2026-01-01" in block
+        assert "tags" not in block
+        assert meta == {"verified": "2026-01-01"}
+
+    def test_unset_nested_map_leaves_trailing_comment_intact(self):
+        content = "---\nnested:\n  x: 1\n  y: 2\n\n# note\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {}, ["nested"])
+        block = split_frontmatter_block(new)[0]
+        assert "# note" in block
+        assert "owner: me" in block
+        assert "nested" not in block
+        assert meta == {"owner": "me"}
+
+    def test_interior_list_comment_not_mistaken_for_a_trailing_boundary(self):
+        # "# about b" sits between two list items -- it comes *before* the
+        # final item, so a correct trailing-only walk-back never reaches it
+        # while looking for where the value truly ends. It's genuinely part
+        # of the (about-to-be-deleted) tags value, unlike the *trailing*
+        # "# trailing note" after the blank line, which must survive.
+        content = (
+            "---\n"
+            "tags:\n  - a\n  # about b\n  - b\n"
+            "\n# trailing note\n"
+            "owner: me\n"
+            "---\nbody\n"
+        )
+        new, meta = merge_frontmatter(content, {}, ["tags"])
+        block = split_frontmatter_block(new)[0]
+        assert "# trailing note" in block
+        assert "owner: me" in block
+        assert "tags" not in block
+        assert "about b" not in block
+        assert meta == {"owner": "me"}
+
+    def test_block_scalar_trailing_comment_was_already_correct(self):
+        content = "---\nnotes: |\n  line1\n  line2\n\n# note\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {}, ["notes"])
+        block = split_frontmatter_block(new)[0]
+        assert "# note" in block
+        assert "owner: me" in block
+        assert "notes" not in block
+        assert meta == {"owner": "me"}
+
+
+class TestMergeFrontmatterUnsafeShapesFallBack:
+    """Shapes where per-key span editing can't be done safely at all must
+    route to the whole-block fallback rather than silently drop or
+    misreport a sibling key.
+    """
+
+    def test_flow_mapping_top_level_falls_back_instead_of_losing_sibling(self):
+        content = "---\n{a: 1, b: 2}\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {}, ["a"])
+        reparsed, _ = extract_metadata(new)
+        assert meta == reparsed
+        assert "b" in reparsed
+        assert "a" not in reparsed
+
+    def test_duplicate_top_level_keys_fall_back_instead_of_lying(self):
+        content = "---\nlayer: a\nlayer: b\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {}, ["layer"])
+        reparsed, _ = extract_metadata(new)
+        assert meta == reparsed
+        assert "layer" not in reparsed
+        assert reparsed["owner"] == "me"
+
+
+class TestMergeFrontmatterBlockCollectionDirectlyTouched:
+    """Regression coverage: earlier tests only ever set/unset a scalar key
+    *unrelated* to a block-collection value, so a broken/deleted walk-back
+    (the exact trim that fixes TestMergeFrontmatterSwallowedTrailer) would
+    not have failed any of them. These touch the block-collection key itself.
+    """
+
+    def test_set_block_collection_valued_key_directly(self):
+        content = "---\ntags:\n  - a\n  - b\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"tags": "flat"})
+        block = split_frontmatter_block(new)[0]
+        assert "tags: flat" in block
+        assert "owner: me" in block
+        assert meta == {"tags": "flat", "owner": "me"}
+
+    def test_unset_block_collection_valued_key_directly(self):
+        content = "---\ntags:\n  - a\n  - b\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {}, ["tags"])
+        block = split_frontmatter_block(new)[0]
+        assert "tags" not in block
+        assert "owner: me" in block
+        assert meta == {"owner": "me"}
+
+
+class TestMergeFrontmatterTruthfulnessInvariant:
+    """The structural safety net: whatever the surgical splice produces, the
+    returned metadata must always match what re-parsing that exact content
+    would show. When it wouldn't, merge_frontmatter must fall back rather
+    than return a result that fails this check.
+    """
+
+    def test_returned_metadata_always_matches_reparsed_content(self):
+        cases = [
+            ("---\ntags: [a, b]\nowner: me\n---\nbody\n", {"owner": "you"}, []),
+            ("---\n{a: 1, b: 2}\n---\nbody\n", {}, ["a"]),
+            ("---\nlayer: a\nlayer: b\nowner: me\n---\nbody\n", {}, ["layer"]),
+            (
+                "---\nbase: &b\n  shared: 1\nlayer: fm\n<<: *b\nowner: me\n---\nbody\n",
+                {},
+                ["shared"],
+            ),
+            (
+                "---\ntags:\n  - a\n  - b\n\n# note\nowner: me\n---\nbody\n",
+                {},
+                ["tags"],
+            ),
+            ("---\nnotes: |\n  a\n  b\nowner: me\n---\nbody\n", {"owner": "you"}, []),
+        ]
+        for content, values, unset in cases:
+            new, meta = merge_frontmatter(content, values, unset)
+            reparsed, _ = parse_frontmatter(new)
+            assert meta == reparsed, f"mismatch for {content!r}: {meta} != {reparsed}"
