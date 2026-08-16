@@ -206,7 +206,8 @@ class FileSystem:
                 for item in self.content_dir.glob(pattern):
                     if not item.is_file():
                         continue
-                    if any(part.startswith(".") for part in item.relative_to(self.content_dir).parts):
+                    item_parts = item.relative_to(self.content_dir).parts
+                    if any(part.startswith(".") for part in item_parts):
                         continue
                     # POSIX-style separators regardless of host OS, matching
                     # the path contract exposed to MCP clients.

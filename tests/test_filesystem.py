@@ -9,6 +9,7 @@ from stash_mcp.filesystem import (
     FileNotFoundError,
     FileSystem,
     InvalidPathError,
+    glob_to_regex,
 )
 
 
@@ -370,9 +371,6 @@ def test_list_all_files_with_patterns_and_subpath(populated_dir):
 
 
 # --- glob_to_regex module-level function tests ---
-
-
-from stash_mcp.filesystem import glob_to_regex
 
 
 class TestGlobToRegex:
