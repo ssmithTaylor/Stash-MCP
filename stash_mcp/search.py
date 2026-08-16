@@ -293,13 +293,15 @@ class VectorStore:
         return removed
 
     def search(
-        self, query_embedding: list[float], top_n: int = 10
+        self, query_embedding: list[float], top_n: int = 10, mask=None
     ) -> list[dict]:
         """Cosine similarity search.
 
         Args:
             query_embedding: The query embedding vector.
             top_n: Maximum number of results to return.
+            mask: Optional boolean array aligned with the stored vectors;
+                False rows are never returned.
 
         Returns:
             List of metadata dicts with added 'score' field, sorted by
@@ -321,6 +323,12 @@ class VectorStore:
         normed = self._vectors / norms
 
         similarities = normed @ query
+        if mask is not None:
+            if len(mask) != len(similarities):
+                raise ValueError(
+                    f"mask length {len(mask)} != vector count {len(similarities)}"
+                )
+            similarities = np.where(mask, similarities, -np.inf)
         top_k = min(top_n, len(similarities))
         top_indices = np.argsort(similarities)[-top_k:][::-1]
 
@@ -343,6 +351,7 @@ class VectorStore:
         candidate_pool: int = 30,
         mmr_lambda: float = 0.7,
         max_per_file: int | None = 2,
+        mask=None,
     ) -> list[dict]:
         """Cosine retrieval followed by Maximal Marginal Relevance reranking.
 
@@ -351,7 +360,9 @@ class VectorStore:
         against diversity. ``mmr_lambda=1.0`` collapses to pure cosine
         ordering; ``0.0`` ignores relevance and maximises diversity.
         ``max_per_file`` (if set) hard-caps how many chunks from any one
-        file can land in the final result.
+        file can land in the final result. ``mask``: optional boolean
+        array aligned with the stored vectors; ``False`` rows are never
+        returned.
 
         Returns the same metadata-with-score shape as ``search``.
         """
@@ -373,6 +384,12 @@ class VectorStore:
         normed = self._vectors / norms
 
         similarities = normed @ query
+        if mask is not None:
+            if len(mask) != len(similarities):
+                raise ValueError(
+                    f"mask length {len(mask)} != vector count {len(similarities)}"
+                )
+            similarities = np.where(mask, similarities, -np.inf)
         pool_size = min(candidate_pool, len(similarities))
         # argpartition is O(n) vs argsort's O(n log n); fine either way at
         # this scale, but argsort makes the post-sort cleaner.

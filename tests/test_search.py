@@ -182,6 +182,33 @@ class TestVectorStore:
             assert store.count == 0
             assert store.search([1.0, 0.0]) == []
 
+    def test_search_with_mask_excludes_rows(self):
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = VectorStore(Path(tmpdir) / "vectors.pkl")
+            store.add(
+                [[1.0, 0.0], [0.9, 0.1], [0.1, 0.9]],
+                [
+                    {"file_path": "_reports/a.md", "chunk_index": 0},
+                    {"file_path": "docs/b.md", "chunk_index": 0},
+                    {"file_path": "docs/c.md", "chunk_index": 0},
+                ],
+            )
+            mask = np.array([False, True, True])
+            results = store.search([1.0, 0.0], top_n=2, mask=mask)
+            # the best row is masked out; the two remaining positive-score rows come back in order
+            assert [r["file_path"] for r in results] == ["docs/b.md", "docs/c.md"]
+
+    def test_search_mask_length_mismatch_raises(self):
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = VectorStore(Path(tmpdir) / "vectors.pkl")
+            store.add([[1.0, 0.0]], [{"file_path": "a.md", "chunk_index": 0}])
+            with pytest.raises(ValueError):
+                store.search([1.0, 0.0], mask=np.array([True, False]))
+
 
 # --- Chunking tests ---
 
@@ -1190,6 +1217,26 @@ class TestVectorStoreMMR:
                 max_per_file=None,
             )
             assert picked[0]["file_path"] == "a.md"
+
+    def test_search_mmr_with_mask_diversifies_within_scope(self):
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = VectorStore(Path(tmpdir) / "vectors.pkl")
+            store.add(
+                [[1.0, 0.0], [0.99, 0.01], [0.98, 0.02], [0.5, 0.5]],
+                [
+                    {"file_path": "_reports/x.md", "chunk_index": 0},
+                    {"file_path": "_reports/x.md", "chunk_index": 1},
+                    {"file_path": "docs/y.md", "chunk_index": 0},
+                    {"file_path": "docs/z.md", "chunk_index": 0},
+                ],
+            )
+            mask = np.array([False, False, True, True])
+            results = store.search_mmr(
+                [1.0, 0.0], top_n=2, candidate_pool=4, mmr_lambda=0.7, max_per_file=2, mask=mask,
+            )
+            assert [r["file_path"] for r in results] == ["docs/y.md", "docs/z.md"]
 
 
 # --- SearchEngine recency reranking tests ---
