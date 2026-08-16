@@ -69,6 +69,8 @@ class Config:
     SEARCH_EXCLUDE_PATTERNS: list[str] | None = _parse_content_paths(
         os.getenv("STASH_SEARCH_EXCLUDE_PATTERNS")
     )
+    # Soft scoping: score multiplier (1 + weight) for results under boost_prefixes.
+    SEARCH_BOOST_WEIGHT: float = float(os.getenv("STASH_SEARCH_BOOST_WEIGHT", "0.15"))
 
     # Find tool settings
     FIND_MAX_RESULTS_CEILING: int = int(

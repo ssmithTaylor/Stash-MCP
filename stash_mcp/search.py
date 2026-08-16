@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .filesystem import glob_to_regex
-from .frontmatter import extract_metadata
+from .frontmatter import extract_metadata, normalize_key
 from .headings import heading_path_at, scan_headings
 
 logger = logging.getLogger(__name__)
@@ -763,6 +763,18 @@ def _rrf_fuse(
     return [{**meta_by_id[key], "score": s} for key, s in fused]
 
 
+def _merge_candidates(primary: list[dict], extra: list[dict]) -> list[dict]:
+    """Union of two candidate lists keyed by (file_path, chunk_index); primary order first."""
+    seen = {(r.get("file_path", ""), int(r.get("chunk_index", 0))) for r in primary}
+    merged = list(primary)
+    for r in extra:
+        key = (r.get("file_path", ""), int(r.get("chunk_index", 0)))
+        if key not in seen:
+            seen.add(key)
+            merged.append(r)
+    return merged
+
+
 def _chunk_text_sliding_window_with_offsets(
     text: str,
     chunk_size: int = 1000,
@@ -948,6 +960,8 @@ class SearchEngine:
         hybrid_enabled: bool = False,
         rrf_k: int = 60,
         bm25_candidate_pool: int = 30,
+        default_exclude_patterns: list[str] | None = None,
+        default_boost_weight: float = 0.15,
     ):
         """Initialize the search engine.
 
@@ -983,6 +997,10 @@ class SearchEngine:
                 from the original paper.
             bm25_candidate_pool: How many sparse candidates to fetch
                 per query before fusion.
+            default_exclude_patterns: Globs (STASH_CONTENT_PATHS dialect)
+                excluded from every search unless include_excluded=True.
+            default_boost_weight: Bonus applied to results under
+                boost_prefixes when the caller does not pass boost_weight.
         """
         self.content_dir = content_dir
         self.index_dir = index_dir
@@ -1005,6 +1023,8 @@ class SearchEngine:
         self.hybrid_enabled = hybrid_enabled
         self.rrf_k = rrf_k
         self.bm25_candidate_pool = bm25_candidate_pool
+        self.default_exclude_patterns = [p for p in (default_exclude_patterns or []) if p]
+        self.default_boost_weight = max(0.0, float(default_boost_weight))
 
         # Validate numpy dependency at init time so we fail fast
         # rather than crashing on first file operation.
@@ -1419,6 +1439,12 @@ class SearchEngine:
         *,
         max_results: int = 5,
         file_types: list[str] | None = None,
+        path_prefix: str | list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+        metadata_filters: dict[str, str] | None = None,
+        include_excluded: bool = False,
+        boost_prefixes: str | list[str] | None = None,
+        boost_weight: float | None = None,
     ) -> list[SearchResult]:
         """Search for relevant content.
 
@@ -1426,6 +1452,21 @@ class SearchEngine:
             query: Search query text.
             max_results: Maximum number of results.
             file_types: Optional list of file extensions to filter (e.g. [".md", ".py"]).
+            path_prefix: Optional subtree(s) to restrict results to — a
+                comma-separated string or a list; any-of.
+            exclude_patterns: Optional glob patterns (STASH_CONTENT_PATHS dialect)
+                whose matches are dropped; always applied.
+            metadata_filters: Optional key/value equality filters on document
+                metadata (frontmatter / leading blockquote). Keys are
+                normalized the same way as stored metadata keys, so
+                "Describes" / "last-verified" match "describes" / "last_verified".
+            include_excluded: When True, the engine's default exclude patterns
+                are not applied (explicit ``exclude_patterns`` still are).
+            boost_prefixes: Optional subtree(s) to *prefer*: candidates under
+                them are also fetched separately and their score is
+                multiplied by (1 + boost_weight) before truncation; nothing
+                outside is hidden.
+            boost_weight: Overrides the engine default; 0 disables boosting.
 
         Returns:
             List of SearchResult sorted by relevance.
@@ -1433,18 +1474,61 @@ class SearchEngine:
         if not self._ready or self.store.count == 0:
             return []
 
+        excludes = list(exclude_patterns or [])
+        if not include_excluded:
+            excludes.extend(self.default_exclude_patterns)
+        prefixes = normalize_prefixes(path_prefix)
+        # The index stores metadata keys normalized (frontmatter.extract_metadata
+        # already does this at index time) — normalize the caller's filter keys
+        # the same way so e.g. {"Describes": ...} / {"last-verified": ...} still
+        # match the stored "describes" / "last_verified" keys instead of
+        # silently matching nothing.
+        normalized_metadata_filters = (
+            {normalize_key(k): v for k, v in metadata_filters.items()}
+            if metadata_filters
+            else None
+        )
+        chunk_filter = ChunkFilter(
+            path_prefixes=prefixes or None,
+            exclude_patterns=excludes or None,
+            file_types=file_types or None,
+            metadata=normalized_metadata_filters,
+        )
+        predicate = chunk_filter.compile() if chunk_filter.active else None
+
+        boosts = normalize_prefixes(boost_prefixes)
+        weight = self.default_boost_weight if boost_weight is None else max(0.0, boost_weight)
+        boosting = bool(boosts) and weight > 0
+
         query_embedding = await self._embed_query(query)
 
-        # Fetch a larger candidate pool so MMR + per-file cap + file_types
-        # filter have room to work. file_types over-fetches further since
-        # the filter happens post-retrieval.
+        # Fetch a larger candidate pool so MMR + per-file cap have room to
+        # work. Filtering happens as a pre-ranking mask, so no extra
+        # over-fetch is needed for it.
         candidate_pool = max(
             max_results * self.candidate_pool_multiplier,
             max_results,
         )
-        fetch_n = candidate_pool * 3 if file_types else candidate_pool
+        fetch_n = candidate_pool
 
         async with self._lock:
+            mask = None
+            boost_mask = None
+            rows = self.store._metadata
+            if predicate is not None or boosting:
+                import numpy as np
+            if predicate is not None:
+                mask = np.fromiter((predicate(m) for m in rows), dtype=bool, count=len(rows))
+            if boosting:
+                boost_mask = np.fromiter(
+                    (
+                        (predicate is None or predicate(m))
+                        and path_under_any(_normalize_path(m.get("file_path", "")), boosts)
+                        for m in rows
+                    ),
+                    dtype=bool,
+                    count=len(rows),
+                )
             if (
                 self.hybrid_enabled
                 and self.bm25_store.count > 0
@@ -1455,17 +1539,27 @@ class SearchEngine:
                 # back to dense-only below) when the BM25 index is
                 # dirty — fusing fresh dense results with a stale
                 # sparse index would produce inconsistent rankings.
-                dense = self.store.search(query_embedding, top_n=fetch_n)
-                sparse = self.bm25_store.search(
-                    query, top_n=self.bm25_candidate_pool
-                )
+                dense = self.store.search(query_embedding, top_n=fetch_n, mask=mask)
+                if boost_mask is not None:
+                    dense = _merge_candidates(
+                        dense,
+                        self.store.search(query_embedding, top_n=max_results, mask=boost_mask),
+                    )
+                sparse_n = self.bm25_candidate_pool * (3 if predicate is not None else 1)
+                sparse = self.bm25_store.search(query, top_n=sparse_n)
+                meta_lookup = self.store.metadata_index
+                if predicate is not None:
+                    sparse = [
+                        t for t in sparse
+                        if (m := meta_lookup.get((t[0], int(t[1])))) is not None
+                        and predicate(m)
+                    ]
                 fused = _rrf_fuse(dense, sparse, k=self.rrf_k)
                 # Hydrate sparse-only entries (which lack content/context)
                 # by looking up the full metadata from the vector store.
                 # VectorStore.metadata_index is cached across queries and
                 # only rebuilt on mutations, so the lookup is O(1) per
                 # candidate without paying O(N) on every search.
-                meta_lookup = self.store.metadata_index
                 hydrated: list[dict] = []
                 for r in fused:
                     if r.get("content"):
@@ -1498,16 +1592,37 @@ class SearchEngine:
                     candidate_pool=fetch_n,
                     mmr_lambda=self.mmr_lambda,
                     max_per_file=self.max_per_file,
+                    mask=mask,
                 )
+                if boost_mask is not None:
+                    raw_results = _merge_candidates(
+                        raw_results,
+                        self.store.search_mmr(
+                            query_embedding,
+                            top_n=max_results,
+                            candidate_pool=fetch_n,
+                            mmr_lambda=self.mmr_lambda,
+                            max_per_file=self.max_per_file,
+                            mask=boost_mask,
+                        ),
+                    )
             else:
-                raw_results = self.store.search(query_embedding, top_n=fetch_n)
+                raw_results = self.store.search(query_embedding, top_n=fetch_n, mask=mask)
+                if boost_mask is not None:
+                    raw_results = _merge_candidates(
+                        raw_results,
+                        self.store.search(query_embedding, top_n=max_results, mask=boost_mask),
+                    )
 
-        if file_types:
-            raw_results = [
-                r
-                for r in raw_results
-                if any(r.get("file_path", "").endswith(ext) for ext in file_types)
-            ]
+        if boosting and raw_results:
+            boosted: list[dict] = []
+            for r in raw_results:
+                rr = dict(r)
+                if path_under_any(_normalize_path(rr.get("file_path", "")), boosts):
+                    rr["score"] = float(rr.get("score", 0.0)) * (1.0 + weight)
+                boosted.append(rr)
+            boosted.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
+            raw_results = boosted
 
         # Blame is needed up-front only when recency reranking is on
         # (it needs every candidate's timestamp before truncation). When

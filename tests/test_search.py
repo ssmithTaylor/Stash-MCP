@@ -1819,3 +1819,201 @@ class TestHybridSearchEngine:
         )
         assert engine2.indexed_chunks == 0
         assert engine2.bm25_store.count == 0
+
+    async def test_hybrid_filters_sparse_candidates(self, hybrid_engine):
+        root = hybrid_engine.content_dir
+        (root / "_reports").mkdir(exist_ok=True)
+        (root / "_reports" / "r.md").write_text("# R\n\nzebra zebra zebra")
+        (root / "keep.md").write_text("# K\n\nzebra")
+        await hybrid_engine.reindex()
+        results = await hybrid_engine.search(
+            "zebra", max_results=5, exclude_patterns=["**/_reports/**"],
+        )
+        paths = [r.file_path for r in results]
+        assert "keep.md" in paths
+        assert "_reports/r.md" not in paths
+
+
+# --- SearchEngine.search scoping, exclusions, metadata filters, boost ---
+
+
+class TestSearchScoping:
+
+    @pytest.fixture
+    def scoped_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "_reports").mkdir()
+            (root / "openpilot" / "_reports").mkdir(parents=True)
+            (root / "openpilot" / "services").mkdir(parents=True)
+            (root / "_reports" / "scan.md").write_text("# Scan\n\nauth auth auth oauth flow")
+            (root / "openpilot" / "_reports" / "delta.md").write_text(
+                "# Delta\n\nauth oauth flow flow"
+            )
+            (root / "openpilot" / "services" / "auth.md").write_text(
+                "---\nlayer: frogpilot\n---\n# Auth service\n\nauth oauth flow"
+            )
+            (root / "openpilot" / "services" / "notes.md").write_text(
+                "---\nlayer: upstream\n---\n# Notes\n\nauth flow"
+            )
+            engine = SearchEngine(
+                content_dir=root, index_dir=Path(index_dir), embed_fn=mock_embed,
+                default_exclude_patterns=["**/_reports/**"],
+            )
+            yield engine
+
+    async def _paths(self, engine, **kw):
+        return [r.file_path for r in await engine.search("auth oauth flow", max_results=10, **kw)]
+
+    async def test_default_exclusion_hides_reports_at_any_depth(self, scoped_engine):
+        await scoped_engine.reindex()
+        paths = await self._paths(scoped_engine)
+        assert paths
+        assert not any("_reports/" in p for p in paths)
+
+    async def test_include_excluded_readmits_defaults_only(self, scoped_engine):
+        await scoped_engine.reindex()
+        paths = await self._paths(scoped_engine, include_excluded=True)
+        assert any(p.startswith("_reports/") for p in paths)
+        paths = await self._paths(
+            scoped_engine, include_excluded=True, exclude_patterns=["_reports/**"],
+        )
+        assert not any(p.startswith("_reports/") for p in paths)
+        assert any(p.startswith("openpilot/_reports/") for p in paths)
+
+    async def test_path_prefix_scopes_to_subtree(self, scoped_engine):
+        await scoped_engine.reindex()
+        paths = await self._paths(scoped_engine, path_prefix="openpilot/services")
+        assert paths and all(p.startswith("openpilot/services/") for p in paths)
+
+    async def test_metadata_filter(self, scoped_engine):
+        await scoped_engine.reindex()
+        paths = await self._paths(scoped_engine, metadata_filters={"layer": "frogpilot"})
+        assert paths == ["openpilot/services/auth.md"]
+
+    async def test_max_results_holds_under_exclusion(self, scoped_engine):
+        await scoped_engine.reindex()
+        results = await scoped_engine.search("auth oauth flow", max_results=2)
+        assert len(results) == 2
+        assert not any("_reports/" in r.file_path for r in results)
+
+    async def test_file_types_still_filters(self, scoped_engine):
+        (scoped_engine.content_dir / "config.py").write_text("# auth\nAUTH = 1\n")
+        await scoped_engine.reindex()
+        paths = await self._paths(scoped_engine, file_types=[".py"])
+        assert paths == ["config.py"]
+
+    async def test_multiple_path_prefixes(self, scoped_engine):
+        root = scoped_engine.content_dir
+        (root / "systems" / "homelab").mkdir(parents=True)
+        (root / "systems" / "homelab" / "ops.md").write_text("# Ops\n\nauth oauth flow")
+        await scoped_engine.reindex()
+        paths = await self._paths(
+            scoped_engine, path_prefix="openpilot/services,systems/homelab",
+        )
+        assert set(paths) == {
+            "openpilot/services/auth.md", "openpilot/services/notes.md", "systems/homelab/ops.md",
+        }
+        paths = await self._paths(scoped_engine, path_prefix=["systems/homelab/"])
+        assert paths == ["systems/homelab/ops.md"]
+
+
+class TestSearchBoost:
+    """Soft scoping: boosted prefixes rank first but nothing is hidden."""
+
+    @pytest.fixture
+    def boost_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "projects" / "a").mkdir(parents=True)
+            (root / "projects" / "b").mkdir(parents=True)
+            # b's doc is the better lexical match; a's doc is what the agent works in
+            (root / "projects" / "b" / "strong.md").write_text("# B\n\nauth oauth flow oauth")
+            (root / "projects" / "a" / "weak.md").write_text("# A\n\nauth flow")
+            (root / "projects" / "a" / "other.md").write_text("# A2\n\nauth")
+            engine = SearchEngine(
+                content_dir=root, index_dir=Path(index_dir), embed_fn=mock_embed,
+                default_boost_weight=0.5,
+            )
+            yield engine
+
+    async def test_boost_reorders_without_hiding(self, boost_engine):
+        await boost_engine.reindex()
+        plain = [r.file_path for r in await boost_engine.search("auth oauth flow", max_results=3)]
+        assert plain[0] == "projects/b/strong.md"
+        boosted = await boost_engine.search(
+            "auth oauth flow", max_results=3, boost_prefixes="projects/a",
+        )
+        paths = [r.file_path for r in boosted]
+        assert paths[0].startswith("projects/a/")
+        assert "projects/b/strong.md" in paths            # still present
+
+    async def test_boost_zero_matches_plain_order(self, boost_engine):
+        await boost_engine.reindex()
+        plain = [r.file_path for r in await boost_engine.search("auth oauth flow", max_results=3)]
+        zero = [
+            r.file_path
+            for r in await boost_engine.search(
+                "auth oauth flow", max_results=3, boost_prefixes=["projects/a"], boost_weight=0.0,
+            )
+        ]
+        assert zero == plain
+
+    async def test_boost_pulls_in_scoped_doc_missing_from_general_pool(self, boost_engine):
+        root = boost_engine.content_dir
+        for i in range(30):   # flood the general pool with strong matches elsewhere
+            (root / "projects" / "b" / f"flood{i}.md").write_text("# F\n\nauth oauth flow oauth")
+        await boost_engine.reindex()
+        results = await boost_engine.search(
+            "auth oauth flow", max_results=2, boost_prefixes="projects/a",
+        )
+        assert any(r.file_path.startswith("projects/a/") for r in results)
+
+    async def test_boost_never_readmits_default_exclusions(self, boost_engine):
+        boost_engine.default_exclude_patterns = ["**/projects/a/**"]
+        await boost_engine.reindex()
+        results = await boost_engine.search(
+            "auth oauth flow", max_results=5, boost_prefixes="projects/a",
+        )
+        assert not any(r.file_path.startswith("projects/a/") for r in results)
+
+
+class TestSearchMetadataFilterKeyNormalization:
+    """Caller metadata_filters keys are normalized the same way the index side is.
+
+    frontmatter.extract_metadata (Task 2) normalizes frontmatter keys before
+    they're stored as chunk metadata (Task 6). Without normalizing the
+    caller's filter keys the same way, a filter like {"Describes": ...}
+    would silently match nothing against the stored "describes" key —
+    "silently matches nothing" being worse than an error.
+    """
+
+    @pytest.fixture
+    def metadata_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "doc.md").write_text(
+                "---\ndescribes: openpilot\nlast_verified: 2026-08-16\n---\n"
+                "# Doc\n\nauth oauth flow"
+            )
+            (root / "other.md").write_text("# Other\n\nauth oauth flow")
+            engine = SearchEngine(
+                content_dir=root, index_dir=Path(index_dir), embed_fn=mock_embed,
+            )
+            yield engine
+
+    async def test_title_case_key_matches_normalized_stored_key(self, metadata_engine):
+        await metadata_engine.reindex()
+        results = await metadata_engine.search(
+            "auth oauth flow", max_results=10, metadata_filters={"Describes": "openpilot"},
+        )
+        assert [r.file_path for r in results] == ["doc.md"]
+
+    async def test_hyphenated_key_matches_normalized_stored_key(self, metadata_engine):
+        await metadata_engine.reindex()
+        results = await metadata_engine.search(
+            "auth oauth flow",
+            max_results=10,
+            metadata_filters={"last-verified": "2026-08-16"},
+        )
+        assert [r.file_path for r in results] == ["doc.md"]
