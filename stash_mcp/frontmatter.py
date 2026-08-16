@@ -75,15 +75,34 @@ def parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
     return _scalars(data), body
 
 
+def _trim_trailing_newlines(raw_block: str, start: int, end: int) -> int:
+    """Strip trailing newline character(s) that a value's end_mark swallowed
+    to disambiguate itself from a following sibling key. Correct for any
+    value shape that never swallows more than that: scalars (plain, quoted,
+    or block `|`/`>`) and flow collections (`[...]`, `{...}`) all stop right
+    after their own last real character even when followed by another key,
+    *except* for the separating newline(s) themselves, which this strips.
+    """
+    while end > start and raw_block[end - 1] == "\n":
+        end -= 1
+    return end
+
+
 def _trim_swallowed_trailer(raw_block: str, start: int, end: int) -> int:
     """Shrink `end` back past trailing separator newlines, blank lines, and
-    whole comment lines that a block-style value's node span swallowed while
-    PyYAML scanned ahead for the next token (to check whether the collection
-    continues, it must look past intervening blanks/comments -- and it does
-    this even when nothing follows at all, e.g. a trailing comment with no
-    further key). Block scalars and flow/plain values never swallow this, so
-    for them the loop below simply finds real content on the first line it
-    looks at and stops immediately.
+    whole comment lines that a block-style *collection's* (block sequence or
+    block mapping) node span swallows while PyYAML scans ahead for the next
+    token -- to check whether the collection continues, it must look past
+    intervening blanks/comments, and it does this even when nothing follows
+    at all, e.g. a trailing comment with no further key.
+
+    Only ever called for block collections (see _locate_entries): a block
+    scalar's own content can contain a line that merely *looks* blank or
+    comment-shaped (a literal line reading `# not a comment` inside a `|`
+    block, say), which this function would wrongly treat as trailing noise
+    and strip -- orphaning a fragment of the value in the document once it's
+    set/unset. _trim_trailing_newlines is the correct, safe choice for every
+    other value shape, none of which swallow more than a bare newline.
 
     Walking only ever moves toward `start` and only ever removes *trailing*
     blank/comment lines, so an interior comment inside a block collection
@@ -113,8 +132,11 @@ def _locate_entries(raw_block: str) -> dict[str, tuple[int, int, str]] | None:
     ``raw_block[start:end]`` is exactly the on-disk "key: value" text for that
     entry -- key through the last character of its value, however many lines
     the value spans -- with none of the surrounding blank lines / comments /
-    other entries. ``end`` is trimmed by _trim_swallowed_trailer so it never
-    extends into text that doesn't genuinely belong to the value.
+    other entries. ``end`` is trimmed so it never extends into text that
+    doesn't genuinely belong to the value: by _trim_swallowed_trailer for a
+    block-style sequence/mapping value, or by the simpler, always-safe
+    _trim_trailing_newlines for every other value shape (see each function's
+    docstring for why they aren't interchangeable).
 
     Returns None when the block's structure can't be safely edited key-by-key
     so the caller should fall back to a full reparse/redump instead:
@@ -161,7 +183,16 @@ def _locate_entries(raw_block: str) -> dict[str, tuple[int, int, str]] | None:
         start = key_node.start_mark.index
         if prev_end is not None and "\n" not in raw_block[prev_end:start]:
             return None
-        end = _trim_swallowed_trailer(raw_block, start, value_node.end_mark.index)
+        raw_end = value_node.end_mark.index
+        is_block_collection = (
+            isinstance(value_node, (yaml.SequenceNode, yaml.MappingNode))
+            and not value_node.flow_style
+        )
+        end = (
+            _trim_swallowed_trailer(raw_block, start, raw_end)
+            if is_block_collection
+            else _trim_trailing_newlines(raw_block, start, raw_end)
+        )
         spans.append((normalize_key(key_node.value), start, end, key_node.value))
         prev_end = end
     norms = [norm for norm, *_ in spans]
@@ -192,7 +223,14 @@ def _splice_entries(
     unset_keys: list[str] | tuple[str, ...],
 ) -> str:
     """Apply set/unset to *raw_block* using *entries*' already-located spans."""
-    pending_set = dict(set_values)
+    # Keyed by normalized name, same as `entries` and `unset_norms`: an
+    # existing on-disk `Layer` must match a requested `layer`/`Layer`/
+    # `LAYER` alike, exactly as the dict-based bookkeeping in
+    # merge_frontmatter already does. Comparing normalized keys against a
+    # dict keyed by the caller's raw spelling (the bug this replaces) never
+    # matches an existing entry, so every set silently became a brand-new
+    # appended line -- a permanent duplicate next to the untouched original.
+    pending_set = {normalize_key(k): v for k, v in set_values.items()}
     unset_norms = {normalize_key(k) for k in unset_keys}
     edits: list[tuple[int, int, str | None]] = []
     for norm, (start, end, raw_key) in entries.items():
@@ -211,7 +249,7 @@ def _splice_entries(
     result = result.rstrip("\n")
 
     if pending_set:
-        appended = "\n".join(_dump_pair(normalize_key(k), v) for k, v in pending_set.items())
+        appended = "\n".join(_dump_pair(k, v) for k, v in pending_set.items())
         result = f"{result}\n{appended}" if result else appended
     return result
 
@@ -223,6 +261,16 @@ def _is_truthful(candidate: str, data: dict) -> bool:
     whatever YAML shape defeats (or wasn't anticipated by) those checks,
     this still catches it -- a surgical result that doesn't reparse back to
     the metadata it would be returned alongside is never used.
+
+    Two checks, not one. `_scalars(reparsed) == _scalars(data)` alone isn't
+    enough: yaml.safe_load collapses duplicate top-level keys to the last
+    one, so a candidate that (by some bug) wrote a key twice can still
+    reparse to exactly the right values while permanently duplicating a
+    line on disk. Requiring `_locate_entries(candidate) is not None` closes
+    that hole by demanding the candidate itself be safely re-editable --
+    which duplicate (or flow-mapping-sibling, or merge-key-shadowed)
+    top-level keys are not -- the same standard already applied to the
+    *input* raw_block, now also applied to what we're about to write.
     """
     try:
         reparsed = yaml.safe_load(candidate) if candidate.strip() else {}
@@ -232,7 +280,9 @@ def _is_truthful(candidate: str, data: dict) -> bool:
         reparsed = {}
     if not isinstance(reparsed, dict):
         return False
-    return _scalars(reparsed) == _scalars(data)
+    if _scalars(reparsed) != _scalars(data):
+        return False
+    return _locate_entries(candidate) is not None
 
 
 def _splice_block(

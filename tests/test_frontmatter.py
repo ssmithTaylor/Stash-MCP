@@ -320,22 +320,30 @@ class TestMergeFrontmatterBlockCollectionDirectlyTouched:
     *unrelated* to a block-collection value, so a broken/deleted walk-back
     (the exact trim that fixes TestMergeFrontmatterSwallowedTrailer) would
     not have failed any of them. These touch the block-collection key itself.
+
+    The untouched neighbor carries an inline comment and the assertion
+    checks for it verbatim: a whole-block _redump fallback always strips
+    comments, so if the truthfulness guard were silently rescuing a broken
+    splice (rather than the splice genuinely succeeding), that comment would
+    be gone and these tests would catch it -- unlike checking only that the
+    new/removed value is present/absent, which a correct-but-reformatted
+    fallback result would also satisfy.
     """
 
     def test_set_block_collection_valued_key_directly(self):
-        content = "---\ntags:\n  - a\n  - b\nowner: me\n---\nbody\n"
+        content = "---\ntags:\n  - a\n  - b\nowner: me  # keep this comment\n---\nbody\n"
         new, meta = merge_frontmatter(content, {"tags": "flat"})
         block = split_frontmatter_block(new)[0]
+        assert "owner: me  # keep this comment" in block
         assert "tags: flat" in block
-        assert "owner: me" in block
         assert meta == {"tags": "flat", "owner": "me"}
 
     def test_unset_block_collection_valued_key_directly(self):
-        content = "---\ntags:\n  - a\n  - b\nowner: me\n---\nbody\n"
+        content = "---\ntags:\n  - a\n  - b\nowner: me  # keep this comment\n---\nbody\n"
         new, meta = merge_frontmatter(content, {}, ["tags"])
         block = split_frontmatter_block(new)[0]
+        assert "owner: me  # keep this comment" in block
         assert "tags" not in block
-        assert "owner: me" in block
         assert meta == {"owner": "me"}
 
 
@@ -367,3 +375,144 @@ class TestMergeFrontmatterTruthfulnessInvariant:
             new, meta = merge_frontmatter(content, values, unset)
             reparsed, _ = parse_frontmatter(new)
             assert meta == reparsed, f"mismatch for {content!r}: {meta} != {reparsed}"
+
+
+class TestMergeFrontmatterTruthfulnessGuardFaultInjection:
+    """Prove _splice_block's truthfulness check is itself load-bearing (not
+    just something every natural test happens to satisfy either way): force
+    _splice_entries to return a candidate that doesn't match the intended
+    metadata, and confirm merge_frontmatter discards it for the always-
+    truthful whole-block redump instead of writing (or reporting) the wrong
+    thing. Covers all four shapes _splice_block is called for: set only,
+    unset only, both together, and creating a block from scratch (an empty
+    raw_block, where _locate_entries("") returns {} rather than None).
+    """
+
+    def test_bogus_splice_discarded_on_set(self, monkeypatch):
+        import stash_mcp.frontmatter as fm
+
+        monkeypatch.setattr(fm, "_splice_entries", lambda *a, **k: "not: [valid")
+        content = "---\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"verified": "2026-08-16"})
+        assert meta == {"owner": "me", "verified": "2026-08-16"}
+        reparsed, _ = parse_frontmatter(new)
+        assert reparsed == meta
+
+    def test_bogus_splice_discarded_on_unset(self, monkeypatch):
+        import stash_mcp.frontmatter as fm
+
+        monkeypatch.setattr(fm, "_splice_entries", lambda *a, **k: "wrong: nonsense")
+        content = "---\nowner: me\nlayer: x\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {}, ["layer"])
+        assert meta == {"owner": "me"}
+        reparsed, _ = parse_frontmatter(new)
+        assert reparsed == meta
+
+    def test_bogus_splice_discarded_on_set_and_unset(self, monkeypatch):
+        import stash_mcp.frontmatter as fm
+
+        monkeypatch.setattr(fm, "_splice_entries", lambda *a, **k: "totally: [broken")
+        content = "---\nowner: me\nlayer: x\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"verified": "2026-08-16"}, ["layer"])
+        assert meta == {"owner": "me", "verified": "2026-08-16"}
+        reparsed, _ = parse_frontmatter(new)
+        assert reparsed == meta
+
+    def test_bogus_splice_discarded_on_block_creation(self, monkeypatch):
+        import stash_mcp.frontmatter as fm
+
+        monkeypatch.setattr(fm, "_splice_entries", lambda *a, **k: "still: [wrong")
+        content = "# T\n\nbody\n"
+        new, meta = merge_frontmatter(content, {"verified": "2026-08-16"})
+        assert meta == {"verified": "2026-08-16"}
+        reparsed, _ = parse_frontmatter(new)
+        assert reparsed == meta
+
+    def test_bogus_splice_with_duplicate_keys_discarded(self, monkeypatch):
+        # This candidate is *valid, parseable* YAML that even reparses to
+        # the right scalar values overall -- yaml.safe_load collapses the
+        # duplicate "verified" to its last occurrence, which happens to be
+        # the correct one. A truthfulness check that only compares reparsed
+        # scalars against `data` would wrongly call this candidate truthful
+        # and write the duplicate to disk. It's only caught because
+        # _is_truthful also requires the candidate itself to be safely
+        # re-editable (_locate_entries(candidate) is not None), which
+        # duplicate top-level keys fail.
+        import stash_mcp.frontmatter as fm
+
+        monkeypatch.setattr(
+            fm,
+            "_splice_entries",
+            lambda *a, **k: "owner: me\nverified: wrong\nverified: 2026-08-16",
+        )
+        content = "---\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"verified": "2026-08-16"})
+        block = split_frontmatter_block(new)[0]
+        assert block.count("verified") == 1
+        assert meta == {"owner": "me", "verified": "2026-08-16"}
+
+
+class TestMergeFrontmatterSetPathNormalizedKeyMatching:
+    """The set path must match existing on-disk keys by normalized name,
+    exactly like unset already does -- otherwise a caller passing back the
+    normalized spelling read_content showed it (e.g. "Verified" against an
+    on-disk "verified") appends a *second*, duplicate key instead of
+    updating the existing one in place. This is the finding-2 class
+    (normalized-key matching) recurring on the set side specifically.
+    """
+
+    def test_set_with_different_casing_updates_in_place_no_duplicate(self):
+        content = "---\nverified: 2026-01-01\nowner: me  # keep this comment\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"Verified": "2026-08-16"})
+        block = split_frontmatter_block(new)[0]
+        assert block.count("verified") == 1
+        assert "2026-01-01" not in block
+        assert "2026-08-16" in block
+        # A whole-block redump fallback rescuing a duplicate-key mistake
+        # would also end up with one "verified" line and no stale date --
+        # but it would also strip this comment, so its presence proves the
+        # true surgical in-place update ran, not a fallback masking a bug.
+        assert "owner: me  # keep this comment" in block
+        assert meta == {"verified": "2026-08-16", "owner": "me"}
+
+    def test_set_with_hyphen_vs_underscore_updates_in_place_no_duplicate(self):
+        content = "---\nlast_verified: 2026-01-01\nowner: me  # keep this comment\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"last-verified": "2026-08-16"})
+        block = split_frontmatter_block(new)[0]
+        assert block.count("verified") == 1
+        assert "2026-01-01" not in block
+        # Same reasoning as the test above: only the true in-place surgical
+        # update keeps this comment -- a fallback rescuing a duplicate-key
+        # mistake would also land on one correct "verified" line, but would
+        # strip it, so its presence is what actually proves the direct fix
+        # ran rather than the (separate) output-duplicate guard masking it.
+        assert "owner: me  # keep this comment" in block
+        assert meta == {"last_verified": "2026-08-16", "owner": "me"}
+
+
+class TestMergeFrontmatterTrimGatedToBlockCollections:
+    """The blank/comment-aware trim (_trim_swallowed_trailer) must only
+    apply to genuine block-style collections (block sequences/mappings).
+    A block scalar's own content can contain a line that merely *looks*
+    like a trailing comment or blank line -- applying the collection-aware
+    trim there mistakes real value content for swallowed noise and orphans
+    a fragment of the value in the document after set/unset.
+    """
+
+    def test_block_scalar_hash_line_not_orphaned_on_unset(self):
+        content = "---\nnotes: |\n  line1\n  # literal hash line\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {}, ["notes"])
+        block = split_frontmatter_block(new)[0]
+        assert "literal hash line" not in block
+        assert "notes" not in block
+        assert "owner: me" in block
+        assert meta == {"owner": "me"}
+
+    def test_block_scalar_hash_line_not_orphaned_on_set(self):
+        content = "---\nnotes: |\n  line1\n  # literal hash line\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"notes": "flat"})
+        block = split_frontmatter_block(new)[0]
+        assert "literal hash line" not in block
+        assert "notes: flat" in block
+        assert "owner: me" in block
+        assert meta == {"notes": "flat", "owner": "me"}
