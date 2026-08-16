@@ -103,6 +103,24 @@ async def _run_one_iteration(monkeypatch, git, tm, sync_enabled=True):
         await main_mod._git_sync_loop(git, None, event, tm)
 
 
+async def _run_iterations(monkeypatch, git, tm, event, count):
+    """Run the sync loop for exactly *count* iterations, then cancel it."""
+    monkeypatch.setattr(main_mod.Config, "GIT_SYNC_ENABLED", True)
+    monkeypatch.setattr(main_mod.Config, "GIT_SYNC_REMOTE", "origin")
+    monkeypatch.setattr(main_mod.Config, "GIT_SYNC_BRANCH", "main")
+    monkeypatch.setattr(main_mod.Config, "GIT_SYNC_INTERVAL", 60)
+    seen = {"n": 0}
+
+    async def stop_after_count(_seconds):
+        seen["n"] += 1
+        if seen["n"] >= count:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", stop_after_count)
+    with pytest.raises(asyncio.CancelledError):
+        await main_mod._git_sync_loop(git, None, event, tm)
+
+
 async def test_sync_loop_pulls_under_lock_and_pushes_when_ahead(monkeypatch):
     with TemporaryDirectory() as tmp:
         git = MagicMock()
@@ -120,6 +138,89 @@ async def test_sync_loop_pulls_under_lock_and_pushes_when_ahead(monkeypatch):
         await _run_one_iteration(monkeypatch, git, tm)
         assert held == [True]                     # pull ran while the write lock was held
         git.push.assert_called_once_with("origin", "main")
+
+
+async def test_sync_loop_counts_ahead_under_the_write_lock(monkeypatch):
+    """ahead_count was the only git call in the loop running outside the lock."""
+    with TemporaryDirectory() as tmp:
+        git = MagicMock()
+        git.pull.return_value = PullResult(success=True)
+        tm = TransactionManager(FileSystem(Path(tmp)), git, autocommit=True)
+        held: list[tuple[str, bool]] = []
+
+        def count_and_check(*a):
+            held.append(("ahead_count", tm.write_lock.locked()))
+            return 3
+
+        def push_and_check(*a):
+            held.append(("push", tm.write_lock.locked()))
+
+        git.ahead_count.side_effect = count_and_check
+        git.push.side_effect = push_and_check
+        await _run_one_iteration(monkeypatch, git, tm)
+        assert held == [("ahead_count", True), ("push", True)]
+
+
+async def test_sync_loop_warns_once_pulls_have_been_skipped_repeatedly(monkeypatch, caplog):
+    """With per-session transactions the pause window is the union of every
+    open transaction's window, so pulls can starve indefinitely while pushes
+    keep going. That must not stay invisible at DEBUG level."""
+    with TemporaryDirectory() as tmp:
+        git = MagicMock()
+        git.ahead_count.return_value = 0
+        tm = TransactionManager(FileSystem(Path(tmp)), git, autocommit=True)
+        event = asyncio.Event()                    # cleared == a transaction is open
+        with caplog.at_level(logging.WARNING, logger="stash_mcp.main"):
+            await _run_iterations(
+                monkeypatch, git, tm, event, main_mod.PULL_SKIP_WARN_AFTER
+            )
+        git.pull.assert_not_called()
+        assert "skipped 5 consecutive pulls" in caplog.text
+        assert "no longer pulling from origin/main" in caplog.text
+
+
+async def test_sync_loop_does_not_warn_before_the_skip_threshold(monkeypatch, caplog):
+    with TemporaryDirectory() as tmp:
+        git = MagicMock()
+        git.ahead_count.return_value = 0
+        tm = TransactionManager(FileSystem(Path(tmp)), git, autocommit=True)
+        event = asyncio.Event()
+        with caplog.at_level(logging.WARNING, logger="stash_mcp.main"):
+            await _run_iterations(
+                monkeypatch, git, tm, event, main_mod.PULL_SKIP_WARN_AFTER - 1
+            )
+        assert "consecutive pulls" not in caplog.text
+
+
+async def test_sync_loop_reports_a_conflicted_merge_at_error_level(monkeypatch, caplog):
+    """A failed pull can leave MERGE_HEAD behind, after which every
+    path-scoped commit fails permanently while writes keep landing on disk."""
+    with TemporaryDirectory() as tmp:
+        git = MagicMock()
+        git.pull.return_value = PullResult(success=False, message="CONFLICT in README.md")
+        git.merge_in_progress.return_value = True
+        git.ahead_count.return_value = 0
+        tm = TransactionManager(FileSystem(Path(tmp)), git, autocommit=True)
+        with caplog.at_level(logging.WARNING, logger="stash_mcp.main"):
+            await _run_one_iteration(monkeypatch, git, tm)
+        assert "Git sync pull failed" in caplog.text
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "conflicted merge is in progress" in errors[0].getMessage()
+        assert "merge --abort" in errors[0].getMessage()
+
+
+async def test_sync_loop_stays_quiet_when_a_failed_pull_left_no_merge(monkeypatch, caplog):
+    with TemporaryDirectory() as tmp:
+        git = MagicMock()
+        git.pull.return_value = PullResult(success=False, message="timed out after 120s")
+        git.merge_in_progress.return_value = False
+        git.ahead_count.return_value = 0
+        tm = TransactionManager(FileSystem(Path(tmp)), git, autocommit=True)
+        with caplog.at_level(logging.WARNING, logger="stash_mcp.main"):
+            await _run_one_iteration(monkeypatch, git, tm)
+        assert "timed out" in caplog.text
+        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
 
 
 async def test_sync_loop_skips_push_when_not_ahead(monkeypatch):

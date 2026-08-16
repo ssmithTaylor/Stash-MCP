@@ -220,6 +220,14 @@ def _task_done_callback(task: asyncio.Task) -> None:
         logger.error(f"Background task {task.get_name()} failed: {exc}", exc_info=exc)
 
 
+# Consecutive skipped pulls before the operator hears about it. Transactions
+# are per-session and non-exclusive, so the pause window is the union of every
+# open transaction's window and can be near-continuous on a busy server. A repo
+# that keeps pushing but silently stops pulling is the failure mode this warns
+# about; it repeats every N skips so a single line cannot be missed.
+PULL_SKIP_WARN_AFTER = 5
+
+
 async def _git_sync_loop(
     git_backend,
     search_engine,
@@ -230,13 +238,17 @@ async def _git_sync_loop(
 
     Pull and push run under the write lock so they never interleave with a
     write+commit; pull is skipped while any transaction is open (the event
-    is cleared by the TransactionManager's sync callbacks).
+    is cleared by the TransactionManager's sync callbacks). Push is not gated
+    on that event — it never touches the working tree, so it stays safe
+    mid-transaction and keeps local commits reaching the remote even while
+    pulls are starved; the starvation itself is surfaced by a WARNING.
     """
     remote = Config.GIT_SYNC_REMOTE
     branch = Config.GIT_SYNC_BRANCH
     interval = Config.GIT_SYNC_INTERVAL
     recursive = Config.GIT_SYNC_RECURSIVE
     lock = transaction_manager.write_lock if transaction_manager is not None else None
+    skipped_pulls = 0
 
     async def _locked(fn, *args):
         if lock is None:
@@ -244,9 +256,17 @@ async def _git_sync_loop(
         async with lock:
             return await asyncio.to_thread(fn, *args)
 
+    def _push_if_ahead() -> int:
+        """Count and push in one lock hold, on a worker thread."""
+        ahead = git_backend.ahead_count(remote, branch)
+        if ahead > 0:
+            git_backend.push(remote, branch)
+        return ahead
+
     while True:
         try:
             if sync_event is None or sync_event.is_set():
+                skipped_pulls = 0
                 result = await _locked(git_backend.pull, remote, branch, recursive)
                 if result.success:
                     logger.info("Git sync: %s", result.message or "up to date")
@@ -258,16 +278,50 @@ async def _git_sync_loop(
                         emit(CONTENT_DELETED, path)
                 else:
                     logger.warning("Git sync pull failed: %s", result.message)
+                    await _warn_if_merge_in_progress(git_backend)
             else:
-                logger.debug("Git sync pull skipped: transaction in progress")
+                skipped_pulls += 1
+                if skipped_pulls % PULL_SKIP_WARN_AFTER == 0:
+                    logger.warning(
+                        "Git sync has skipped %d consecutive pulls (~%ds) because a "
+                        "transaction was open every time; this server is still pushing "
+                        "but is no longer pulling from %s/%s.",
+                        skipped_pulls,
+                        skipped_pulls * interval,
+                        remote,
+                        branch,
+                    )
+                else:
+                    logger.debug("Git sync pull skipped: transaction in progress")
             if Config.GIT_SYNC_ENABLED:
-                ahead = await asyncio.to_thread(git_backend.ahead_count, remote, branch)
+                ahead = await _locked(_push_if_ahead)
                 if ahead > 0:
-                    await _locked(git_backend.push, remote, branch)
                     logger.info("Git sync: pushed %d commit(s)", ahead)
         except Exception as exc:
             logger.warning("Git sync error: %s", exc)
         await asyncio.sleep(interval)
+
+
+async def _warn_if_merge_in_progress(git_backend) -> None:
+    """Log an ERROR when a failed pull left a conflicted merge behind.
+
+    ``git commit -- <pathspec>`` refuses to run during a merge, so from this
+    point every write still lands on disk but no commit can be made — an
+    otherwise invisible hard-down state. Resolution is deliberately manual.
+    """
+    try:
+        if not await asyncio.to_thread(git_backend.merge_in_progress):
+            return
+    except Exception as exc:  # never let diagnostics break the sync loop
+        logger.debug("Could not check for an in-progress merge: %s", exc)
+        return
+    logger.error(
+        "A conflicted merge is in progress in %s (MERGE_HEAD is present). "
+        "Path-scoped commits fail during a merge, so writes will keep landing "
+        "on disk but NOTHING will be committed until an operator resolves it "
+        "manually (resolve the conflicts and 'git commit', or 'git merge --abort').",
+        Config.CONTENT_DIR,
+    )
 
 
 def create_app():
@@ -317,10 +371,6 @@ def create_app():
         # `transaction_manager` would make every autocommit-mode MCP write
         # fail with a generic "No active transaction" instead of committing.
         fs_for_mcp = filesystem if Config.GIT_AUTOCOMMIT else transaction_manager
-        assert not (Config.GIT_AUTOCOMMIT and fs_for_mcp is transaction_manager), (
-            "fs_for_mcp must be the raw filesystem in autocommit mode, or MCP writes "
-            "will fail with a generic 'No active transaction' error"
-        )
         logger.info(
             "Git write mode: %s", "autocommit" if Config.GIT_AUTOCOMMIT else "transactions"
         )

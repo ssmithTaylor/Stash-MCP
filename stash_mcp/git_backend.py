@@ -10,6 +10,12 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Wall-clock ceiling for git subprocesses that talk to a remote. Git sets no
+# low-speed limits by default, so a blackholed TCP connection or a stalled TLS
+# handshake would otherwise hang forever — and these run under the process-wide
+# write lock, which would take every write down with them.
+NETWORK_TIMEOUT_SECONDS = 120.0
+
 
 @dataclass
 class BlameLine:
@@ -133,6 +139,20 @@ def _parse_pull_file_statuses(
     return added, modified, deleted
 
 
+_AUTHOR_RE = re.compile(r"^.+\s*<[^>]*>\s*$")
+
+
+def is_valid_author(author: str) -> bool:
+    """True when *author* has the ``"Name <email>"`` shape ``git commit --author`` needs.
+
+    Git only accepts a bare name when it happens to match an author already in
+    the repository's history, so a value like ``"doc-writer"`` fails with
+    ``exit 128`` on some repositories and succeeds on others. Callers validate
+    up front to keep that ambiguity out of the commit path.
+    """
+    return bool(_AUTHOR_RE.match(author.strip()))
+
+
 def _parse_author_string(author: str) -> tuple[str, str]:
     """Parse a ``"Name <email>"`` string into ``(name, email)``.
 
@@ -153,9 +173,11 @@ class GitBackend:
         content_dir: Path,
         sync_token: str | None = None,
         author_default: str = "stash-mcp <stash@local>",
+        network_timeout: float = NETWORK_TIMEOUT_SECONDS,
     ) -> None:
         self.content_dir = content_dir
         self.author_default = author_default
+        self.network_timeout = network_timeout
         if sync_token:
             self._configure_credentials(sync_token)
 
@@ -253,6 +275,15 @@ class GitBackend:
     def validate_remote(self, remote: str) -> bool:
         """Return True if *remote* is configured in this repository."""
         result = self._run(["git", "remote", "get-url", remote])
+        return result.returncode == 0
+
+    def merge_in_progress(self) -> bool:
+        """True while an unresolved merge is in flight (``MERGE_HEAD`` exists).
+
+        ``git commit -- <pathspec>`` refuses to run during a merge, so every
+        path-scoped commit fails until an operator resolves it.
+        """
+        result = self._run(["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"])
         return result.returncode == 0
 
     def rename_remote(self, old_name: str, new_name: str) -> None:
@@ -558,9 +589,19 @@ class GitBackend:
             branch: Branch name (e.g. ``"main"``).
 
         Raises:
-            RuntimeError: If the push fails.
+            RuntimeError: If the push fails, including when it exceeds
+                :attr:`network_timeout` seconds. The timeout is translated
+                here so callers only ever have to handle ``RuntimeError``.
         """
-        result = self._run(["git", "push", remote, branch])
+        try:
+            result = self._run(
+                ["git", "push", remote, branch], timeout=self.network_timeout
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"git push timed out after {self.network_timeout:g}s "
+                f"({remote}/{branch}); the remote may be unreachable."
+            ) from exc
         if result.returncode != 0:
             raise RuntimeError(f"git push failed: {result.stderr.strip()}")
         logger.info("Pushed %s to %s/%s.", branch, remote, branch)
@@ -658,6 +699,10 @@ class GitBackend:
             branch: Branch name (e.g. ``"main"``).
             recursive: If True, pass ``--recurse-submodules``.
 
+        A pull that exceeds :attr:`network_timeout` seconds is reported as an
+        ordinary failed :class:`PullResult` rather than raising, so a hung
+        remote cannot escape as an unhandled exception from the sync loop.
+
         Returns:
             :class:`PullResult` with success flag, categorised file lists,
             and the raw git output message.
@@ -674,7 +719,15 @@ class GitBackend:
         if recursive:
             pull_args.append("--recurse-submodules")
 
-        result = self._run(pull_args)
+        try:
+            result = self._run(pull_args, timeout=self.network_timeout)
+        except subprocess.TimeoutExpired:
+            message = (
+                f"git pull timed out after {self.network_timeout:g}s "
+                f"({remote}/{branch}); the remote may be unreachable."
+            )
+            logger.warning("Git pull failed: %s", message)
+            return PullResult(success=False, message=message)
         if result.returncode != 0:
             stderr = result.stderr or ""
             if any(
