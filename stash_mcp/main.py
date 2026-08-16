@@ -310,8 +310,17 @@ def create_app():
         )
         # Gated mode installs the delegating wrapper so writes outside a
         # transaction are rejected; autocommit mode uses the raw filesystem
-        # and the manager only for the write lock / commits.
+        # and the manager only for the write lock / commits. Load-bearing:
+        # TransactionManager._resolve_txn_for_wrapper_write requires an open
+        # transaction regardless of autocommit (unlike guard()'s gate, which
+        # does understand autocommit) — reverting this to an unconditional
+        # `transaction_manager` would make every autocommit-mode MCP write
+        # fail with a generic "No active transaction" instead of committing.
         fs_for_mcp = filesystem if Config.GIT_AUTOCOMMIT else transaction_manager
+        assert not (Config.GIT_AUTOCOMMIT and fs_for_mcp is transaction_manager), (
+            "fs_for_mcp must be the raw filesystem in autocommit mode, or MCP writes "
+            "will fail with a generic 'No active transaction' error"
+        )
         logger.info(
             "Git write mode: %s", "autocommit" if Config.GIT_AUTOCOMMIT else "transactions"
         )

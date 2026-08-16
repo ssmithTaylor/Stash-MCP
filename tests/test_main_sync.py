@@ -1,6 +1,8 @@
 """Tests for main.py git wiring: autocommit config and the sync loop."""
 
 import asyncio
+import logging
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock
@@ -12,11 +14,77 @@ from stash_mcp.filesystem import FileSystem
 from stash_mcp.git_backend import PullResult
 from stash_mcp.transactions import TransactionManager
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _init_repo(path: Path) -> None:
+    """Initialise a git repo at *path* with a single commit."""
+    subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.name", "Test User"],
+        check=True,
+        capture_output=True,
+    )
+    (path / "README.md").write_text("# Test\n")
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-m", "Initial commit"],
+        check=True,
+        capture_output=True,
+    )
+
 
 def test_git_autocommit_config_default_false():
     from stash_mcp.config import Config
 
     assert Config.GIT_AUTOCOMMIT is False
+
+
+class TestCreateGitBackend:
+    """Tests for _create_git_backend's config-validation branches."""
+
+    def test_autocommit_without_tracking_warns_and_is_ignored(self, monkeypatch, caplog):
+        """STASH_GIT_AUTOCOMMIT=true without STASH_GIT_TRACKING=true must warn and
+        be ignored — startup must never fail from this flag combination."""
+        monkeypatch.setattr(main_mod.Config, "GIT_AUTOCOMMIT", True)
+        monkeypatch.setattr(main_mod.Config, "GIT_TRACKING", False)
+        monkeypatch.setattr(main_mod.Config, "GIT_SYNC_ENABLED", False)
+
+        with caplog.at_level(logging.WARNING, logger="stash_mcp.main"):
+            result = main_mod._create_git_backend()  # must not raise
+
+        assert result is None
+        assert "STASH_GIT_AUTOCOMMIT=true has no effect" in caplog.text
+
+    def test_unstages_leftover_staged_content_at_startup(self, tmp_path, monkeypatch):
+        """A repo with content staged by a crashed prior sequence must come out
+        of _create_git_backend with a clean index (worktree left untouched)."""
+        _init_repo(tmp_path)
+        (tmp_path / "leftover.md").write_text("leftover")
+        subprocess.run(
+            ["git", "-C", str(tmp_path), "add", "leftover.md"],
+            check=True,
+            capture_output=True,
+        )
+
+        monkeypatch.setattr(main_mod.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(main_mod.Config, "GIT_AUTOCOMMIT", False)
+        monkeypatch.setattr(main_mod.Config, "GIT_SYNC_ENABLED", False)
+        monkeypatch.setattr(main_mod.Config, "GIT_SYNC_TOKEN", None)
+        monkeypatch.setattr(main_mod.Config, "CONTENT_DIR", tmp_path)
+
+        backend = main_mod._create_git_backend()
+
+        assert backend is not None
+        assert not backend.has_staged_changes()
+        assert (tmp_path / "leftover.md").exists()  # worktree untouched
 
 
 async def _run_one_iteration(monkeypatch, git, tm, sync_enabled=True):

@@ -431,8 +431,9 @@ What is collected:
 | `STASH_GIT_SYNC_RECURSIVE` | `false` | Include submodule updates on pull |
 | `STASH_GIT_SYNC_TOKEN` | — | HTTPS token for git authentication |
 | `STASH_GIT_AUTHOR_DEFAULT` | `stash-mcp <stash@local>` | Fallback committer/author identity |
+| `STASH_GIT_AUTOCOMMIT` | `false` | With git tracking: commit every write outside a transaction immediately (per-write `commit_message`/`author`); transactions become optional grouping. `false` keeps the transaction gate |
 | `STASH_TRANSACTION_TIMEOUT` | `300` | Seconds before an active transaction is auto-aborted |
-| `STASH_TRANSACTION_LOCK_WAIT` | `120` | Seconds a queued agent waits for the transaction lock |
+| `STASH_TRANSACTION_LOCK_WAIT` | `120` | Seconds a write waits for the write lock before failing with "server busy" |
 | `STASH_SEARCH_ENABLED` | `false` | Enable semantic search |
 | `STASH_SEARCH_INDEX_DIR` | `/data/.stash-index` | Search index directory |
 | `STASH_SEARCH_EMBEDDER_MODEL` | `sentence-transformers:all-MiniLM-L6-v2` | Pydantic AI embedder model |
