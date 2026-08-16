@@ -2017,3 +2017,226 @@ class TestSearchMetadataFilterKeyNormalization:
             metadata_filters={"last-verified": "2026-08-16"},
         )
         assert [r.file_path for r in results] == ["doc.md"]
+
+
+# --- Fix round 1 regressions: boost vs. max_per_file, boost vs. negative scores ---
+
+
+class TestSearchBoostMaxPerFileCap:
+    """Regression: boost_prefixes must not let the union of two independently
+    -capped MMR passes (the general pool and the boost-scoped pool) exceed
+    max_per_file.
+
+    mock_embed can't reproduce this: its keyword-count vectors are
+    non-negative and never happen to make the two independent MMR passes
+    (general vs. boost-scoped) disagree on which chunks of a file to keep,
+    for any of this file's fixtures. This uses a hand-crafted embed_fn whose
+    vectors were verified (by direct experimentation against
+    VectorStore.search_mmr, see the fix-round-1 report) to make the two
+    passes independently select DIFFERENT chunks of the same 3-chunk file
+    under the engine's DEFAULT mmr_lambda=0.7 and max_per_file=2 — the
+    "general" pass picks chunks {2, 1} while the pass scoped to just this
+    file's own 3 chunks picks {2, 0}; naive union = all 3.
+    """
+
+    @staticmethod
+    async def _cap_repro_embed(texts: list[str]) -> list[list[float]]:
+        # Vectors are 3-D and hand-verified (not derived from the text
+        # content — this is a pure lookup keyed by a marker substring) to
+        # reproduce the max_per_file violation under mmr_lambda=0.7.
+        table = {
+            "QUERYMARK": [1.0, 0.0, 0.0],
+            "ZERO": [0.1300602624868516, -0.00949558973049732, -0.9914606204471872],
+            "ONE": [0.41487906317265155, -0.7756009301561246, 0.47572950306023404],
+            "TWO": [0.8362323236972545, -0.07510504497355922, 0.5432078175278867],
+            "NOISE": [0.22063688266072035, -0.12463224371628472, -0.9673604136184217],
+        }
+        out = []
+        for t in texts:
+            for tag, vec in table.items():
+                if tag in t:
+                    out.append(vec)
+                    break
+            else:
+                out.append([0.01, 0.0, 0.0])
+        return out
+
+    @pytest.fixture
+    def cap_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "boosted").mkdir()
+            (root / "noise").mkdir()
+            # chunk_size=30/overlap=0 makes each 30-char block below its own
+            # chunk with no boundary drift; everything else about the engine
+            # (mmr_enabled, hybrid_enabled, mmr_lambda, max_per_file) is left
+            # at its DEFAULT, since the cap contract is scoped to those defaults.
+            block0 = ("ZERO" * 8)[:30]
+            block1 = ("ONE-" * 8)[:30]
+            block2 = ("TWO-" * 8)[:30]
+            (root / "boosted" / "multi.md").write_text(block0 + block1 + block2)
+            (root / "noise" / "other.md").write_text("NOISE" * 6)
+            engine = SearchEngine(
+                content_dir=root,
+                index_dir=Path(index_dir),
+                embed_fn=self._cap_repro_embed,
+                chunk_size=30,
+                chunk_overlap=0,
+            )
+            yield engine
+
+    async def test_boost_respects_max_per_file_cap(self, cap_engine):
+        await cap_engine.reindex()
+        # Sanity: the file really did produce 3 distinct indexed chunks —
+        # otherwise this test would trivially pass for the wrong reason.
+        assert cap_engine.meta.chunk_counts["boosted/multi.md"] == 3
+
+        results = await cap_engine.search(
+            "QUERYMARK", max_results=10, boost_prefixes="boosted",
+        )
+        boosted_chunks = [r for r in results if r.file_path == "boosted/multi.md"]
+        assert len(boosted_chunks) <= 2, (
+            f"max_per_file=2 violated: got {len(boosted_chunks)} chunks from "
+            f"boosted/multi.md: {sorted(r.chunk_index for r in boosted_chunks)}"
+        )
+        # The boost must still be able to rescue this file into the result
+        # set at all — the cap fix must not turn boosting into a no-op.
+        assert boosted_chunks
+
+
+class TestSearchBoostNegativeScore:
+    """Regression: the boost multiplier must never make a boosted result
+    rank *worse* by multiplying a negative score further into the negative.
+
+    Only mmr_rerank (used in the hybrid + MMR path) can surface a negative
+    'score': search()/search_mmr() both explicitly drop non-positive cosine
+    similarities before a candidate is ever selectable, but mmr_rerank
+    overwrites 'score' with the raw cosine of whatever candidates hybrid
+    fusion handed it — including a BM25-rescued, dense-irrelevant candidate,
+    which is exactly the class of document hybrid mode exists to surface.
+    mock_embed cannot produce a negative similarity (its vectors are
+    non-negative keyword counts), so this uses a hand-crafted embed_fn.
+    """
+
+    @staticmethod
+    async def _neg_embed(texts: list[str]) -> list[list[float]]:
+        out = []
+        for t in texts:
+            if t == "findme":                 # the literal query string
+                out.append([1.0, 0.0])
+            elif "NEGDOC" in t:                # the chunk (also contains
+                out.append([-1.0, 0.0])        # "findme" for BM25 to find it)
+            else:
+                out.append([0.01, 0.0])
+        return out
+
+    @pytest.fixture
+    def neg_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "boosted").mkdir()
+            # Contains "findme" (so BM25 finds it via literal term overlap)
+            # and "NEGDOC" (a marker so the embed_fn can hand it a vector
+            # that is exactly opposite the query's — cosine similarity -1.0).
+            (root / "boosted" / "neg.md").write_text("findme NEGDOC findme findme")
+            engine = SearchEngine(
+                content_dir=root,
+                index_dir=Path(index_dir),
+                embed_fn=self._neg_embed,
+                hybrid_enabled=True,
+                default_boost_weight=0.5,   # matches the reviewer's -1.0 -> -1.5 repro ratio
+            )
+            yield engine
+
+    async def test_boost_never_demotes_negative_score_candidate(self, neg_engine):
+        await neg_engine.reindex()
+
+        unboosted = await neg_engine.search("findme", max_results=5)
+        assert unboosted
+        assert unboosted[0].score < 0, "fixture must exercise the negative-score path"
+
+        boosted = await neg_engine.search(
+            "findme", max_results=5, boost_prefixes="boosted",
+        )
+        assert boosted
+        # Chosen fix: only positive scores are eligible for the multiplier,
+        # so a negative score must come through completely unchanged — not
+        # just "not worse", but byte-identical to the unboosted run.
+        assert boosted[0].score == unboosted[0].score
+        assert boosted[0].score >= unboosted[0].score  # never demoted (the reported symptom)
+
+
+class TestSearchBoostCombinations:
+    """Combinations the fix-round-1 review flagged as untested."""
+
+    @pytest.fixture
+    def combo_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "projects" / "a").mkdir(parents=True)
+            (root / "projects" / "b").mkdir(parents=True)
+            (root / "outside").mkdir(parents=True)
+            (root / "projects" / "b" / "strong.md").write_text("# B\n\nauth oauth flow oauth")
+            (root / "projects" / "a" / "weak.md").write_text("# A\n\nauth flow")
+            # Strongest lexical match of all three, but outside the hard
+            # path_prefix scope — proves the hard filter really excludes it
+            # rather than it just losing on relevance.
+            (root / "outside" / "doc.md").write_text(
+                "# O\n\nauth oauth flow oauth auth oauth flow"
+            )
+            engine = SearchEngine(
+                content_dir=root, index_dir=Path(index_dir), embed_fn=mock_embed,
+                default_boost_weight=0.5,
+            )
+            yield engine
+
+    async def test_path_prefix_and_boost_prefixes_compose_as_and(self, combo_engine):
+        await combo_engine.reindex()
+        results = await combo_engine.search(
+            "auth oauth flow",
+            max_results=10,
+            path_prefix="projects",
+            boost_prefixes="projects/a",
+        )
+        paths = [r.file_path for r in results]
+        assert paths
+        # Hard filter: the stronger outside/ match never appears.
+        assert all(p.startswith("projects/") for p in paths)
+        # Soft boost still reorders within the allowed scope.
+        assert paths[0].startswith("projects/a/")
+        assert "projects/b/strong.md" in paths  # still present, just not first
+
+
+class TestSearchBoostHybrid:
+    """hybrid_enabled=True combined with boost_prefixes — previously untested
+    in any form (not just the negative-score edge case above).
+    """
+
+    @pytest.fixture
+    def hybrid_boost_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "projects" / "a").mkdir(parents=True)
+            (root / "projects" / "b").mkdir(parents=True)
+            (root / "projects" / "b" / "strong.md").write_text("# B\n\nauth oauth flow oauth")
+            (root / "projects" / "a" / "weak.md").write_text("# A\n\nauth flow")
+            engine = SearchEngine(
+                content_dir=root, index_dir=Path(index_dir), embed_fn=mock_embed,
+                hybrid_enabled=True, default_boost_weight=0.5,
+            )
+            yield engine
+
+    async def test_boost_reorders_in_hybrid_mode(self, hybrid_boost_engine):
+        await hybrid_boost_engine.reindex()
+        plain = [
+            r.file_path
+            for r in await hybrid_boost_engine.search("auth oauth flow", max_results=3)
+        ]
+        assert plain[0] == "projects/b/strong.md"
+
+        boosted = await hybrid_boost_engine.search(
+            "auth oauth flow", max_results=3, boost_prefixes="projects/a",
+        )
+        paths = [r.file_path for r in boosted]
+        assert paths[0].startswith("projects/a/")
+        assert "projects/b/strong.md" in paths

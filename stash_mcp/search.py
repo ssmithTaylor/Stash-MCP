@@ -775,6 +775,32 @@ def _merge_candidates(primary: list[dict], extra: list[dict]) -> list[dict]:
     return merged
 
 
+def _enforce_max_per_file(results: list[dict], max_per_file: int | None) -> list[dict]:
+    """Drop entries beyond ``max_per_file`` per file_path, preserving input order.
+
+    ``search_mmr`` enforces the cap within a single call, but the boost path
+    in ``SearchEngine.search`` runs it *twice* (once for the general pool,
+    once for the boost-scoped pool) and unions the results via
+    ``_merge_candidates`` — each call independently respects the cap, but
+    their union may not. Re-applying the cap on the merged, final-order list
+    restores the invariant without needing a shared per_file dict across the
+    two independent MMR passes. ``max_per_file=None`` means no cap (matches
+    ``VectorStore.search_mmr``'s own convention).
+    """
+    if max_per_file is None:
+        return results
+    counts: dict[str, int] = {}
+    kept: list[dict] = []
+    for r in results:
+        file_path = r.get("file_path", "")
+        seen = counts.get(file_path, 0)
+        if seen >= max_per_file:
+            continue
+        counts[file_path] = seen + 1
+        kept.append(r)
+    return kept
+
+
 def _chunk_text_sliding_window_with_offsets(
     text: str,
     chunk_size: int = 1000,
@@ -1618,11 +1644,29 @@ class SearchEngine:
             boosted: list[dict] = []
             for r in raw_results:
                 rr = dict(r)
-                if path_under_any(_normalize_path(rr.get("file_path", "")), boosts):
-                    rr["score"] = float(rr.get("score", 0.0)) * (1.0 + weight)
+                score = float(rr.get("score", 0.0))
+                # Only reward positive (genuinely relevant) scores. mmr_rerank
+                # (the hybrid + MMR path) overwrites score with the raw cosine
+                # similarity and, unlike search()/search_mmr(), does not filter
+                # out non-positive values — a BM25-rescued, dense-irrelevant
+                # candidate can legitimately have a negative score there.
+                # Multiplying a negative score by (1 + weight) makes it more
+                # negative, i.e. demotes the very candidate boosting was asked
+                # to promote.
+                if score > 0 and path_under_any(_normalize_path(rr.get("file_path", "")), boosts):
+                    rr["score"] = score * (1.0 + weight)
                 boosted.append(rr)
             boosted.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
             raw_results = boosted
+
+        if self.mmr_enabled and raw_results:
+            # The boost path above can run search_mmr/mmr_rerank twice (general
+            # pool + boost-scoped pool, unioned via _merge_candidates) — each
+            # call independently respects max_per_file, but their union may
+            # not. Re-enforce the documented hard cap on the final, boost-
+            # ordered list. No-op whenever a single MMR pass already produced
+            # raw_results (i.e. whenever boosting didn't trigger a second call).
+            raw_results = _enforce_max_per_file(raw_results, self.max_per_file)
 
         # Blame is needed up-front only when recency reranking is on
         # (it needs every candidate's timestamp before truncation). When
