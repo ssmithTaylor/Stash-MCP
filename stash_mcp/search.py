@@ -10,13 +10,22 @@ import json
 import logging
 import pickle
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+from .filesystem import glob_to_regex, normalize_glob
+from .frontmatter import extract_metadata, normalize_key
+from .headings import heading_path_at, scan_headings
 
 logger = logging.getLogger(__name__)
 
 # Maximum characters to pass to contextual retrieval model (~200k tokens ≈ 150k chars)
 MAX_CONTEXTUAL_DOCUMENT_CHARS = 150_000
+
+# Bump when the per-chunk metadata layout changes; a mismatch clears the
+# index on startup so build_index re-embeds and repopulates every chunk.
+INDEX_SCHEMA_VERSION = 1
 
 
 def _normalize_path(path: str) -> str:
@@ -44,6 +53,8 @@ class ChunkMetadata:
     content: str
     context: str | None = None
     content_hash: str = ""
+    metadata: dict[str, str] = field(default_factory=dict)
+    heading_path: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -58,6 +69,121 @@ class SearchResult:
     last_changed_at: str | None = None
     changed_by: str | None = None
     commit_message: str | None = None
+    metadata: dict[str, str] = field(default_factory=dict)
+    heading_path: list[str] = field(default_factory=list)
+
+
+def _normalize_exclude_pattern(pattern: str) -> str:
+    """Apply the STASH_CONTENT_PATHS conventions to a caller-supplied glob."""
+    return normalize_glob(pattern)
+
+
+def normalize_prefixes(value: str | list[str] | None) -> list[str]:
+    """Comma-separated string or list → normalized, de-duplicated subtree prefixes."""
+    if not value:
+        return []
+    parts = value.split(",") if isinstance(value, str) else list(value)
+    out: list[str] = []
+    for part in parts:
+        p = _normalize_path(str(part).strip())
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def path_under_any(path: str, prefixes: list[str]) -> bool:
+    """True when *path* equals or lies inside any of *prefixes* (subtree, not string prefix)."""
+    for p in prefixes:
+        if path == p or path.startswith(p + "/"):
+            return True
+    return False
+
+
+def reject_path_traversal(label: str, value: str | None) -> None:
+    """Raise ValueError if any comma-separated part of *value* is a '..' escape.
+
+    Shared by the MCP ``search_content`` tool and the REST ``/api/search``
+    endpoint so a ``path_prefix``/``boost_prefix`` value gets the same
+    accept/reject decision regardless of which surface it arrives through.
+    Backslashes are normalized to forward slashes first (matching
+    ``_normalize_path``) so a Windows-style traversal (``"..\\etc"``) is
+    rejected exactly like the POSIX form (``"../etc"``) instead of silently
+    reaching the engine as a no-op prefix. A name that merely contains
+    ``".."`` without it being its own path segment (e.g.
+    ``"archive..old/notes.md"``) is not rejected.
+
+    Args:
+        label: Parameter name used in the error message (e.g. "path_prefix").
+        value: Raw, comma-separated caller input (or None).
+
+    Raises:
+        ValueError: If any segment is exactly "..".
+    """
+    for part in (value or "").split(","):
+        stripped = part.strip()
+        if stripped and ".." in PurePosixPath(stripped.replace("\\", "/")).parts:
+            raise ValueError(f"{label} must not contain '..' segments")
+
+
+@dataclass
+class ChunkFilter:
+    """Predicate over chunk-metadata dicts. Every set field must match.
+
+    - ``path_prefixes``: any-of subtrees (``docs`` matches ``docs/a.md`` and
+      ``docs/x/b.md``, not ``docs2/a.md``).
+    - ``exclude_patterns``: globs in the ``STASH_CONTENT_PATHS`` dialect,
+      anchored at the content root; any match excludes the chunk.
+    - ``file_types``: extension allow-list.
+    - ``metadata``: string equality on the chunk's ``metadata`` dict.
+    """
+
+    path_prefixes: list[str] | None = None
+    exclude_patterns: list[str] | None = None
+    file_types: list[str] | None = None
+    metadata: dict[str, str] | None = None
+
+    @property
+    def active(self) -> bool:
+        return bool(
+            self.path_prefixes or self.exclude_patterns or self.file_types or self.metadata
+        )
+
+    def compile(self) -> Callable[[dict], bool]:
+        prefixes = normalize_prefixes(self.path_prefixes)
+        excludes = [
+            glob_to_regex(_normalize_exclude_pattern(p))
+            for p in (self.exclude_patterns or [])
+            if p and p.strip()
+        ]
+        types = tuple(self.file_types or ())
+        meta = dict(self.metadata or {})
+        path_cache: dict[str, bool] = {}
+
+        def path_ok(path: str) -> bool:
+            cached = path_cache.get(path)
+            if cached is not None:
+                return cached
+            ok = True
+            if prefixes and not path_under_any(path, prefixes):
+                ok = False
+            elif types and not path.endswith(types):
+                ok = False
+            elif any(rx.match(path) for rx in excludes):
+                ok = False
+            path_cache[path] = ok
+            return ok
+
+        def predicate(chunk: dict) -> bool:
+            if not path_ok(_normalize_path(chunk.get("file_path", ""))):
+                return False
+            if meta:
+                chunk_meta = chunk.get("metadata") or {}
+                for key, value in meta.items():
+                    if chunk_meta.get(key) != value:
+                        return False
+            return True
+
+        return predicate
 
 
 class VectorStore:
@@ -199,14 +325,41 @@ class VectorStore:
 
         return removed
 
+    @staticmethod
+    def _apply_mask(similarities, mask):
+        """Return ``similarities`` with any ``False``-masked rows set to -inf.
+
+        Returns ``similarities`` unchanged when ``mask`` is None — the
+        additive, opt-in default used by every existing caller.
+
+        Args:
+            similarities: 1-D array of cosine similarities, one per stored vector.
+            mask: Optional boolean array aligned with ``similarities``.
+
+        Raises:
+            ValueError: If ``mask``'s length doesn't match ``similarities``.
+        """
+        if mask is None:
+            return similarities
+        if len(mask) != len(similarities):
+            raise ValueError(
+                f"mask length {len(mask)} != vector count {len(similarities)}"
+            )
+
+        import numpy as np
+
+        return np.where(mask, similarities, -np.inf)
+
     def search(
-        self, query_embedding: list[float], top_n: int = 10
+        self, query_embedding: list[float], top_n: int = 10, mask=None
     ) -> list[dict]:
         """Cosine similarity search.
 
         Args:
             query_embedding: The query embedding vector.
             top_n: Maximum number of results to return.
+            mask: Optional boolean array aligned with the stored vectors;
+                False rows are never returned.
 
         Returns:
             List of metadata dicts with added 'score' field, sorted by
@@ -227,7 +380,7 @@ class VectorStore:
         norms = np.maximum(norms, 1e-10)
         normed = self._vectors / norms
 
-        similarities = normed @ query
+        similarities = self._apply_mask(normed @ query, mask)
         top_k = min(top_n, len(similarities))
         top_indices = np.argsort(similarities)[-top_k:][::-1]
 
@@ -250,6 +403,7 @@ class VectorStore:
         candidate_pool: int = 30,
         mmr_lambda: float = 0.7,
         max_per_file: int | None = 2,
+        mask=None,
     ) -> list[dict]:
         """Cosine retrieval followed by Maximal Marginal Relevance reranking.
 
@@ -258,7 +412,9 @@ class VectorStore:
         against diversity. ``mmr_lambda=1.0`` collapses to pure cosine
         ordering; ``0.0`` ignores relevance and maximises diversity.
         ``max_per_file`` (if set) hard-caps how many chunks from any one
-        file can land in the final result.
+        file can land in the final result. ``mask``: optional boolean
+        array aligned with the stored vectors; ``False`` rows are never
+        returned.
 
         Returns the same metadata-with-score shape as ``search``.
         """
@@ -279,7 +435,7 @@ class VectorStore:
         norms = np.maximum(norms, 1e-10)
         normed = self._vectors / norms
 
-        similarities = normed @ query
+        similarities = self._apply_mask(normed @ query, mask)
         pool_size = min(candidate_pool, len(similarities))
         # argpartition is O(n) vs argsort's O(n log n); fine either way at
         # this scale, but argsort makes the post-sort cleaner.
@@ -630,11 +786,68 @@ def _rrf_fuse(
     return [{**meta_by_id[key], "score": s} for key, s in fused]
 
 
-def _chunk_text_sliding_window(
+def _merge_candidates(primary: list[dict], extra: list[dict]) -> list[dict]:
+    """Union of two candidate lists keyed by (file_path, chunk_index); primary order first."""
+    seen = {(r.get("file_path", ""), int(r.get("chunk_index", 0))) for r in primary}
+    merged = list(primary)
+    for r in extra:
+        key = (r.get("file_path", ""), int(r.get("chunk_index", 0)))
+        if key not in seen:
+            seen.add(key)
+            merged.append(r)
+    return merged
+
+
+def _enforce_max_per_file(results: list[dict], max_per_file: int | None) -> list[dict]:
+    """Drop entries beyond ``max_per_file`` per file_path, preserving input order.
+
+    ``search_mmr`` enforces the cap within a single call, but the boost path
+    in ``SearchEngine.search`` runs it *twice* (once for the general pool,
+    once for the boost-scoped pool) and unions the results via
+    ``_merge_candidates`` — each call independently respects the cap, but
+    their union may not. Re-applying the cap on the merged, final-order list
+    restores the invariant without needing a shared per_file dict across the
+    two independent MMR passes. ``max_per_file=None`` means no cap (matches
+    ``VectorStore.search_mmr``'s own convention).
+    """
+    if max_per_file is None:
+        return results
+    counts: dict[str, int] = {}
+    kept: list[dict] = []
+    for r in results:
+        file_path = r.get("file_path", "")
+        seen = counts.get(file_path, 0)
+        if seen >= max_per_file:
+            continue
+        counts[file_path] = seen + 1
+        kept.append(r)
+    return kept
+
+
+def _chunk_text_sliding_window_with_offsets(
     text: str,
     chunk_size: int = 1000,
     chunk_overlap: int = 100,
-) -> list[str]:
+) -> list[tuple[str, int]]:
+    """Sliding-window chunks with the start offset of each chunk in ``text.strip()``."""
+    if not text or not text.strip():
+        return []
+    text = text.strip()
+    if len(text) <= chunk_size:
+        return [(text, 0)]
+    pairs: list[tuple[str, int]] = []
+    start = 0
+    while start < len(text):
+        raw = text[start:start + chunk_size]
+        lead = len(raw) - len(raw.lstrip())
+        chunk = raw.strip()
+        if chunk:
+            pairs.append((chunk, start + lead))
+        start += chunk_size - chunk_overlap
+    return pairs
+
+
+def _chunk_text_sliding_window(text, chunk_size=1000, chunk_overlap=100) -> list[str]:
     """Split text into fixed-size overlapping chunks.
 
     Simple sliding window — no structural parsing, no boundary detection.
@@ -647,23 +860,7 @@ def _chunk_text_sliding_window(
     Returns:
         List of text chunks.
     """
-    if not text or not text.strip():
-        return []
-
-    text = text.strip()
-
-    if len(text) <= chunk_size:
-        return [text]
-
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end].strip())
-        start += chunk_size - chunk_overlap
-
-    # Drop any trailing empty chunk
-    return [c for c in chunks if c.strip()]
+    return [c for c, _ in _chunk_text_sliding_window_with_offsets(text, chunk_size, chunk_overlap)]
 
 
 def _chunk_text(text: str, max_chunk_size: int = 1500) -> list[str]:
@@ -743,6 +940,7 @@ class IndexMeta:
     file_hashes: dict[str, str] = field(default_factory=dict)
     chunk_counts: dict[str, int] = field(default_factory=dict)
     embedder_model: str = ""
+    schema_version: int = INDEX_SCHEMA_VERSION
 
     def save(self, path: Path) -> None:
         """Persist to JSON file."""
@@ -753,6 +951,7 @@ class IndexMeta:
                     "file_hashes": self.file_hashes,
                     "chunk_counts": self.chunk_counts,
                     "embedder_model": self.embedder_model,
+                    "schema_version": self.schema_version,
                 },
                 f,
                 indent=2,
@@ -774,6 +973,7 @@ class IndexMeta:
                 file_hashes=data.get("file_hashes", {}),
                 chunk_counts=data.get("chunk_counts", {}),
                 embedder_model=data.get("embedder_model", ""),
+                schema_version=data.get("schema_version", 0),
             )
         except Exception as e:
             logger.warning(f"Failed to load index meta: {e}")
@@ -809,6 +1009,8 @@ class SearchEngine:
         hybrid_enabled: bool = False,
         rrf_k: int = 60,
         bm25_candidate_pool: int = 30,
+        default_exclude_patterns: list[str] | None = None,
+        default_boost_weight: float = 0.15,
     ):
         """Initialize the search engine.
 
@@ -844,6 +1046,10 @@ class SearchEngine:
                 from the original paper.
             bm25_candidate_pool: How many sparse candidates to fetch
                 per query before fusion.
+            default_exclude_patterns: Globs (STASH_CONTENT_PATHS dialect)
+                excluded from every search unless include_excluded=True.
+            default_boost_weight: Bonus applied to results under
+                boost_prefixes when the caller does not pass boost_weight.
         """
         self.content_dir = content_dir
         self.index_dir = index_dir
@@ -866,6 +1072,8 @@ class SearchEngine:
         self.hybrid_enabled = hybrid_enabled
         self.rrf_k = rrf_k
         self.bm25_candidate_pool = bm25_candidate_pool
+        self.default_exclude_patterns = [p for p in (default_exclude_patterns or []) if p]
+        self.default_boost_weight = max(0.0, float(default_boost_weight))
 
         # Validate numpy dependency at init time so we fail fast
         # rather than crashing on first file operation.
@@ -897,14 +1105,18 @@ class SearchEngine:
         # the BM25 store must be wiped in the same block so the two
         # indexes don't drift.
         if self.meta.embedder_model and self.meta.embedder_model != embedder_model:
-            logger.warning(
+            self._clear_index_for_rebuild(
                 f"Embedder model changed from '{self.meta.embedder_model}' "
                 f"to '{embedder_model}'. Clearing stale index for rebuild."
             )
-            self.store.clear()
-            self.bm25_store.clear()
-            self.meta = IndexMeta()
-            self.meta.save(self.index_dir / "index_meta.json")
+
+        # Chunk-metadata layout changed (e.g. the `metadata` dict was added):
+        # clear everything so the startup build re-embeds and repopulates.
+        if self.meta.schema_version != INDEX_SCHEMA_VERSION:
+            self._clear_index_for_rebuild(
+                f"Search index schema version {self.meta.schema_version} != "
+                f"{INDEX_SCHEMA_VERSION}; clearing index for rebuild."
+            )
 
         # Upgrade path: vectors.pkl exists from a pre-hybrid deployment
         # but no BM25 index yet — rebuild it now so the first query
@@ -924,6 +1136,25 @@ class SearchEngine:
 
         # Eagerly initialise the embedder so the first search query is fast
         self._embedder = self._create_embedder()
+
+    def _clear_index_for_rebuild(self, reason: str) -> None:
+        """Wipe the vector store, BM25 store, and index metadata, then persist.
+
+        Called at startup whenever something invalidates every stored chunk
+        (embedder model change, index schema-version bump, ...). The vector
+        and BM25 stores are cleared together so the two indexes never drift,
+        and the fresh, empty ``IndexMeta`` is saved immediately so a crash
+        before the next successful ``build_index()`` doesn't leave stale
+        on-disk state.
+
+        Args:
+            reason: Logged as a warning before clearing.
+        """
+        logger.warning(reason)
+        self.store.clear()
+        self.bm25_store.clear()
+        self.meta = IndexMeta()
+        self.meta.save(self.index_dir / "index_meta.json")
 
     def _create_embedder(self):
         """Create and return the embedding model instance, or None for custom embed_fn.
@@ -1146,18 +1377,22 @@ class SearchEngine:
                 logger.warning(f"Could not read {normalized_path}: {e}")
                 return 0
 
-        chunks = _chunk_text_sliding_window(content, self.chunk_size, self.chunk_overlap)
-        if not chunks:
+        doc_metadata, body = extract_metadata(content)
+        chunk_pairs = _chunk_text_sliding_window_with_offsets(
+            body, self.chunk_size, self.chunk_overlap
+        )
+        if not chunk_pairs:
             return 0
+        headings = scan_headings(body.strip())   # offsets are relative to the stripped body
 
         content_h = _content_hash(content)
         metadata_list: list[dict] = []
         texts_to_embed: list[str] = []
 
-        for i, chunk in enumerate(chunks):
+        for i, (chunk, start) in enumerate(chunk_pairs):
             context = None
             if self.contextual_retrieval:
-                context = await self._contextualise_chunk(chunk, content)
+                context = await self._contextualise_chunk(chunk, body)
 
             embed_text = f"{context}\n\n{chunk}" if context else chunk
             texts_to_embed.append(embed_text)
@@ -1168,6 +1403,8 @@ class SearchEngine:
                 content=chunk,
                 context=context,
                 content_hash=content_h,
+                metadata=doc_metadata,
+                heading_path=heading_path_at(headings, start),
             )
             metadata_list.append(asdict(meta))
 
@@ -1176,9 +1413,9 @@ class SearchEngine:
         self.bm25_store.mark_dirty()
 
         self.meta.file_hashes[normalized_path] = content_h
-        self.meta.chunk_counts[normalized_path] = len(chunks)
+        self.meta.chunk_counts[normalized_path] = len(chunk_pairs)
 
-        return len(chunks)
+        return len(chunk_pairs)
 
     async def index_file(
         self, relative_path: str, *, content: str | None = None
@@ -1251,6 +1488,12 @@ class SearchEngine:
         *,
         max_results: int = 5,
         file_types: list[str] | None = None,
+        path_prefix: str | list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+        metadata_filters: dict[str, str] | None = None,
+        include_excluded: bool = False,
+        boost_prefixes: str | list[str] | None = None,
+        boost_weight: float | None = None,
     ) -> list[SearchResult]:
         """Search for relevant content.
 
@@ -1258,6 +1501,21 @@ class SearchEngine:
             query: Search query text.
             max_results: Maximum number of results.
             file_types: Optional list of file extensions to filter (e.g. [".md", ".py"]).
+            path_prefix: Optional subtree(s) to restrict results to — a
+                comma-separated string or a list; any-of.
+            exclude_patterns: Optional glob patterns (STASH_CONTENT_PATHS dialect)
+                whose matches are dropped; always applied.
+            metadata_filters: Optional key/value equality filters on document
+                metadata (frontmatter / leading blockquote). Keys are
+                normalized the same way as stored metadata keys, so
+                "Describes" / "last-verified" match "describes" / "last_verified".
+            include_excluded: When True, the engine's default exclude patterns
+                are not applied (explicit ``exclude_patterns`` still are).
+            boost_prefixes: Optional subtree(s) to *prefer*: candidates under
+                them are also fetched separately and their score is
+                multiplied by (1 + boost_weight) before truncation; nothing
+                outside is hidden.
+            boost_weight: Overrides the engine default; 0 disables boosting.
 
         Returns:
             List of SearchResult sorted by relevance.
@@ -1265,18 +1523,61 @@ class SearchEngine:
         if not self._ready or self.store.count == 0:
             return []
 
+        excludes = list(exclude_patterns or [])
+        if not include_excluded:
+            excludes.extend(self.default_exclude_patterns)
+        prefixes = normalize_prefixes(path_prefix)
+        # The index stores metadata keys normalized (frontmatter.extract_metadata
+        # already does this at index time) — normalize the caller's filter keys
+        # the same way so e.g. {"Describes": ...} / {"last-verified": ...} still
+        # match the stored "describes" / "last_verified" keys instead of
+        # silently matching nothing.
+        normalized_metadata_filters = (
+            {normalize_key(k): v for k, v in metadata_filters.items()}
+            if metadata_filters
+            else None
+        )
+        chunk_filter = ChunkFilter(
+            path_prefixes=prefixes or None,
+            exclude_patterns=excludes or None,
+            file_types=file_types or None,
+            metadata=normalized_metadata_filters,
+        )
+        predicate = chunk_filter.compile() if chunk_filter.active else None
+
+        boosts = normalize_prefixes(boost_prefixes)
+        weight = self.default_boost_weight if boost_weight is None else max(0.0, boost_weight)
+        boosting = bool(boosts) and weight > 0
+
         query_embedding = await self._embed_query(query)
 
-        # Fetch a larger candidate pool so MMR + per-file cap + file_types
-        # filter have room to work. file_types over-fetches further since
-        # the filter happens post-retrieval.
+        # Fetch a larger candidate pool so MMR + per-file cap have room to
+        # work. Filtering happens as a pre-ranking mask, so no extra
+        # over-fetch is needed for it.
         candidate_pool = max(
             max_results * self.candidate_pool_multiplier,
             max_results,
         )
-        fetch_n = candidate_pool * 3 if file_types else candidate_pool
+        fetch_n = candidate_pool
 
         async with self._lock:
+            mask = None
+            boost_mask = None
+            rows = self.store._metadata
+            if predicate is not None or boosting:
+                import numpy as np
+            if predicate is not None:
+                mask = np.fromiter((predicate(m) for m in rows), dtype=bool, count=len(rows))
+            if boosting:
+                boost_mask = np.fromiter(
+                    (
+                        (predicate is None or predicate(m))
+                        and path_under_any(_normalize_path(m.get("file_path", "")), boosts)
+                        for m in rows
+                    ),
+                    dtype=bool,
+                    count=len(rows),
+                )
             if (
                 self.hybrid_enabled
                 and self.bm25_store.count > 0
@@ -1287,17 +1588,37 @@ class SearchEngine:
                 # back to dense-only below) when the BM25 index is
                 # dirty — fusing fresh dense results with a stale
                 # sparse index would produce inconsistent rankings.
-                dense = self.store.search(query_embedding, top_n=fetch_n)
-                sparse = self.bm25_store.search(
-                    query, top_n=self.bm25_candidate_pool
-                )
+                dense = self.store.search(query_embedding, top_n=fetch_n, mask=mask)
+                if boost_mask is not None:
+                    # NOTE: _merge_candidates appends the boost-scoped rescues
+                    # *after* the general pool, and _rrf_fuse scores purely by
+                    # position, so a rescued candidate enters fusion at the
+                    # worst reciprocal rank in the list. With MMR disabled
+                    # nothing reorders afterwards except the score multiplier
+                    # below, which acts on RRF scores that already encode that
+                    # penalty -- so boosting is near-inert in the
+                    # hybrid + MMR-disabled combination. Fixing it properly
+                    # needs a scoping parameter on BM25Store.search so the
+                    # sparse side can be fetched boost-scoped too.
+                    dense = _merge_candidates(
+                        dense,
+                        self.store.search(query_embedding, top_n=max_results, mask=boost_mask),
+                    )
+                sparse_n = self.bm25_candidate_pool * (3 if predicate is not None else 1)
+                sparse = self.bm25_store.search(query, top_n=sparse_n)
+                meta_lookup = self.store.metadata_index
+                if predicate is not None:
+                    sparse = [
+                        t for t in sparse
+                        if (m := meta_lookup.get((t[0], int(t[1])))) is not None
+                        and predicate(m)
+                    ]
                 fused = _rrf_fuse(dense, sparse, k=self.rrf_k)
                 # Hydrate sparse-only entries (which lack content/context)
                 # by looking up the full metadata from the vector store.
                 # VectorStore.metadata_index is cached across queries and
                 # only rebuilt on mutations, so the lookup is O(1) per
                 # candidate without paying O(N) on every search.
-                meta_lookup = self.store.metadata_index
                 hydrated: list[dict] = []
                 for r in fused:
                     if r.get("content"):
@@ -1330,16 +1651,62 @@ class SearchEngine:
                     candidate_pool=fetch_n,
                     mmr_lambda=self.mmr_lambda,
                     max_per_file=self.max_per_file,
+                    mask=mask,
                 )
+                if boost_mask is not None:
+                    raw_results = _merge_candidates(
+                        raw_results,
+                        self.store.search_mmr(
+                            query_embedding,
+                            top_n=max_results,
+                            candidate_pool=fetch_n,
+                            mmr_lambda=self.mmr_lambda,
+                            max_per_file=self.max_per_file,
+                            mask=boost_mask,
+                        ),
+                    )
             else:
-                raw_results = self.store.search(query_embedding, top_n=fetch_n)
+                raw_results = self.store.search(query_embedding, top_n=fetch_n, mask=mask)
+                if boost_mask is not None:
+                    raw_results = _merge_candidates(
+                        raw_results,
+                        self.store.search(query_embedding, top_n=max_results, mask=boost_mask),
+                    )
 
-        if file_types:
-            raw_results = [
-                r
-                for r in raw_results
-                if any(r.get("file_path", "").endswith(ext) for ext in file_types)
-            ]
+        if boosting and raw_results:
+            boosted: list[dict] = []
+            for r in raw_results:
+                rr = dict(r)
+                score = float(rr.get("score", 0.0))
+                # Only reward positive (genuinely relevant) scores. mmr_rerank
+                # (the hybrid + MMR path) overwrites score with the raw cosine
+                # similarity and, unlike search()/search_mmr(), does not filter
+                # out non-positive values — a BM25-rescued, dense-irrelevant
+                # candidate can legitimately have a negative score there.
+                # Multiplying a negative score by (1 + weight) makes it more
+                # negative, i.e. demotes the very candidate boosting was asked
+                # to promote.
+                if score > 0 and path_under_any(_normalize_path(rr.get("file_path", "")), boosts):
+                    rr["score"] = score * (1.0 + weight)
+                boosted.append(rr)
+            boosted.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
+            raw_results = boosted
+
+        if self.mmr_enabled and raw_results:
+            # The boost path above can run search_mmr/mmr_rerank twice (general
+            # pool + boost-scoped pool, unioned via _merge_candidates) — each
+            # call independently respects max_per_file, but their union may
+            # not. Re-enforce the documented hard cap on the final, boost-
+            # ordered list. No-op whenever a single MMR pass already produced
+            # raw_results (i.e. whenever boosting didn't trigger a second call).
+            #
+            # The `mmr_enabled` gate is about that *double fetch*, not about
+            # MMR itself: max_per_file is only ever applied by the MMR-based
+            # retrieval calls, so those are the only paths whose union can
+            # exceed it. The non-MMR branches never enforce the cap at all, so
+            # applying it here would silently start capping them. Don't
+            # "fix" this by dropping the gate.
+            raw_results = _enforce_max_per_file(raw_results, self.max_per_file)
 
         # Blame is needed up-front only when recency reranking is on
         # (it needs every candidate's timestamp before truncation). When
@@ -1401,6 +1768,8 @@ class SearchEngine:
                     content=r.get("content", ""),
                     context=r.get("context"),
                     score=r.get("score", 0.0),
+                    metadata=dict(r.get("metadata") or {}),
+                    heading_path=list(r.get("heading_path") or []),
                 )
             )
             if len(results) >= max_results:
@@ -1516,8 +1885,12 @@ class SearchEngine:
             Total number of chunks indexed.
         """
         async with self._lock:
-            self.store.clear()
-            self.meta = IndexMeta()
+            # Route through the shared helper so the BM25 store is wiped in
+            # the same breath as the vector store. Clearing only `store` and
+            # `meta` left every pre-reindex sparse posting in place, so a
+            # hybrid query could fuse fresh dense hits with chunks that no
+            # longer exist.
+            self._clear_index_for_rebuild("Full reindex requested; clearing index for rebuild.")
 
         file_paths = []
         if self._filesystem is not None:

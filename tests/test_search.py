@@ -7,6 +7,7 @@ import pytest
 
 from stash_mcp.search import (
     BM25Store,
+    ChunkFilter,
     IndexMeta,
     SearchEngine,
     SearchResult,
@@ -181,6 +182,51 @@ class TestVectorStore:
             assert store.count == 0
             assert store.search([1.0, 0.0]) == []
 
+    def test_search_with_mask_excludes_rows(self):
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = VectorStore(Path(tmpdir) / "vectors.pkl")
+            store.add(
+                [[1.0, 0.0], [0.9, 0.1], [0.1, 0.9]],
+                [
+                    {"file_path": "_reports/a.md", "chunk_index": 0},
+                    {"file_path": "docs/b.md", "chunk_index": 0},
+                    {"file_path": "docs/c.md", "chunk_index": 0},
+                ],
+            )
+            mask = np.array([False, True, True])
+            results = store.search([1.0, 0.0], top_n=2, mask=mask)
+            # the best row is masked out; the two remaining positive-score rows come back in order
+            assert [r["file_path"] for r in results] == ["docs/b.md", "docs/c.md"]
+
+    def test_search_mask_length_mismatch_raises(self):
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = VectorStore(Path(tmpdir) / "vectors.pkl")
+            store.add([[1.0, 0.0]], [{"file_path": "a.md", "chunk_index": 0}])
+            with pytest.raises(ValueError):
+                store.search([1.0, 0.0], mask=np.array([True, False]))
+
+    def test_search_mask_all_false_returns_empty(self):
+        """A scope filter that excludes every row must return [], not raise
+        and not fall back to unmasked results."""
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = VectorStore(Path(tmpdir) / "vectors.pkl")
+            store.add(
+                [[1.0, 0.0], [0.9, 0.1], [0.1, 0.9]],
+                [
+                    {"file_path": "a.md", "chunk_index": 0},
+                    {"file_path": "b.md", "chunk_index": 0},
+                    {"file_path": "c.md", "chunk_index": 0},
+                ],
+            )
+            mask = np.array([False, False, False])
+            assert store.search([1.0, 0.0], top_n=5, mask=mask) == []
+
 
 # --- Chunking tests ---
 
@@ -283,6 +329,20 @@ class TestIndexMeta:
             meta = IndexMeta.load(Path(tmpdir) / "nonexistent_meta.json")
             assert meta.file_hashes == {}
             assert meta.chunk_counts == {}
+
+    def test_schema_version_round_trip_and_legacy_default(self):
+        from stash_mcp.search import INDEX_SCHEMA_VERSION
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "index_meta.json"
+            meta = IndexMeta()
+            assert meta.schema_version == INDEX_SCHEMA_VERSION
+            meta.save(path)
+            assert IndexMeta.load(path).schema_version == INDEX_SCHEMA_VERSION
+
+            # Legacy file without the field loads as version 0
+            path.write_text('{"file_hashes": {}, "chunk_counts": {}, "embedder_model": ""}')
+            assert IndexMeta.load(path).schema_version == 0
 
 
 # --- Content hash tests ---
@@ -530,6 +590,66 @@ class TestSearchEngine:
         # With chunk_size=500, overlap=50, step=450, ~2000 chars => more than 1 chunk
         assert chunks > 1
 
+    async def test_chunks_carry_metadata_and_frontmatter_is_not_embedded(self, engine_dirs):
+        content_dir, index_dir = engine_dirs
+        (content_dir / "doc.md").write_text(
+            "---\nlayer: frogpilot\nverified: 2026-08-16\n---\n# Doc\n\nOAuth flow text.\n"
+        )
+        engine = SearchEngine(content_dir=content_dir, index_dir=index_dir, embed_fn=mock_embed)
+        await engine.build_index(["doc.md"])
+        chunk = engine.store._metadata[0]
+        assert chunk["metadata"] == {"layer": "frogpilot", "verified": "2026-08-16"}
+        assert chunk["heading_path"] == ["Doc"]
+        assert "layer: frogpilot" not in chunk["content"]
+        results = await engine.search("oauth flow")
+        assert results[0].metadata == {"layer": "frogpilot", "verified": "2026-08-16"}
+        assert results[0].heading_path == ["Doc"]
+
+    async def test_chunk_heading_path_follows_sections(self, engine_dirs):
+        content_dir, index_dir = engine_dirs
+        body = "# Svc\n\n## Role\n\n" + ("auth " * 300) + "\n\n## Config\n\n" + ("oauth " * 300)
+        (content_dir / "svc.md").write_text(body)
+        engine = SearchEngine(
+            content_dir=content_dir, index_dir=index_dir, embed_fn=mock_embed,
+            chunk_size=400, chunk_overlap=0,
+        )
+        await engine.build_index(["svc.md"])
+        paths = [tuple(m["heading_path"]) for m in engine.store._metadata]
+        assert paths[0] == ("Svc",)                       # first chunk starts on the H1 line
+        assert ("Svc", "Role") in paths and ("Svc", "Config") in paths
+        assert paths[-1] == ("Svc", "Config")
+
+    def test_sliding_window_offsets_align_with_chunks(self):
+        from stash_mcp.search import _chunk_text_sliding_window_with_offsets
+
+        text = "  " + "abcdefghij" * 5 + "  "
+        pairs = _chunk_text_sliding_window_with_offsets(text, chunk_size=20, chunk_overlap=5)
+        stripped = text.strip()
+        assert [c for c, _ in pairs] == _chunk_text_sliding_window(text, 20, 5)
+        for chunk, start in pairs:
+            assert stripped[start:start + len(chunk)] == chunk
+
+    async def test_schema_mismatch_clears_index_for_rebuild(self, engine_dirs):
+        import json
+
+        content_dir, index_dir = engine_dirs
+        (content_dir / "a.md").write_text("# A\n\nauth text")
+        engine1 = SearchEngine(content_dir=content_dir, index_dir=index_dir, embed_fn=mock_embed)
+        await engine1.build_index(["a.md"])
+        assert engine1.indexed_chunks > 0
+
+        meta_path = index_dir / "index_meta.json"
+        data = json.loads(meta_path.read_text())
+        data.pop("schema_version", None)          # simulate a pre-metadata index
+        meta_path.write_text(json.dumps(data))
+
+        engine2 = SearchEngine(content_dir=content_dir, index_dir=index_dir, embed_fn=mock_embed)
+        assert engine2.indexed_chunks == 0        # cleared
+        assert engine2.meta.file_hashes == {}     # so build_index re-embeds everything
+        total = await engine2.build_index(["a.md"])
+        assert total > 0
+        assert engine2.store._metadata[0].get("metadata") == {}
+
 
 # --- REST API search endpoint tests ---
 
@@ -549,17 +669,23 @@ class TestSearchAPI:
         with TemporaryDirectory() as content_dir:
             with TemporaryDirectory() as index_dir:
                 fs = FileSystem(Path(content_dir))
-                fs.write_file("docs/auth.md", "# Auth\n\nOAuth2 flow here.")
+                fs.write_file(
+                    "docs/auth.md", "---\nlayer: frogpilot\n---\n# Auth\n\nOAuth2 flow here."
+                )
                 fs.write_file("notes.md", "# Notes\n\nMeeting notes.")
+                fs.write_file("_reports/scan.md", "# Scan\n\nOAuth2 flow auth auth.")
 
                 engine = SearchEngine(
                     content_dir=Path(content_dir),
                     index_dir=Path(index_dir),
                     embed_fn=mock_embed,
+                    default_exclude_patterns=["**/_reports/**"],
                 )
 
                 # Build index directly since reindex endpoint is now non-blocking
-                asyncio.run(engine.build_index(["docs/auth.md", "notes.md"]))
+                asyncio.run(
+                    engine.build_index(["docs/auth.md", "notes.md", "_reports/scan.md"])
+                )
 
                 app = create_api(fs, search_engine=engine)
                 client = TestClient(app)
@@ -604,6 +730,81 @@ class TestSearchAPI:
         data = response.json()
         for result in data["results"]:
             assert result["file_path"].endswith(".md")
+
+    def test_search_default_exclusion_and_include_excluded(self, search_client):
+        data = search_client.get("/api/search", params={"q": "oauth flow"}).json()
+        paths = [r["file_path"] for r in data["results"]]
+        assert "docs/auth.md" in paths and "_reports/scan.md" not in paths
+        data = search_client.get(
+            "/api/search", params={"q": "oauth flow", "include_excluded": "true"},
+        ).json()
+        assert "_reports/scan.md" in [r["file_path"] for r in data["results"]]
+
+    def test_search_result_fields_and_metadata_filter(self, search_client):
+        data = search_client.get(
+            "/api/search", params={"q": "oauth flow", "filter": ["layer:frogpilot"]},
+        ).json()
+        assert [r["file_path"] for r in data["results"]] == ["docs/auth.md"]
+        item = data["results"][0]
+        assert item["metadata"] == {"layer": "frogpilot"}
+        assert item["heading_path"] == ["Auth"]
+        for key in ("last_changed_at", "changed_by", "commit_message"):
+            assert key in item
+
+    def test_search_boost_prefix_reorders(self, search_client):
+        plain = search_client.get(
+            "/api/search", params={"q": "oauth flow", "include_excluded": "true"},
+        ).json()["results"]
+        boosted = search_client.get(
+            "/api/search",
+            params={"q": "oauth flow", "include_excluded": "true", "boost_prefix": "_reports/"},
+        ).json()["results"]
+        assert plain[0]["file_path"] == "docs/auth.md"
+        assert boosted[0]["file_path"] == "_reports/scan.md"
+
+    def test_search_path_prefix_and_bad_filter(self, search_client):
+        data = search_client.get(
+            "/api/search", params={"q": "oauth flow", "path_prefix": "docs"},
+        ).json()
+        assert all(r["file_path"].startswith("docs/") for r in data["results"])
+        resp = search_client.get("/api/search", params={"q": "x", "filter": ["nocolon"]})
+        assert resp.status_code == 400
+
+    def test_search_status_reports_default_excludes(self, search_client):
+        data = search_client.get("/api/search/status").json()
+        assert data["default_exclude_patterns"] == ["**/_reports/**"]
+        assert data["boost_weight"] == 0.15
+
+    def test_search_rejects_parent_traversal_prefix(self, search_client):
+        """REST must reject '..' path segments exactly like the MCP tool does
+        (see TestMCPSearchTool.test_search_tool_rejects_parent_traversal_prefix),
+        including the backslash-spelled form, for both path_prefix and
+        boost_prefix."""
+        resp = search_client.get(
+            "/api/search", params={"q": "auth", "path_prefix": "../etc"},
+        )
+        assert resp.status_code == 400
+        assert "path_prefix" in resp.json()["detail"]
+
+        resp = search_client.get(
+            "/api/search", params={"q": "auth", "path_prefix": "..\\etc"},
+        )
+        assert resp.status_code == 400
+        assert "path_prefix" in resp.json()["detail"]
+
+        resp = search_client.get(
+            "/api/search", params={"q": "auth", "boost_prefix": "../etc"},
+        )
+        assert resp.status_code == 400
+        assert "boost_prefix" in resp.json()["detail"]
+
+    def test_search_accepts_prefix_merely_containing_dotdot(self, search_client):
+        """A legitimate name that contains '..' without it being its own path
+        segment (e.g. "archive..old") is not a traversal and must be accepted."""
+        resp = search_client.get(
+            "/api/search", params={"q": "oauth flow", "path_prefix": "archive..old"},
+        )
+        assert resp.status_code == 200
 
 
 # --- API without search engine ---
@@ -727,6 +928,220 @@ class TestMCPSearchTool:
                 finally:
                     _current_context.reset(token)
 
+    async def _tool_with_store(self, content_dir, index_dir, files, **engine_kw):
+        from stash_mcp.filesystem import FileSystem
+        from stash_mcp.mcp_server import create_mcp_server
+
+        fs = FileSystem(Path(content_dir))
+        for path, text in files.items():
+            fs.write_file(path, text)
+        engine = SearchEngine(
+            content_dir=Path(content_dir), index_dir=Path(index_dir),
+            embed_fn=mock_embed, **engine_kw,
+        )
+        await engine.build_index(list(files))
+        mcp = create_mcp_server(fs, search_engine=engine)
+        return await mcp.get_tool("search_content")
+
+    async def test_search_tool_default_exclusion_and_override(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {
+                    "_reports/scan.md": "# Scan\n\nauth oauth flow",
+                    "docs/auth.md": "---\nlayer: frogpilot\n---\n# Auth\n\nauth oauth flow",
+                },
+                default_exclude_patterns=["**/_reports/**"],
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                text = str((await tool.run({"query": "auth oauth"})).content)
+                assert "docs/auth.md" in text
+                assert "_reports/scan.md" not in text
+                assert "Meta: layer=frogpilot" in text
+                assert "Section: Auth" in text
+
+                text = str((await tool.run({
+                    "query": "auth oauth", "include_excluded": True,
+                })).content)
+                assert "_reports/scan.md" in text
+
+                text = str((await tool.run({
+                    "query": "auth oauth", "include_excluded": True, "boost_prefix": "_reports/",
+                })).content)
+                assert text.index("_reports/scan.md") < text.index("docs/auth.md")
+
+                text = str((await tool.run({
+                    "query": "auth oauth", "metadata_filters": {"layer": "nope"},
+                })).content)
+                assert "No results found" in text
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_marks_truncated_meta_values(self):
+        """A Meta value cut at 60 chars must say so — otherwise an agent
+        can't tell a truncated `describes:` from a complete one.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        long_value = "x" * 75
+        short_value = "y" * 60      # exactly at the limit: not truncated
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {"docs/a.md": (
+                    f"---\ndescribes: {long_value}\nlayer: {short_value}\n---\n"
+                    "# A\n\nauth oauth flow"
+                )},
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                # the raw text payload, not str(content) -- TextContent's repr
+                # escapes the ellipsis to a literal "\\u2026" and would hide it
+                text = (await tool.run({"query": "auth oauth"})).content[0].text
+                assert f"describes={'x' * 60}…" in text
+                assert long_value not in text                 # genuinely cut
+                # exactly at the limit is complete, so it gets no marker
+                assert f"layer={short_value}" in text
+                assert f"layer={short_value}…" not in text
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_rejects_parent_traversal_prefix(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir, {"a.md": "# A\n\nauth"},
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                with pytest.raises(ValueError, match="path_prefix"):
+                    await tool.run({"query": "auth", "path_prefix": "../etc"})
+
+                # Backslash-spelled traversal must be caught the same way as the
+                # forward-slash form — _normalize_path (search.py) treats '\\' as a
+                # path separator too, so the validation must match that convention.
+                with pytest.raises(ValueError, match="path_prefix"):
+                    await tool.run({"query": "auth", "path_prefix": "..\\etc"})
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_accepts_prefix_merely_containing_dotdot(self):
+        """A legitimate name that contains '..' without it being its own path
+        segment (e.g. "archive..old") is not a traversal and must be accepted
+        — mirrors TestSearchAPI.test_search_accepts_prefix_merely_containing_dotdot,
+        confirming REST and MCP share the same accept/reject decision."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {"archive..old/notes.md": "# A\n\nauth oauth flow"},
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                text = str((await tool.run({
+                    "query": "auth oauth", "path_prefix": "archive..old",
+                })).content)
+                assert "archive..old/notes.md" in text
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_path_prefix_narrows_results(self):
+        """A valid path_prefix actually scopes results, not just the rejection path."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {
+                    "docs/auth.md": "# Auth\n\nauth oauth flow",
+                    "other/auth.md": "# Auth\n\nauth oauth flow",
+                },
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                text = str((await tool.run({
+                    "query": "auth oauth", "path_prefix": "docs",
+                })).content)
+                assert "docs/auth.md" in text
+                assert "other/auth.md" not in text
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_exclude_patterns_filters_results(self):
+        """The exclude_patterns tool argument is threaded through, not just
+        the engine-level default_exclude_patterns."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {
+                    "docs/auth.md": "# Auth\n\nauth oauth flow",
+                    "scratch/auth.md": "# Auth\n\nauth oauth flow",
+                },
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                text = str((await tool.run({
+                    "query": "auth oauth", "exclude_patterns": "scratch/**",
+                })).content)
+                assert "docs/auth.md" in text
+                assert "scratch/auth.md" not in text
+            finally:
+                _current_context.reset(token)
+
+    async def test_search_tool_omits_section_and_meta_labels_when_absent(self):
+        """A chunk with no heading and a document with no frontmatter must not
+        emit dangling Section:/Meta: labels."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {"plain.md": "auth oauth flow with no heading and no frontmatter"},
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                text = str((await tool.run({"query": "auth oauth"})).content)
+                assert "plain.md" in text
+                assert "Section:" not in text
+                assert "Meta:" not in text
+            finally:
+                _current_context.reset(token)
+
 
 # --- Startup index build via lifespan ---
 
@@ -831,6 +1246,18 @@ class TestSearchConfig:
 
         assert Config.MODEL_CACHE_DIR == Path("/data/models")
 
+    def test_search_exclude_patterns_default_unset(self):
+        from stash_mcp.config import Config
+
+        assert Config.SEARCH_EXCLUDE_PATTERNS is None
+
+    def test_search_exclude_patterns_parse(self):
+        from stash_mcp.config import _parse_content_paths
+
+        assert _parse_content_paths("**/_reports/, **/_archive/**") == [
+            "**/_reports/**", "**/_archive/**",
+        ]
+
 
 # --- Path normalization tests ---
 
@@ -864,6 +1291,73 @@ class TestNormalizePath:
     def test_empty_string(self):
         """Test that empty string stays empty."""
         assert _normalize_path("") == ""
+
+
+# --- ChunkFilter tests ---
+
+
+class TestChunkFilter:
+    def _chunk(self, path, **meta):
+        return {"file_path": path, "chunk_index": 0, "content": "", "metadata": meta}
+
+    def test_inactive_when_empty(self):
+        assert ChunkFilter().active is False
+        assert ChunkFilter(path_prefixes=["docs"]).active is True
+
+    def test_path_prefix_is_subtree_not_string_prefix(self):
+        pred = ChunkFilter(path_prefixes=["docs/"]).compile()
+        assert pred(self._chunk("docs/a.md"))
+        assert pred(self._chunk("docs/sub/a.md"))
+        assert not pred(self._chunk("docs2/a.md"))
+        assert not pred(self._chunk("a.md"))
+
+    def test_multiple_prefixes_are_any_of(self):
+        pred = ChunkFilter(path_prefixes=["projects/stash-mcp", "systems/homelab/"]).compile()
+        assert pred(self._chunk("projects/stash-mcp/services/x.md"))
+        assert pred(self._chunk("systems/homelab/operations/y.md"))
+        assert not pred(self._chunk("projects/openpilot/services/z.md"))
+
+    def test_normalize_prefixes_and_path_under_any(self):
+        from stash_mcp.search import normalize_prefixes, path_under_any
+
+        assert normalize_prefixes("projects/a/, /systems/b ,,") == ["projects/a", "systems/b"]
+        assert normalize_prefixes(["x/"]) == ["x"]
+        assert normalize_prefixes(None) == []
+        assert path_under_any("projects/a/f.md", ["projects/a"])
+        assert path_under_any("projects/a", ["projects/a"])
+        assert not path_under_any("projects/ab/f.md", ["projects/a"])
+
+    def test_exclude_any_depth_vs_root_anchored(self):
+        pred = ChunkFilter(exclude_patterns=["**/_reports/**"]).compile()
+        assert not pred(self._chunk("_reports/scan.md"))
+        assert not pred(self._chunk("openpilot/_reports/x.md"))
+        assert pred(self._chunk("openpilot/services/pandad.md"))
+
+        pred_root = ChunkFilter(exclude_patterns=["_reports/"]).compile()
+        assert not pred_root(self._chunk("_reports/scan.md"))
+        assert pred_root(self._chunk("openpilot/_reports/x.md"))
+
+    def test_file_types(self):
+        pred = ChunkFilter(file_types=[".md", ".py"]).compile()
+        assert pred(self._chunk("a.md"))
+        assert pred(self._chunk("b.py"))
+        assert not pred(self._chunk("c.json"))
+
+    def test_metadata_equality_all_keys_must_match(self):
+        pred = ChunkFilter(metadata={"layer": "frogpilot", "verified": "2026-08-16"}).compile()
+        assert pred(self._chunk("a.md", layer="frogpilot", verified="2026-08-16"))
+        assert not pred(self._chunk("a.md", layer="frogpilot"))
+        assert not pred(self._chunk("a.md", layer="moretore", verified="2026-08-16"))
+        assert not pred({"file_path": "a.md"})  # no metadata key at all
+
+    def test_combined(self):
+        pred = ChunkFilter(
+            path_prefixes=["openpilot"], exclude_patterns=["**/_reports/**"], file_types=[".md"],
+        ).compile()
+        assert pred(self._chunk("openpilot/services/x.md"))
+        assert not pred(self._chunk("openpilot/_reports/x.md"))
+        assert not pred(self._chunk("openpilot/services/x.py"))
+        assert not pred(self._chunk("services/x.md"))
 
 
 # --- Search index integrity tests (delete/move) ---
@@ -1110,6 +1604,74 @@ class TestVectorStoreMMR:
                 max_per_file=None,
             )
             assert picked[0]["file_path"] == "a.md"
+
+    def test_search_mmr_with_mask_diversifies_within_scope(self):
+        """Masking must leave a real multi-candidate choice for MMR to make,
+        not just a pool that happens to equal top_n.
+
+        _reports/scratch.md has the single highest raw cosine similarity of
+        all four rows (1.0, a perfect match) but is masked out and must
+        never surface. Of the three unmasked survivors, docs/a.md and
+        docs/b.md point in nearly the same direction (high mutual cosine),
+        while docs/c.md is far more diverse but far less relevant. With
+        top_n=2 and mmr_lambda=0.3 (diversity-weighted), the second pick is
+        a genuine 2-way argmax between docs/b.md and docs/c.md — and the
+        redundancy penalty on docs/b.md (near-duplicate of the already
+        selected docs/a.md) flips the choice to docs/c.md, contradicting
+        plain cosine order (which would pick docs/a.md, docs/b.md).
+        """
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = VectorStore(Path(tmpdir) / "vectors.pkl")
+            store.add(
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.999, 0.045, 0.0],
+                    [0.99, 0.1, 0.0],
+                    [0.1, 0.0, 1.0],
+                ],
+                [
+                    {"file_path": "_reports/scratch.md", "chunk_index": 0},
+                    {"file_path": "docs/a.md", "chunk_index": 0},
+                    {"file_path": "docs/b.md", "chunk_index": 0},
+                    {"file_path": "docs/c.md", "chunk_index": 0},
+                ],
+            )
+            mask = np.array([False, True, True, True])
+            results = store.search_mmr(
+                [1.0, 0.0, 0.0],
+                top_n=2,
+                candidate_pool=4,
+                mmr_lambda=0.3,
+                max_per_file=2,
+                mask=mask,
+            )
+            assert [r["file_path"] for r in results] == ["docs/a.md", "docs/c.md"]
+
+    def test_search_mmr_mask_all_false_returns_empty(self):
+        """A scope filter that excludes every row must return [], not raise
+        and not fall back to unmasked results.
+
+        This is the only input class that reaches the ``if not pool: return
+        []`` early return in search_mmr — masking makes it a realistic
+        caller input (an all-excluding scope filter), not just a defensive
+        branch for an organically all-negative-similarity query.
+        """
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            mask = np.array([False, False, False])
+            assert store.search_mmr([1.0, 0.0, 0.0], top_n=2, mask=mask) == []
+
+    def test_search_mmr_mask_length_mismatch_raises(self):
+        import numpy as np
+
+        with TemporaryDirectory() as tmpdir:
+            store = self._store(tmpdir)
+            with pytest.raises(ValueError):
+                store.search_mmr([1.0, 0.0, 0.0], mask=np.array([True, False]))
 
 
 # --- SearchEngine recency reranking tests ---
@@ -1437,6 +1999,25 @@ class TestHybridSearchEngine:
         paths = [r.file_path for r in results]
         assert "search.md" in paths
 
+    async def test_reindex_clears_the_bm25_store_too(self, hybrid_engine):
+        """``reindex`` cleared ``store`` and ``meta`` but not ``bm25_store``.
+
+        The two indexes must be wiped together or they drift. Deleting every
+        file first makes the drift observable: with nothing left to re-index,
+        nothing marks BM25 dirty, so nothing triggers the incidental full
+        rebuild that otherwise papers over the missing clear.
+        """
+        engine = hybrid_engine
+        await engine.build_index(["auth.md", "db.md", "search.md"])
+        assert engine.bm25_store.count > 0
+
+        for name in ("auth.md", "db.md", "search.md"):
+            (engine.content_dir / name).unlink()
+
+        await engine.reindex()
+        assert engine.store.count == 0
+        assert engine.bm25_store.count == 0      # was: stale postings survived
+
     async def test_hybrid_disabled_is_dense_only(self, tmp_path):
         """hybrid_enabled=False bypasses BM25 entirely."""
         content_dir = tmp_path / "content"
@@ -1552,3 +2133,424 @@ class TestHybridSearchEngine:
         )
         assert engine2.indexed_chunks == 0
         assert engine2.bm25_store.count == 0
+
+    async def test_hybrid_filters_sparse_candidates(self, hybrid_engine):
+        root = hybrid_engine.content_dir
+        (root / "_reports").mkdir(exist_ok=True)
+        (root / "_reports" / "r.md").write_text("# R\n\nzebra zebra zebra")
+        (root / "keep.md").write_text("# K\n\nzebra")
+        await hybrid_engine.reindex()
+        results = await hybrid_engine.search(
+            "zebra", max_results=5, exclude_patterns=["**/_reports/**"],
+        )
+        paths = [r.file_path for r in results]
+        assert "keep.md" in paths
+        assert "_reports/r.md" not in paths
+
+
+# --- SearchEngine.search scoping, exclusions, metadata filters, boost ---
+
+
+class TestSearchScoping:
+
+    @pytest.fixture
+    def scoped_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "_reports").mkdir()
+            (root / "openpilot" / "_reports").mkdir(parents=True)
+            (root / "openpilot" / "services").mkdir(parents=True)
+            (root / "_reports" / "scan.md").write_text("# Scan\n\nauth auth auth oauth flow")
+            (root / "openpilot" / "_reports" / "delta.md").write_text(
+                "# Delta\n\nauth oauth flow flow"
+            )
+            (root / "openpilot" / "services" / "auth.md").write_text(
+                "---\nlayer: frogpilot\n---\n# Auth service\n\nauth oauth flow"
+            )
+            (root / "openpilot" / "services" / "notes.md").write_text(
+                "---\nlayer: upstream\n---\n# Notes\n\nauth flow"
+            )
+            engine = SearchEngine(
+                content_dir=root, index_dir=Path(index_dir), embed_fn=mock_embed,
+                default_exclude_patterns=["**/_reports/**"],
+            )
+            yield engine
+
+    async def _paths(self, engine, **kw):
+        return [r.file_path for r in await engine.search("auth oauth flow", max_results=10, **kw)]
+
+    async def test_default_exclusion_hides_reports_at_any_depth(self, scoped_engine):
+        await scoped_engine.reindex()
+        paths = await self._paths(scoped_engine)
+        assert paths
+        assert not any("_reports/" in p for p in paths)
+
+    async def test_include_excluded_readmits_defaults_only(self, scoped_engine):
+        await scoped_engine.reindex()
+        paths = await self._paths(scoped_engine, include_excluded=True)
+        assert any(p.startswith("_reports/") for p in paths)
+        paths = await self._paths(
+            scoped_engine, include_excluded=True, exclude_patterns=["_reports/**"],
+        )
+        assert not any(p.startswith("_reports/") for p in paths)
+        assert any(p.startswith("openpilot/_reports/") for p in paths)
+
+    async def test_path_prefix_scopes_to_subtree(self, scoped_engine):
+        await scoped_engine.reindex()
+        paths = await self._paths(scoped_engine, path_prefix="openpilot/services")
+        assert paths and all(p.startswith("openpilot/services/") for p in paths)
+
+    async def test_metadata_filter(self, scoped_engine):
+        await scoped_engine.reindex()
+        paths = await self._paths(scoped_engine, metadata_filters={"layer": "frogpilot"})
+        assert paths == ["openpilot/services/auth.md"]
+
+    async def test_max_results_holds_under_exclusion(self, scoped_engine):
+        await scoped_engine.reindex()
+        results = await scoped_engine.search("auth oauth flow", max_results=2)
+        assert len(results) == 2
+        assert not any("_reports/" in r.file_path for r in results)
+
+    async def test_file_types_still_filters(self, scoped_engine):
+        (scoped_engine.content_dir / "config.py").write_text("# auth\nAUTH = 1\n")
+        await scoped_engine.reindex()
+        paths = await self._paths(scoped_engine, file_types=[".py"])
+        assert paths == ["config.py"]
+
+    async def test_multiple_path_prefixes(self, scoped_engine):
+        root = scoped_engine.content_dir
+        (root / "systems" / "homelab").mkdir(parents=True)
+        (root / "systems" / "homelab" / "ops.md").write_text("# Ops\n\nauth oauth flow")
+        await scoped_engine.reindex()
+        paths = await self._paths(
+            scoped_engine, path_prefix="openpilot/services,systems/homelab",
+        )
+        assert set(paths) == {
+            "openpilot/services/auth.md", "openpilot/services/notes.md", "systems/homelab/ops.md",
+        }
+        paths = await self._paths(scoped_engine, path_prefix=["systems/homelab/"])
+        assert paths == ["systems/homelab/ops.md"]
+
+
+class TestSearchBoost:
+    """Soft scoping: boosted prefixes rank first but nothing is hidden."""
+
+    @pytest.fixture
+    def boost_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "projects" / "a").mkdir(parents=True)
+            (root / "projects" / "b").mkdir(parents=True)
+            # b's doc is the better lexical match; a's doc is what the agent works in
+            (root / "projects" / "b" / "strong.md").write_text("# B\n\nauth oauth flow oauth")
+            (root / "projects" / "a" / "weak.md").write_text("# A\n\nauth flow")
+            (root / "projects" / "a" / "other.md").write_text("# A2\n\nauth")
+            engine = SearchEngine(
+                content_dir=root, index_dir=Path(index_dir), embed_fn=mock_embed,
+                default_boost_weight=0.5,
+            )
+            yield engine
+
+    async def test_boost_reorders_without_hiding(self, boost_engine):
+        await boost_engine.reindex()
+        plain = [r.file_path for r in await boost_engine.search("auth oauth flow", max_results=3)]
+        assert plain[0] == "projects/b/strong.md"
+        boosted = await boost_engine.search(
+            "auth oauth flow", max_results=3, boost_prefixes="projects/a",
+        )
+        paths = [r.file_path for r in boosted]
+        assert paths[0].startswith("projects/a/")
+        assert "projects/b/strong.md" in paths            # still present
+
+    async def test_boost_zero_matches_plain_order(self, boost_engine):
+        await boost_engine.reindex()
+        plain = [r.file_path for r in await boost_engine.search("auth oauth flow", max_results=3)]
+        zero = [
+            r.file_path
+            for r in await boost_engine.search(
+                "auth oauth flow", max_results=3, boost_prefixes=["projects/a"], boost_weight=0.0,
+            )
+        ]
+        assert zero == plain
+
+    async def test_boost_pulls_in_scoped_doc_missing_from_general_pool(self, boost_engine):
+        root = boost_engine.content_dir
+        for i in range(30):   # flood the general pool with strong matches elsewhere
+            (root / "projects" / "b" / f"flood{i}.md").write_text("# F\n\nauth oauth flow oauth")
+        await boost_engine.reindex()
+        results = await boost_engine.search(
+            "auth oauth flow", max_results=2, boost_prefixes="projects/a",
+        )
+        assert any(r.file_path.startswith("projects/a/") for r in results)
+
+    async def test_boost_never_readmits_default_exclusions(self, boost_engine):
+        boost_engine.default_exclude_patterns = ["**/projects/a/**"]
+        await boost_engine.reindex()
+        results = await boost_engine.search(
+            "auth oauth flow", max_results=5, boost_prefixes="projects/a",
+        )
+        assert not any(r.file_path.startswith("projects/a/") for r in results)
+
+
+class TestSearchMetadataFilterKeyNormalization:
+    """Caller metadata_filters keys are normalized the same way the index side is.
+
+    frontmatter.extract_metadata (Task 2) normalizes frontmatter keys before
+    they're stored as chunk metadata (Task 6). Without normalizing the
+    caller's filter keys the same way, a filter like {"Describes": ...}
+    would silently match nothing against the stored "describes" key —
+    "silently matches nothing" being worse than an error.
+    """
+
+    @pytest.fixture
+    def metadata_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "doc.md").write_text(
+                "---\ndescribes: openpilot\nlast_verified: 2026-08-16\n---\n"
+                "# Doc\n\nauth oauth flow"
+            )
+            (root / "other.md").write_text("# Other\n\nauth oauth flow")
+            engine = SearchEngine(
+                content_dir=root, index_dir=Path(index_dir), embed_fn=mock_embed,
+            )
+            yield engine
+
+    async def test_title_case_key_matches_normalized_stored_key(self, metadata_engine):
+        await metadata_engine.reindex()
+        results = await metadata_engine.search(
+            "auth oauth flow", max_results=10, metadata_filters={"Describes": "openpilot"},
+        )
+        assert [r.file_path for r in results] == ["doc.md"]
+
+    async def test_hyphenated_key_matches_normalized_stored_key(self, metadata_engine):
+        await metadata_engine.reindex()
+        results = await metadata_engine.search(
+            "auth oauth flow",
+            max_results=10,
+            metadata_filters={"last-verified": "2026-08-16"},
+        )
+        assert [r.file_path for r in results] == ["doc.md"]
+
+
+# --- Fix round 1 regressions: boost vs. max_per_file, boost vs. negative scores ---
+
+
+class TestSearchBoostMaxPerFileCap:
+    """Regression: boost_prefixes must not let the union of two independently
+    -capped MMR passes (the general pool and the boost-scoped pool) exceed
+    max_per_file.
+
+    mock_embed can't reproduce this: its keyword-count vectors are
+    non-negative and never happen to make the two independent MMR passes
+    (general vs. boost-scoped) disagree on which chunks of a file to keep,
+    for any of this file's fixtures. This uses a hand-crafted embed_fn whose
+    vectors were verified (by direct experimentation against
+    VectorStore.search_mmr, see the fix-round-1 report) to make the two
+    passes independently select DIFFERENT chunks of the same 3-chunk file
+    under the engine's DEFAULT mmr_lambda=0.7 and max_per_file=2 — the
+    "general" pass picks chunks {2, 1} while the pass scoped to just this
+    file's own 3 chunks picks {2, 0}; naive union = all 3.
+    """
+
+    @staticmethod
+    async def _cap_repro_embed(texts: list[str]) -> list[list[float]]:
+        # Vectors are 3-D and hand-verified (not derived from the text
+        # content — this is a pure lookup keyed by a marker substring) to
+        # reproduce the max_per_file violation under mmr_lambda=0.7.
+        table = {
+            "QUERYMARK": [1.0, 0.0, 0.0],
+            "ZERO": [0.1300602624868516, -0.00949558973049732, -0.9914606204471872],
+            "ONE": [0.41487906317265155, -0.7756009301561246, 0.47572950306023404],
+            "TWO": [0.8362323236972545, -0.07510504497355922, 0.5432078175278867],
+            "NOISE": [0.22063688266072035, -0.12463224371628472, -0.9673604136184217],
+        }
+        out = []
+        for t in texts:
+            for tag, vec in table.items():
+                if tag in t:
+                    out.append(vec)
+                    break
+            else:
+                out.append([0.01, 0.0, 0.0])
+        return out
+
+    @pytest.fixture
+    def cap_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "boosted").mkdir()
+            (root / "noise").mkdir()
+            # chunk_size=30/overlap=0 makes each 30-char block below its own
+            # chunk with no boundary drift; everything else about the engine
+            # (mmr_enabled, hybrid_enabled, mmr_lambda, max_per_file) is left
+            # at its DEFAULT, since the cap contract is scoped to those defaults.
+            block0 = ("ZERO" * 8)[:30]
+            block1 = ("ONE-" * 8)[:30]
+            block2 = ("TWO-" * 8)[:30]
+            (root / "boosted" / "multi.md").write_text(block0 + block1 + block2)
+            (root / "noise" / "other.md").write_text("NOISE" * 6)
+            engine = SearchEngine(
+                content_dir=root,
+                index_dir=Path(index_dir),
+                embed_fn=self._cap_repro_embed,
+                chunk_size=30,
+                chunk_overlap=0,
+            )
+            yield engine
+
+    async def test_boost_respects_max_per_file_cap(self, cap_engine):
+        await cap_engine.reindex()
+        # Sanity: the file really did produce 3 distinct indexed chunks —
+        # otherwise this test would trivially pass for the wrong reason.
+        assert cap_engine.meta.chunk_counts["boosted/multi.md"] == 3
+
+        results = await cap_engine.search(
+            "QUERYMARK", max_results=10, boost_prefixes="boosted",
+        )
+        boosted_chunks = [r for r in results if r.file_path == "boosted/multi.md"]
+        assert len(boosted_chunks) <= 2, (
+            f"max_per_file=2 violated: got {len(boosted_chunks)} chunks from "
+            f"boosted/multi.md: {sorted(r.chunk_index for r in boosted_chunks)}"
+        )
+        # The boost must still be able to rescue this file into the result
+        # set at all — the cap fix must not turn boosting into a no-op.
+        assert boosted_chunks
+
+
+class TestSearchBoostNegativeScore:
+    """Regression: the boost multiplier must never make a boosted result
+    rank *worse* by multiplying a negative score further into the negative.
+
+    Only mmr_rerank (used in the hybrid + MMR path) can surface a negative
+    'score': search()/search_mmr() both explicitly drop non-positive cosine
+    similarities before a candidate is ever selectable, but mmr_rerank
+    overwrites 'score' with the raw cosine of whatever candidates hybrid
+    fusion handed it — including a BM25-rescued, dense-irrelevant candidate,
+    which is exactly the class of document hybrid mode exists to surface.
+    mock_embed cannot produce a negative similarity (its vectors are
+    non-negative keyword counts), so this uses a hand-crafted embed_fn.
+    """
+
+    @staticmethod
+    async def _neg_embed(texts: list[str]) -> list[list[float]]:
+        out = []
+        for t in texts:
+            if t == "findme":                 # the literal query string
+                out.append([1.0, 0.0])
+            elif "NEGDOC" in t:                # the chunk (also contains
+                out.append([-1.0, 0.0])        # "findme" for BM25 to find it)
+            else:
+                out.append([0.01, 0.0])
+        return out
+
+    @pytest.fixture
+    def neg_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "boosted").mkdir()
+            # Contains "findme" (so BM25 finds it via literal term overlap)
+            # and "NEGDOC" (a marker so the embed_fn can hand it a vector
+            # that is exactly opposite the query's — cosine similarity -1.0).
+            (root / "boosted" / "neg.md").write_text("findme NEGDOC findme findme")
+            engine = SearchEngine(
+                content_dir=root,
+                index_dir=Path(index_dir),
+                embed_fn=self._neg_embed,
+                hybrid_enabled=True,
+                default_boost_weight=0.5,   # matches the reviewer's -1.0 -> -1.5 repro ratio
+            )
+            yield engine
+
+    async def test_boost_never_demotes_negative_score_candidate(self, neg_engine):
+        await neg_engine.reindex()
+
+        unboosted = await neg_engine.search("findme", max_results=5)
+        assert unboosted
+        assert unboosted[0].score < 0, "fixture must exercise the negative-score path"
+
+        boosted = await neg_engine.search(
+            "findme", max_results=5, boost_prefixes="boosted",
+        )
+        assert boosted
+        # Chosen fix: only positive scores are eligible for the multiplier,
+        # so a negative score must come through completely unchanged — not
+        # just "not worse", but byte-identical to the unboosted run.
+        assert boosted[0].score == unboosted[0].score
+        assert boosted[0].score >= unboosted[0].score  # never demoted (the reported symptom)
+
+
+class TestSearchBoostCombinations:
+    """Combinations the fix-round-1 review flagged as untested."""
+
+    @pytest.fixture
+    def combo_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "projects" / "a").mkdir(parents=True)
+            (root / "projects" / "b").mkdir(parents=True)
+            (root / "outside").mkdir(parents=True)
+            (root / "projects" / "b" / "strong.md").write_text("# B\n\nauth oauth flow oauth")
+            (root / "projects" / "a" / "weak.md").write_text("# A\n\nauth flow")
+            # Strongest lexical match of all three, but outside the hard
+            # path_prefix scope — proves the hard filter really excludes it
+            # rather than it just losing on relevance.
+            (root / "outside" / "doc.md").write_text(
+                "# O\n\nauth oauth flow oauth auth oauth flow"
+            )
+            engine = SearchEngine(
+                content_dir=root, index_dir=Path(index_dir), embed_fn=mock_embed,
+                default_boost_weight=0.5,
+            )
+            yield engine
+
+    async def test_path_prefix_and_boost_prefixes_compose_as_and(self, combo_engine):
+        await combo_engine.reindex()
+        results = await combo_engine.search(
+            "auth oauth flow",
+            max_results=10,
+            path_prefix="projects",
+            boost_prefixes="projects/a",
+        )
+        paths = [r.file_path for r in results]
+        assert paths
+        # Hard filter: the stronger outside/ match never appears.
+        assert all(p.startswith("projects/") for p in paths)
+        # Soft boost still reorders within the allowed scope.
+        assert paths[0].startswith("projects/a/")
+        assert "projects/b/strong.md" in paths  # still present, just not first
+
+
+class TestSearchBoostHybrid:
+    """hybrid_enabled=True combined with boost_prefixes — previously untested
+    in any form (not just the negative-score edge case above).
+    """
+
+    @pytest.fixture
+    def hybrid_boost_engine(self):
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            root = Path(content_dir)
+            (root / "projects" / "a").mkdir(parents=True)
+            (root / "projects" / "b").mkdir(parents=True)
+            (root / "projects" / "b" / "strong.md").write_text("# B\n\nauth oauth flow oauth")
+            (root / "projects" / "a" / "weak.md").write_text("# A\n\nauth flow")
+            engine = SearchEngine(
+                content_dir=root, index_dir=Path(index_dir), embed_fn=mock_embed,
+                hybrid_enabled=True, default_boost_weight=0.5,
+            )
+            yield engine
+
+    async def test_boost_reorders_in_hybrid_mode(self, hybrid_boost_engine):
+        await hybrid_boost_engine.reindex()
+        plain = [
+            r.file_path
+            for r in await hybrid_boost_engine.search("auth oauth flow", max_results=3)
+        ]
+        assert plain[0] == "projects/b/strong.md"
+
+        boosted = await hybrid_boost_engine.search(
+            "auth oauth flow", max_results=3, boost_prefixes="projects/a",
+        )
+        paths = [r.file_path for r in boosted]
+        assert paths[0].startswith("projects/a/")
+        assert "projects/b/strong.md" in paths

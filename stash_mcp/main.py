@@ -137,10 +137,13 @@ def _create_search_engine():
             hybrid_enabled=Config.SEARCH_HYBRID_ENABLED,
             rrf_k=Config.SEARCH_RRF_K,
             bm25_candidate_pool=Config.SEARCH_BM25_CANDIDATE_POOL,
+            default_exclude_patterns=Config.SEARCH_EXCLUDE_PATTERNS,
+            default_boost_weight=Config.SEARCH_BOOST_WEIGHT,
         )
         logger.info(
             f"Search engine initialised (model={Config.SEARCH_EMBEDDER_MODEL}, "
-            f"contextual={Config.CONTEXTUAL_RETRIEVAL})"
+            f"contextual={Config.CONTEXTUAL_RETRIEVAL}, "
+            f"exclude={Config.SEARCH_EXCLUDE_PATTERNS} boost={Config.SEARCH_BOOST_WEIGHT})"
         )
         return engine
     except Exception as e:

@@ -440,6 +440,8 @@ What is collected:
 | `STASH_SEARCH_ENABLED` | `false` | Enable semantic search |
 | `STASH_SEARCH_INDEX_DIR` | `/data/.stash-index` | Search index directory |
 | `STASH_SEARCH_EMBEDDER_MODEL` | `sentence-transformers:all-MiniLM-L6-v2` | Pydantic AI embedder model |
+| `STASH_SEARCH_EXCLUDE_PATTERNS` | — | Comma-separated globs (same dialect as `STASH_CONTENT_PATHS`, root-anchored) hidden from search results unless `include_excluded=true`, e.g. `**/_reports/**,**/_archive/**` |
+| `STASH_SEARCH_BOOST_WEIGHT` | `0.15` | Score bonus (×(1+weight)) for results under `boost_prefix` — soft scoping that prefers a root without hiding the rest |
 | `STASH_CONTEXTUAL_RETRIEVAL` | `false` | Enable Claude-powered contextual chunk enrichment |
 | `STASH_CONTEXTUAL_MODEL` | `claude-haiku-4-5-20251001` | Model for contextual retrieval |
 | `ANTHROPIC_API_KEY` | — | Required when contextual retrieval is enabled |

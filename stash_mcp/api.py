@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -21,6 +21,7 @@ from .filesystem import (
 )
 from .mcp_server import MIME_TYPES
 from .metrics import get_metrics
+from .search import reject_path_traversal
 from .transactions import TransactionError, TransactionManager
 
 logger = logging.getLogger(__name__)
@@ -394,6 +395,11 @@ def create_api(
             q: str,
             max_results: int = 5,
             file_types: str | None = None,
+            path_prefix: str | None = None,
+            boost_prefix: str | None = None,
+            exclude_patterns: str | None = None,
+            include_excluded: bool = False,
+            filter: list[str] = Query(default=[]),  # noqa: A002 - REST param name
         ):
             """Semantic search across stashed content.
 
@@ -401,13 +407,44 @@ def create_api(
                 q: Search query.
                 max_results: Maximum number of results (default 5).
                 file_types: Comma-separated file extensions (e.g. ".md,.py").
+                path_prefix: Comma-separated subtree(s); results must lie under one.
+                    A subtree whose directory name contains a literal ","
+                    cannot be expressed this way — it would be read as two.
+                boost_prefix: Comma-separated subtree(s) to rank first without hiding others.
+                exclude_patterns: Comma-separated glob patterns to drop (always applied).
+                include_excluded: Also return files matched by the server's default
+                    exclusion patterns.
+                filter: Repeatable ``key:value`` metadata equality filters.
             """
             types_list = None
             if file_types:
                 types_list = [t.strip() for t in file_types.split(",") if t.strip()]
+            excludes = None
+            if exclude_patterns:
+                excludes = [p.strip() for p in exclude_patterns.split(",") if p.strip()]
+            for label, value in (("path_prefix", path_prefix), ("boost_prefix", boost_prefix)):
+                try:
+                    reject_path_traversal(label, value)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            metadata_filters: dict[str, str] = {}
+            for item in filter:
+                key, sep, value = item.partition(":")
+                if not sep or not key.strip():
+                    raise HTTPException(
+                        status_code=400, detail=f"filter must be key:value, got {item!r}"
+                    )
+                metadata_filters[key.strip()] = value.strip()
 
             results = await search_engine.search(
-                q, max_results=max_results, file_types=types_list
+                q,
+                max_results=max_results,
+                file_types=types_list,
+                path_prefix=path_prefix,
+                exclude_patterns=excludes,
+                metadata_filters=metadata_filters or None,
+                include_excluded=include_excluded,
+                boost_prefixes=boost_prefix,
             )
             return {
                 "query": q,
@@ -415,9 +452,14 @@ def create_api(
                     {
                         "file_path": r.file_path,
                         "chunk_index": r.chunk_index,
+                        "heading_path": r.heading_path,
                         "content": r.content,
                         "context": r.context,
                         "score": r.score,
+                        "metadata": r.metadata,
+                        "last_changed_at": r.last_changed_at,
+                        "changed_by": r.changed_by,
+                        "commit_message": r.commit_message,
                     }
                     for r in results
                 ],
@@ -435,6 +477,8 @@ def create_api(
                 "embedder_model": search_engine.embedder_model,
                 "indexed_files": search_engine.indexed_files,
                 "indexed_chunks": search_engine.indexed_chunks,
+                "default_exclude_patterns": list(search_engine.default_exclude_patterns),
+                "boost_weight": search_engine.default_boost_weight,
             }
 
         @app.post("/api/search/reindex")

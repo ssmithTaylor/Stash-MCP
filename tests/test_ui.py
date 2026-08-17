@@ -280,6 +280,73 @@ class TestUIMarkdown:
         assert "README</h1>" in body
         assert "Some content here." in body
 
+    def test_frontmatter_rendered_as_metadata_card(self, ui_client):
+        # write via the REST API so the fixture's filesystem is used
+        ui_client.put("/api/content/meta.md", json={
+            "content": "---\nlayer: frogpilot\nverified: 2026-08-16\n---\n# Doc\n\nBody text",
+        })
+        response = ui_client.get("/ui/browse/meta.md")
+        html_text = response.text
+        assert 'class="doc-meta"' in html_text
+        assert "<th>layer</th><td>frogpilot</td>" in html_text
+        # the raw YAML must not leak into the rendered body
+        assert "layer: frogpilot" not in html_text
+        assert "<h1" in html_text and "Body text" in html_text
+
+    def test_no_frontmatter_no_card(self, ui_client):
+        response = ui_client.get("/ui/browse/hello.md")
+        assert 'class="doc-meta"' not in response.text
+
+    def test_frontmatter_key_and_value_are_html_escaped(self, ui_client):
+        """Metadata card must not be an HTML/attribute injection vector."""
+        ui_client.put("/api/content/danger.md", json={
+            "content": (
+                '---\n'
+                '"<b>xss</b>": "<script>alert(1)</script>"\n'
+                'commit: \'a" onmouseover="x\'\n'
+                '---\n'
+                '# Doc\n'
+            ),
+        })
+        response = ui_client.get("/ui/browse/danger.md")
+        html_text = response.text
+        # neither the raw tag nor the raw attribute-breakout string appears
+        assert "<script>alert(1)</script>" not in html_text
+        assert "<b>xss</b>" not in html_text
+        assert 'a" onmouseover="x' not in html_text
+        # the escaped forms are present, for both a key and a value
+        assert "&lt;b&gt;xss&lt;/b&gt;" in html_text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_text
+        assert "a&quot; onmouseover=&quot;x" in html_text
+
+    def test_frontmatter_only_document_renders_without_error(self, ui_client):
+        """A document that is only frontmatter (no body) must not break the page."""
+        ui_client.put("/api/content/onlymeta.md", json={
+            "content": "---\nlayer: frogpilot\n---\n",
+        })
+        response = ui_client.get("/ui/browse/onlymeta.md")
+        assert response.status_code == 200
+        assert 'class="doc-meta"' in response.text
+        assert "<th>layer</th><td>frogpilot</td>" in response.text
+
+    def test_leading_blockquote_metadata_card_and_blockquote_both_render(self, ui_client):
+        """Blockquote-derived fields populate the card; the blockquote itself stays
+        in the rendered body (only the YAML frontmatter block is stripped)."""
+        ui_client.put("/api/content/quoted.md", json={
+            "content": (
+                "# Doc Title\n\n"
+                "> describes: something | commit: abc123\n\n"
+                "Body prose here.\n"
+            ),
+        })
+        response = ui_client.get("/ui/browse/quoted.md")
+        html_text = response.text
+        assert "<th>describes</th><td>something</td>" in html_text
+        assert "<th>commit</th><td>abc123</td>" in html_text
+        assert "<blockquote>" in html_text
+        assert "describes: something" in html_text
+        assert "Body prose here." in html_text
+
 
 _SAMPLE_OPENAPI = """{
   "openapi": "3.0.0",
@@ -1015,6 +1082,206 @@ class TestUISearch:
         """GET /ui/search returns 404 when search engine is not enabled."""
         response = ui_client.get("/ui/search", params={"q": "test"})
         assert response.status_code in (404, 405)
+
+
+class TestUISearchScope:
+    """Tests for the search scope selector, path_prefix wiring, and root badges."""
+
+    @pytest.fixture
+    def scoped_ui(self):
+        import asyncio
+
+        from stash_mcp.search import SearchEngine
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as idx:
+            fs = FileSystem(Path(tmp))
+            fs.write_file("projects/a/doc.md", "# A\n\n## Setup\n\nauth oauth flow")
+            fs.write_file("projects/b/doc.md", "# B\n\nauth oauth flow")
+            fs.write_file("systems/homelab/ops.md", "# Ops\n\nauth")
+            engine = SearchEngine(content_dir=Path(tmp), index_dir=Path(idx), embed_fn=_mock_embed)
+            asyncio.run(engine.build_index([
+                "projects/a/doc.md", "projects/b/doc.md", "systems/homelab/ops.md",
+            ]))
+            app = create_api(fs, search_engine=engine)
+            app.include_router(create_ui_router(fs, search_engine=engine))
+            yield TestClient(app)
+
+    def test_scope_select_lists_roots_and_children(self, scoped_ui):
+        html_text = scoped_ui.get("/ui/browse/").text
+        assert 'id="search-scope"' in html_text
+        assert 'value=""' in html_text                          # Everything
+        assert 'value="projects/"' in html_text
+        assert 'value="projects/a/"' in html_text
+        assert 'value="systems/homelab/"' in html_text
+
+    def test_ui_search_honours_path_prefix_and_returns_heading_path(self, scoped_ui):
+        data = scoped_ui.get(
+            "/ui/search", params={"q": "auth oauth", "path_prefix": "projects/a/"}
+        ).json()
+        assert [r["file_path"] for r in data["results"]] == ["projects/a/doc.md"]
+        # the whole short doc is one chunk that starts on the H1 line, so its path is the H1
+        assert data["results"][0]["heading_path"] == ["A"]
+
+    def test_result_markup_has_root_badge_hook(self, scoped_ui):
+        html_text = scoped_ui.get("/ui/browse/").text
+        assert "search-result-root" in html_text  # JS template contains the badge class
+
+    def test_ui_search_without_scope_returns_hits_from_all_roots(self, scoped_ui):
+        """No path_prefix sent => unscoped, matching pre-task behaviour exactly."""
+        data = scoped_ui.get("/ui/search", params={"q": "auth oauth"}).json()
+        paths = {r["file_path"] for r in data["results"]}
+        assert "projects/a/doc.md" in paths
+        assert "projects/b/doc.md" in paths
+
+    def test_scope_select_absent_without_search_engine(self, ui_client):
+        """No search engine => no scope selector, same as today's plain file filter."""
+        html_text = ui_client.get("/ui/browse/").text
+        assert 'id="search-scope"' not in html_text
+
+    def test_scope_select_with_flat_store_shows_everything_only(self):
+        """A store with no subdirectories still renders a sensible, non-broken select."""
+        from stash_mcp.search import SearchEngine
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as idx:
+            fs = FileSystem(Path(tmp))
+            fs.write_file("doc.md", "# Doc\n\nauth")
+            engine = SearchEngine(content_dir=Path(tmp), index_dir=Path(idx), embed_fn=_mock_embed)
+            app = create_api(fs, search_engine=engine)
+            app.include_router(create_ui_router(fs, search_engine=engine))
+            html_text = TestClient(app).get("/ui/browse/").text
+            assert 'id="search-scope"' in html_text
+            assert 'value=""' in html_text
+            assert html_text.count("<option") == 1
+
+    def test_scope_select_persists_selection_via_localstorage_js(self, scoped_ui):
+        """Selecting a scope must survive a reload (round trip) instead of resetting."""
+        html_text = scoped_ui.get("/ui/browse/").text
+        assert "localStorage.setItem('stash-search-scope'" in html_text
+        assert "localStorage.getItem('stash-search-scope')" in html_text
+
+    def test_ui_search_scopes_a_comma_named_directory_correctly(self):
+        """A directory whose own name contains a ',' must scope, not split in two.
+
+        ``/ui/search`` takes ``path_prefix`` as a repeated parameter rather
+        than the comma-separated string ``/api/search`` uses, because the
+        scope selector generates it from real directory names.
+        ``normalize_prefixes`` splits string values on commas but never
+        splits list elements, so the name survives intact.
+        """
+        import asyncio
+
+        from stash_mcp.search import SearchEngine
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as idx:
+            fs = FileSystem(Path(tmp))
+            fs.write_file("clients, active/doc.md", "# Active\n\nauth oauth flow")
+            fs.write_file("clients/doc.md", "# Plain\n\nauth oauth flow")
+            fs.write_file("active/doc.md", "# Other\n\nauth oauth flow")
+            engine = SearchEngine(
+                content_dir=Path(tmp), index_dir=Path(idx), embed_fn=_mock_embed
+            )
+            asyncio.run(engine.build_index([
+                "clients, active/doc.md", "clients/doc.md", "active/doc.md",
+            ]))
+            app = create_api(fs, search_engine=engine)
+            app.include_router(create_ui_router(fs, search_engine=engine))
+            client = TestClient(app)
+
+            data = client.get(
+                "/ui/search", params={"q": "auth oauth", "path_prefix": "clients, active/"}
+            ).json()
+            # scoped to the one real directory -- not the union of
+            # "clients/" and "active/", which is what a comma split gives
+            assert [r["file_path"] for r in data["results"]] == ["clients, active/doc.md"]
+
+            # the selector offers exactly that value, so the round trip is real
+            assert 'value="clients, active/"' in client.get("/ui/browse/").text
+
+    def test_ui_search_rejects_path_traversal(self):
+        """Consistent with MCP search_content and REST /api/search."""
+        import asyncio
+
+        from stash_mcp.search import SearchEngine
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as idx:
+            fs = FileSystem(Path(tmp))
+            fs.write_file("a/doc.md", "# A\n\nauth")
+            engine = SearchEngine(
+                content_dir=Path(tmp), index_dir=Path(idx), embed_fn=_mock_embed
+            )
+            asyncio.run(engine.build_index(["a/doc.md"]))
+            app = create_api(fs, search_engine=engine)
+            app.include_router(create_ui_router(fs, search_engine=engine))
+            resp = TestClient(app).get(
+                "/ui/search", params={"q": "auth", "path_prefix": "../etc"}
+            )
+            assert resp.status_code == 400
+            assert "path_prefix" in resp.json()["error"]
+
+    def test_search_js_sends_path_prefix_exactly_once(self, scoped_ui):
+        """The repeated-parameter server signature needs no JS change: the
+        sidebar builds the query string with a single ``&path_prefix=``
+        occurrence, which arrives as a one-element list.
+        """
+        html_text = scoped_ui.get("/ui/browse/").text
+        assert html_text.count("path_prefix=") == 1
+        assert "'&path_prefix='+encodeURIComponent(scope)" in html_text
+
+    def test_scope_options_html_escapes_directory_names(self):
+        """Directory names are user-controlled; escaping must hold in both the
+        ``value="..."`` attribute context and the ``<option>`` text context --
+        for *both* branches of ``_scope_options_html``, which build their
+        attribute value differently:
+
+        - top-level branch: escape the name, *then* append a literal ``/``.
+        - child branch: concatenate the raw ``f"{name}/{child}/"`` first,
+          *then* escape that whole string as one unit.
+
+        So the dangerous top-level entry is given a dangerous child too --
+        otherwise the child branch (a different operation order) is never
+        exercised by a dangerous name.
+
+        ``<``, ``>`` and ``"`` are illegal in real Windows directory names, so
+        this exercises ``_scope_options_html`` directly against a minimal
+        filesystem double instead of real files on disk.
+        """
+        import html as html_mod
+
+        from stash_mcp.ui import _scope_options_html
+
+        dangerous_parent = '<script>alert("p")</script>'
+        dangerous_child = '<img src=x onerror=alert("c")>'
+
+        class _FakeFS:
+            def list_files(self, relative_path: str = ""):
+                tree = {
+                    "": [(dangerous_parent, True)],
+                    dangerous_parent: [(dangerous_child, True)],
+                }
+                return tree[relative_path]
+
+        out = _scope_options_html(_FakeFS())
+        # neither raw string survives anywhere -- either context would let it
+        # break out (close the attribute, or close the tag)
+        assert dangerous_parent not in out
+        assert dangerous_child not in out
+        assert "<script>" not in out
+        assert "<img" not in out
+
+        escaped_parent = html_mod.escape(dangerous_parent)
+        escaped_child = html_mod.escape(dangerous_child)
+
+        # top-level option: name escaped, *then* '/' appended
+        assert f'value="{escaped_parent}/"' in out  # attribute context
+        assert f'>{escaped_parent}/</option>' in out  # text context
+
+        # child option: "{name}/{child}/" is concatenated raw first, then the
+        # whole thing is escaped as one unit for the attribute -- assert
+        # against the escape of the *concatenation*, not of the parts alone
+        escaped_concat = html_mod.escape(f"{dangerous_parent}/{dangerous_child}/")
+        assert f'value="{escaped_concat}"' in out  # attribute context
+        # child option text only ever shows the child segment (indented)
+        assert f'>&nbsp;&nbsp;{escaped_child}/</option>' in out  # text context
 
 
 class TestUIFeatures:
