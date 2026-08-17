@@ -732,3 +732,254 @@ class TestMaybeCloneRepoSyncURL:
             ["git", "remote", "get-url", "origin"], cwd=target, text=True
         ).strip()
         assert str(bare) in remote_url
+
+
+# ---------------------------------------------------------------------------
+# _maybe_init_repo() helper (tested via main.py import)
+# ---------------------------------------------------------------------------
+
+
+def _rev_count(repo: Path) -> int:
+    """Return the number of commits reachable from HEAD in *repo*."""
+    output = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-list", "--count", "HEAD"], text=True
+    ).strip()
+    return int(output)
+
+
+class TestMaybeInitRepo:
+    """Tests for the _maybe_init_repo startup helper."""
+
+    def test_empty_dir_creates_repo_with_single_commit(self, tmp_path, monkeypatch):
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        content_dir = tmp_path / "content"
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+        monkeypatch.setattr(cfg.Config, "GIT_AUTHOR_DEFAULT", "stash-mcp <stash@local>")
+
+        app_main._maybe_init_repo()
+
+        assert (content_dir / ".git").exists()
+        # HEAD must resolve — an unborn HEAD is exactly what this function
+        # must avoid, since GitBackend assumes HEAD exists elsewhere.
+        subprocess.run(
+            ["git", "-C", str(content_dir), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+        )
+        assert _rev_count(content_dir) == 1
+
+    def test_existing_files_are_included_in_initial_commit(self, tmp_path, monkeypatch):
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+        (content_dir / "notes.md").write_text("# Notes\n")
+        (content_dir / "sub").mkdir()
+        (content_dir / "sub" / "file.txt").write_text("hello\n")
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+
+        app_main._maybe_init_repo()
+
+        assert _rev_count(content_dir) == 1
+        tracked = subprocess.check_output(
+            ["git", "-C", str(content_dir), "show", "--name-only", "--format=", "HEAD"],
+            text=True,
+        ).strip().splitlines()
+        assert "notes.md" in tracked
+        assert "sub/file.txt" in tracked
+
+        # The files must not be untracked, or a transaction abort's cleanup
+        # of untracked-and-restorable files would delete pre-existing content.
+        status = subprocess.check_output(
+            ["git", "-C", str(content_dir), "status", "--porcelain"], text=True
+        )
+        assert status.strip() == ""
+
+    def test_initial_commit_respects_gitignore(self, tmp_path, monkeypatch):
+        """`git add -A` respects .gitignore -- ignored paths must not be staged."""
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+        (content_dir / ".gitignore").write_text("ignored.txt\nsecrets/\n")
+        (content_dir / "tracked.md").write_text("# Tracked\n")
+        (content_dir / "ignored.txt").write_text("do not track me\n")
+        (content_dir / "secrets").mkdir()
+        (content_dir / "secrets" / "foo.txt").write_text("sh\n")
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+
+        app_main._maybe_init_repo()
+
+        tracked = subprocess.check_output(
+            ["git", "-C", str(content_dir), "show", "--name-only", "--format=", "HEAD"],
+            text=True,
+        ).strip().splitlines()
+        assert sorted(tracked) == [".gitignore", "tracked.md"]
+        assert "ignored.txt" not in tracked
+        assert "secrets/foo.txt" not in tracked
+
+    def test_already_a_repo_is_noop(self, tmp_path, monkeypatch):
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        content_dir = tmp_path / "content"
+        _init_repo(content_dir)  # git init + identity + one commit (README.md)
+        before = _rev_count(content_dir)
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+
+        app_main._maybe_init_repo()
+
+        assert _rev_count(content_dir) == before
+
+    def test_nested_inside_parent_repo_refuses(self, tmp_path, monkeypatch):
+        """A content dir living inside a parent repo must not become a nested repo.
+
+        `git rev-parse --git-dir` alone would succeed here (it resolves up to
+        the parent's .git), which is exactly the trap `--show-toplevel`
+        avoids — regression-guard that distinction directly.
+        """
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        parent = tmp_path / "outer"
+        parent.mkdir()
+        _init_repo(parent)  # parent is a real repo with a commit
+        content_dir = parent / "content"
+        content_dir.mkdir()
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+
+        with pytest.raises(SystemExit):
+            app_main._maybe_init_repo()
+
+        assert not (content_dir / ".git").exists()
+
+    def test_nonexistent_content_dir_nested_inside_parent_repo_refuses(
+        self, tmp_path, monkeypatch
+    ):
+        """The ancestor-repo check must fire even when content_dir does not
+        exist yet -- the common case, since _maybe_init_repo() runs before
+        Config.ensure_content_dir() (see main.py's create_app()). Gating the
+        toplevel check on content_dir.exists() would let this fall straight
+        through to mkdir + git init, silently creating a nested repo.
+        """
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        parent = tmp_path / "outer"
+        parent.mkdir()
+        _init_repo(parent)  # parent is a real repo with a commit
+        content_dir = parent / "data" / "content"  # deliberately never created
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+
+        assert not content_dir.exists()
+
+        with pytest.raises(SystemExit):
+            app_main._maybe_init_repo()
+
+        # Nothing new should exist anywhere under the parent repo -- not just
+        # "no .git at content_dir", but no directory was created at all.
+        git_dirs = sorted(p for p in parent.rglob(".git"))
+        assert git_dirs == [parent / ".git"], f"unexpected .git dirs: {git_dirs}"
+        assert not content_dir.exists()
+        assert not (parent / "data").exists()
+
+    def test_clone_url_configured_skips_init(self, tmp_path, monkeypatch):
+        """A configured remote wins — no local init is attempted."""
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        content_dir = tmp_path / "content"
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", "https://example.com/repo.git")
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+
+        app_main._maybe_init_repo()
+
+        assert not content_dir.exists()
+
+    def test_sync_url_configured_skips_init(self, tmp_path, monkeypatch):
+        """STASH_GIT_SYNC_URL also counts as a configured remote — no init."""
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        content_dir = tmp_path / "content"
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", "https://example.com/repo.git")
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+
+        app_main._maybe_init_repo()
+
+        assert not content_dir.exists()
+
+    def test_tracking_disabled_skips_init(self, tmp_path, monkeypatch):
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        content_dir = tmp_path / "content"
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", False)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+
+        app_main._maybe_init_repo()
+
+        assert not content_dir.exists()
+
+    def test_after_init_git_backend_validate_passes_with_identity(self, tmp_path, monkeypatch):
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        content_dir = tmp_path / "content"
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+        monkeypatch.setattr(cfg.Config, "GIT_AUTHOR_DEFAULT", "stash-mcp <stash@local>")
+
+        app_main._maybe_init_repo()
+
+        backend = GitBackend(content_dir, author_default=cfg.Config.GIT_AUTHOR_DEFAULT)
+        backend.validate()  # must not raise
+
+        name = subprocess.check_output(
+            ["git", "-C", str(content_dir), "config", "--local", "user.name"], text=True
+        ).strip()
+        email = subprocess.check_output(
+            ["git", "-C", str(content_dir), "config", "--local", "user.email"], text=True
+        ).strip()
+        assert name == "stash-mcp"
+        assert email == "stash@local"
