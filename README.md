@@ -256,7 +256,9 @@ environment:
 
 ### Git tracking
 
-Set `STASH_GIT_TRACKING=true` to enable git-aware features. The content directory must already be a git repository (contain a `.git` folder).
+Set `STASH_GIT_TRACKING=true` to enable git-aware features.
+
+**Auto-init when no remote is configured.** If the content directory is not yet a git repository, Stash-MCP initialises one automatically on startup and makes an initial commit — including any files already present in the directory (respecting `.gitignore`), so nothing pre-existing is left untracked. This only happens when no remote is configured: a `STASH_GIT_SYNC_URL` (or legacy `STASH_GIT_CLONE_URL`) always takes precedence and clones instead — see [Git sync](#git-sync). If the content directory turns out to sit *inside* an existing git repository (for example, a parent directory was already initialised), the server refuses to start rather than create a nested repo; point `STASH_CONTENT_ROOT` at the parent repo's root, run `git init` in the content directory yourself first if a nested repo is genuinely intended, or set `STASH_GIT_TRACKING=false`.
 
 What it enables:
 
@@ -277,7 +279,7 @@ The server pulls from `STASH_GIT_SYNC_REMOTE`/`STASH_GIT_SYNC_BRANCH` every `STA
 
 **Authentication.** Provide `STASH_GIT_SYNC_TOKEN` for HTTPS token authentication. The token is injected via a local git credential helper at `.git/stash-credential-helper.sh` — no manual credential configuration is required.
 
-**Auto-clone on startup.** Set `STASH_GIT_SYNC_URL` to the HTTPS URL of the repository. When the content directory is empty, the server clones from that URL using `STASH_GIT_SYNC_BRANCH` and `STASH_GIT_SYNC_TOKEN`, then configures the remote as `STASH_GIT_SYNC_REMOTE`. `STASH_GIT_TRACKING` is auto-enabled after a successful clone, so you don't need to set it explicitly.
+**Auto-clone on startup.** Set `STASH_GIT_SYNC_URL` to the HTTPS URL of the repository. When the content directory is empty, the server clones from that URL using `STASH_GIT_SYNC_BRANCH` and `STASH_GIT_SYNC_TOKEN`, then configures the remote as `STASH_GIT_SYNC_REMOTE`. `STASH_GIT_TRACKING` is auto-enabled after a successful clone, so you don't need to set it explicitly. This always takes precedence over the local auto-init described in [Git tracking](#git-tracking) above, and a failed clone is always a hard startup failure — it never falls back to initialising an empty local repo, which would silently mask a real misconfiguration (bad URL, expired token, wrong branch) behind what looks like a working but empty store.
 
 ```yaml
 environment:

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -109,6 +110,100 @@ def _maybe_clone_repo() -> None:
 
     Config.GIT_TRACKING = True
     logger.info("Clone complete. Git tracking auto-enabled.")
+
+
+def _maybe_init_repo() -> None:
+    """Initialise a local git repo in the content dir when tracking is on and
+    no remote is configured.
+
+    Precedence: a configured clone/sync URL always wins. ``_maybe_clone_repo()``
+    owns that path — including its hard-fail on clone failure — so this
+    function is a no-op whenever ``STASH_GIT_CLONE_URL``/``STASH_GIT_SYNC_URL``
+    is set. It only bootstraps a repo for the case that's otherwise a hard
+    startup failure: ``STASH_GIT_TRACKING=true`` with no remote and a content
+    directory that isn't a git repo yet (e.g. a fresh container volume).
+
+    A directory that already sits *inside* a different, pre-existing git
+    repository is refused rather than silently nested: ``git rev-parse
+    --git-dir`` would succeed from such a directory (it resolves upward to
+    the parent repo's ``.git``), so ``--show-toplevel`` is used instead and
+    compared against the content dir to detect this case correctly.
+    """
+    if Config.GIT_CLONE_URL or Config.GIT_SYNC_URL:
+        return
+
+    if not Config.GIT_TRACKING:
+        return
+
+    content_dir = Config.CONTENT_DIR
+
+    if content_dir.exists():
+        toplevel_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=content_dir,
+            capture_output=True,
+            text=True,
+        )
+        if toplevel_result.returncode == 0:
+            toplevel = Path(toplevel_result.stdout.strip()).resolve()
+            if toplevel == content_dir.resolve():
+                # Already the repo root — nothing to do.
+                return
+            logger.error(
+                "Content directory %s is inside an existing git repository "
+                "rooted at %s. Refusing to create a nested repo. Point "
+                "STASH_CONTENT_ROOT at the parent repo root, set "
+                "STASH_GIT_TRACKING=false, or run 'git init' in the content "
+                "directory yourself if a nested repo is genuinely intended.",
+                content_dir,
+                toplevel,
+            )
+            raise SystemExit(1)
+        # Non-zero: content_dir is not inside any git repository — proceed.
+
+    content_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("No git repository found at %s; running 'git init'", content_dir)
+    init_result = subprocess.run(
+        ["git", "init", str(content_dir)], capture_output=True, text=True
+    )
+    if init_result.returncode != 0:
+        logger.error("git init failed for %s: %s", content_dir, init_result.stderr.strip())
+        raise SystemExit(1)
+
+    from .git_backend import GitBackend
+
+    backend = GitBackend(content_dir, author_default=Config.GIT_AUTHOR_DEFAULT)
+    try:
+        backend.validate()  # sets local user.name/user.email if not already configured
+    except RuntimeError as exc:
+        logger.error("Failed to configure committer identity after git init: %s", exc)
+        raise SystemExit(1) from exc
+
+    # Commit whatever is already present (respecting .gitignore) so a
+    # pre-populated content dir doesn't leave existing files untracked — an
+    # untracked file looks "restorable" to a transaction abort and would be
+    # deleted by it. --allow-empty guarantees a commit even when there's
+    # nothing to stage, since an unborn HEAD breaks GitBackend elsewhere
+    # (reset_hard, and the HEAD-relative commands used during transactions).
+    add_result = subprocess.run(
+        ["git", "add", "-A"], cwd=content_dir, capture_output=True, text=True
+    )
+    if add_result.returncode != 0:
+        logger.error("git add failed during auto-init: %s", add_result.stderr.strip())
+        raise SystemExit(1)
+
+    commit_result = subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "Initial commit (stash-mcp auto-init)"],
+        cwd=content_dir,
+        capture_output=True,
+        text=True,
+    )
+    if commit_result.returncode != 0:
+        logger.error("git commit failed during auto-init: %s", commit_result.stderr.strip())
+        raise SystemExit(1)
+
+    logger.info("Initialised local git repository at %s with an initial commit.", content_dir)
 
 
 def _create_search_engine():
@@ -239,6 +334,7 @@ async def _git_sync_loop(
 def create_app():
     """Create and configure the FastAPI application."""
     _maybe_clone_repo()
+    _maybe_init_repo()
     Config.ensure_content_dir()
     filesystem = FileSystem(Config.CONTENT_DIR, include_patterns=Config.CONTENT_PATHS)
 
