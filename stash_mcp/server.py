@@ -2,13 +2,25 @@
 
 import asyncio
 import logging
-import os
 import sys
 
 from .config import Config
 from .filesystem import FileSystem
 from .mcp_server import create_mcp_server
 from .metrics import get_metrics, init_metrics
+
+# The startup helpers are shared with the FastAPI entrypoint (main.py) and live
+# in startup.py. They are imported under private aliases and called through this
+# module's namespace so tests can monkeypatch stash_mcp.server._create_* the same
+# way they do for main. Do not reintroduce local copies: the copies these
+# replaced had drifted, leaving stdio without auto-init, without the
+# autocommit/sync config validation, without the search scoping defaults, and
+# without a TransactionManager at all.
+from .startup import build_write_stack
+from .startup import create_git_backend as _create_git_backend
+from .startup import create_search_engine as _create_search_engine
+from .startup import maybe_clone_repo as _maybe_clone_repo
+from .startup import maybe_init_repo as _maybe_init_repo
 
 # Configure logging
 logging.basicConfig(
@@ -18,124 +30,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _maybe_clone_repo() -> None:
-    """Clone remote repo into content dir if STASH_GIT_CLONE_URL is configured."""
-    if not Config.GIT_CLONE_URL:
-        return
-
-    content_dir = Config.CONTENT_DIR
-
-    if content_dir.exists() and any(content_dir.iterdir()):
-        git_dir = content_dir / ".git"
-        if git_dir.exists():
-            logger.info("Content directory already contains a git repo, skipping clone")
-            return
-        logger.error(
-            "Content directory %s is non-empty but not a git repo. "
-            "Cannot clone into it. Clear the directory or remove STASH_GIT_CLONE_URL.",
-            content_dir,
-        )
-        raise SystemExit(1)
-
-    from .git_backend import GitBackend
-
-    logger.info(
-        "Cloning %s (branch=%s) into %s",
-        Config.GIT_CLONE_URL,
-        Config.GIT_CLONE_BRANCH,
-        content_dir,
-    )
-    try:
-        GitBackend.clone(
-            url=Config.GIT_CLONE_URL,
-            target_dir=content_dir,
-            branch=Config.GIT_CLONE_BRANCH,
-            token=Config.GIT_CLONE_TOKEN,
-            recursive=Config.GIT_SYNC_RECURSIVE,
-        )
-    except RuntimeError as exc:
-        logger.error("Clone failed: %s", exc)
-        raise SystemExit(1) from exc
-
-    Config.GIT_TRACKING = True
-    logger.info("Clone complete. Git tracking auto-enabled.")
-
-
-def _create_search_engine(filesystem: FileSystem):
-    """Create a SearchEngine if search is enabled, or return None."""
-    if not Config.SEARCH_ENABLED:
-        return None
-
-    try:
-        from .search import SearchEngine
-
-        engine = SearchEngine(
-            content_dir=Config.CONTENT_DIR,
-            index_dir=Config.SEARCH_INDEX_DIR,
-            embedder_model=Config.SEARCH_EMBEDDER_MODEL,
-            contextual_retrieval=Config.CONTEXTUAL_RETRIEVAL,
-            contextual_model=Config.CONTEXTUAL_MODEL,
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
-            model_cache_dir=Config.MODEL_CACHE_DIR,
-            onnx_threads=Config.SEARCH_ONNX_THREADS,
-            query_prefix=Config.SEARCH_QUERY_PREFIX,
-            document_prefix=Config.SEARCH_DOCUMENT_PREFIX,
-            chunk_size=Config.SEARCH_CHUNK_SIZE,
-            chunk_overlap=Config.SEARCH_CHUNK_OVERLAP,
-            heading_context=Config.SEARCH_HEADING_CONTEXT,
-            mmr_enabled=Config.SEARCH_MMR_ENABLED,
-            mmr_lambda=Config.SEARCH_MMR_LAMBDA,
-            max_per_file=Config.SEARCH_MAX_PER_FILE,
-            candidate_pool_multiplier=Config.SEARCH_CANDIDATE_POOL_MULTIPLIER,
-            recency_weight=Config.SEARCH_RECENCY_WEIGHT,
-            recency_half_life_days=Config.SEARCH_RECENCY_HALF_LIFE_DAYS,
-            hybrid_enabled=Config.SEARCH_HYBRID_ENABLED,
-            rrf_k=Config.SEARCH_RRF_K,
-            bm25_candidate_pool=Config.SEARCH_BM25_CANDIDATE_POOL,
-            rerank_enabled=Config.SEARCH_RERANK_ENABLED,
-            rerank_model=Config.SEARCH_RERANK_MODEL,
-            rerank_candidates=Config.SEARCH_RERANK_CANDIDATES,
-            rerank_margin=Config.SEARCH_RERANK_MARGIN,
-        )
-        engine._filesystem = filesystem
-        logger.info(f"Search engine initialised (model={Config.SEARCH_EMBEDDER_MODEL})")
-        return engine
-    except Exception as e:
-        logger.error(f"Failed to create search engine: {e}")
-        return None
-
-
-def _create_git_backend():
-    """Validate git config and return a GitBackend, or None if tracking is off."""
-    if not Config.GIT_TRACKING:
-        return None
-
-    from .git_backend import GitBackend
-
-    backend = GitBackend(
-        Config.CONTENT_DIR,
-        sync_token=Config.GIT_SYNC_TOKEN,
-        author_default=Config.GIT_AUTHOR_DEFAULT,
-    )
-
-    try:
-        backend.validate()
-    except RuntimeError as exc:
-        logger.error("Git tracking enabled but validation failed: %s", exc)
-        raise SystemExit(1) from exc
-
-    logger.info("Git tracking active (content_dir=%s)", Config.CONTENT_DIR)
-    return backend
-
-
 async def main():
     """Run the Stash MCP server over stdio."""
     logger.info("Starting Stash-MCP server...")
     if Config.READ_ONLY:
         logger.info("Read-only mode enabled — write tools will not be registered")
 
-    # Clone remote repo if configured (before ensuring content dir exists)
+    # Bootstrap the content repo before ensuring the content dir exists: clone
+    # wins if a remote is configured, otherwise auto-init covers the fresh-volume
+    # case. Same order as create_app() in main.py — maybe_init_repo() relies on
+    # running before ensure_content_dir() to detect a nested repo correctly.
     _maybe_clone_repo()
+    _maybe_init_repo()
 
     # Ensure content directory exists
     Config.ensure_content_dir()
@@ -154,11 +60,27 @@ async def main():
     filesystem = FileSystem(Config.CONTENT_DIR, include_patterns=Config.CONTENT_PATHS)
 
     # Optionally create search engine and git backend
-    search_engine = _create_search_engine(filesystem)
+    search_engine = _create_search_engine()
+    if search_engine is not None:
+        search_engine._filesystem = filesystem
+
     git_backend = _create_git_backend()
+    if git_backend is not None and search_engine is not None:
+        search_engine._git_backend = git_backend
+
+    # Same write stack the HTTP entrypoint builds: gated transactions or
+    # autocommit, depending on STASH_GIT_AUTOCOMMIT. Without this, git tracking
+    # over stdio would register the write tools but leave every write
+    # uncommitted and unlocked.
+    transaction_manager, fs_for_mcp = build_write_stack(filesystem, git_backend)
 
     # Create FastMCP server and run with stdio transport
-    mcp = create_mcp_server(filesystem, search_engine=search_engine, git_backend=git_backend)
+    mcp = create_mcp_server(
+        fs_for_mcp,
+        search_engine=search_engine,
+        git_backend=git_backend,
+        transaction_manager=transaction_manager,
+    )
 
     if search_engine is not None:
         files = filesystem.list_all_files()

@@ -1299,8 +1299,16 @@ class TestSearchConfig:
         monkeypatch.setattr(Config, "SEARCH_RERANK_CANDIDATES", 7)
         monkeypatch.setattr(Config, "SEARCH_RERANK_MARGIN", 0.25)
 
+        monkeypatch.setattr(Config, "SEARCH_EXCLUDE_PATTERNS", ["archive/**"])
+        monkeypatch.setattr(Config, "SEARCH_BOOST_WEIGHT", 0.25)
+
+        # Both entrypoints share one implementation (startup.py), so the
+        # signature is identical for both. The stdio module used to keep a
+        # private copy taking a `filesystem` argument, and that copy predated
+        # the scoping settings asserted at the end of this test — exactly the
+        # drift this parametrization exists to catch.
         create = module._create_search_engine
-        engine = create(None) if module_name == "stash_mcp.server" else create()
+        engine = create()
 
         assert engine is not None
         assert captured["embedder_model"] == "onnx:test-model"
@@ -1314,6 +1322,8 @@ class TestSearchConfig:
         assert captured["rerank_model"] == "test-reranker"
         assert captured["rerank_candidates"] == 7
         assert captured["rerank_margin"] == 0.25
+        assert captured["default_exclude_patterns"] == ["archive/**"]
+        assert captured["default_boost_weight"] == 0.25
 
     def test_hybrid_retrieval_on_by_default_when_bm25s_is_installed(self):
         """BM25 catches the exact-token queries dense retrieval is worst at."""
