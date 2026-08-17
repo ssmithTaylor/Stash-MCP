@@ -8,12 +8,21 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import pickle
 import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 
+from .embedders import (
+    DEFAULT_EMBEDDER_MODEL,
+    DEFAULT_RERANK_MODEL,
+    FastEmbedAdapter,
+    FastEmbedReranker,
+    is_onnx_model,
+    onnx_model_name,
+)
 from .filesystem import glob_to_regex, normalize_glob
 from .frontmatter import extract_metadata, normalize_key
 from .headings import heading_path_at, scan_headings
@@ -26,6 +35,13 @@ MAX_CONTEXTUAL_DOCUMENT_CHARS = 150_000
 # Bump when the per-chunk metadata layout changes; a mismatch clears the
 # index on startup so build_index re-embeds and repopulates every chunk.
 INDEX_SCHEMA_VERSION = 1
+
+# Which install extra provides pydantic-ai for each embedder-model prefix
+_PYDANTIC_AI_EXTRAS = {
+    "openai": "search-openai",
+    "cohere": "search-cohere",
+    "sentence-transformers": "search-torch",
+}
 
 
 def _normalize_path(path: str) -> str:
@@ -493,6 +509,7 @@ class VectorStore:
         top_n: int,
         mmr_lambda: float = 0.7,
         max_per_file: int | None = 2,
+        relevance: list[float] | None = None,
     ) -> list[dict]:
         """MMR over a pre-selected candidate set (used after hybrid fusion).
 
@@ -500,11 +517,26 @@ class VectorStore:
         we look the vector up in the store by that key and run the same
         relevance-vs-diversity MMR loop as ``search_mmr``. Candidates
         whose vector can't be found are skipped.
+
+        Args:
+            relevance: Optional per-candidate relevance to rank on instead of
+                cosine similarity — the hybrid path passes the RRF fused
+                scores here. Without it, a fused ranking would be silently
+                replaced by the dense one and the sparse retriever could only
+                ever widen the candidate pool, never change the order. Values
+                are min-max normalised to [0, 1] first so they stay
+                commensurate with the cosine diversity term (raw RRF scores
+                sit around 0.02 and would be swamped by it).
         """
         if not candidates or self._vectors is None or len(self._vectors) == 0:
             return []
         if top_n <= 0:
             return []
+        if relevance is not None and len(relevance) != len(candidates):
+            raise ValueError(
+                "relevance must have one entry per candidate "
+                f"({len(relevance)} != {len(candidates)})"
+            )
 
         import numpy as np
 
@@ -515,12 +547,15 @@ class VectorStore:
 
         cand_vec_idx: list[int] = []
         cand_meta: list[dict] = []
-        for c in candidates:
+        cand_relevance: list[float] = []
+        for position, c in enumerate(candidates):
             key = (c.get("file_path", ""), int(c.get("chunk_index", 0)))
             idx = key_to_idx.get(key)
             if idx is not None:
                 cand_vec_idx.append(idx)
                 cand_meta.append(c)
+                if relevance is not None:
+                    cand_relevance.append(float(relevance[position]))
         if not cand_vec_idx:
             return []
 
@@ -536,29 +571,38 @@ class VectorStore:
 
         similarities = normed @ query
 
+        # Relevance term: cosine by default, or the caller's scores (e.g. RRF
+        # fused) min-max normalised onto the same [0, 1] scale as the cosine
+        # diversity term they are traded off against.
+        if relevance is None:
+            relevance_by_candidate = np.array(
+                [similarities[i] for i in cand_vec_idx], dtype=np.float64
+            )
+        else:
+            supplied = np.array(cand_relevance, dtype=np.float64)
+            span = float(supplied.max() - supplied.min())
+            relevance_by_candidate = (
+                (supplied - supplied.min()) / span
+                if span > 0
+                else np.full(len(supplied), 0.5)
+            )
+
         pool = list(range(len(cand_vec_idx)))
         selected: list[int] = []
         per_file: dict[str, int] = {}
 
         while pool and len(selected) < top_n:
+            rel = relevance_by_candidate[pool]
             if not selected:
-                # Seed with the highest-cosine candidate, not whatever
-                # came first in the caller's pool. In the hybrid path
-                # the input is RRF-ranked, not similarity-ranked, so
-                # picking pool[0] would let RRF order leak into the
-                # MMR seed and skew downstream diversity decisions.
-                rel = np.array(
-                    [similarities[cand_vec_idx[p]] for p in pool]
-                )
+                # Seed with the most relevant candidate rather than whatever
+                # came first in the caller's pool, so pool order never leaks
+                # into the MMR seed.
                 best_pos = int(np.argmax(rel))
             else:
                 sel_vec = normed[[cand_vec_idx[p] for p in selected]]
                 pool_vec = normed[[cand_vec_idx[p] for p in pool]]
                 cross = pool_vec @ sel_vec.T
                 max_sim = cross.max(axis=1)
-                rel = np.array(
-                    [similarities[cand_vec_idx[p]] for p in pool]
-                )
                 mmr_scores = mmr_lambda * rel - (1 - mmr_lambda) * max_sim
                 best_pos = int(np.argmax(mmr_scores))
 
@@ -574,15 +618,15 @@ class VectorStore:
             per_file[fp] = per_file.get(fp, 0) + 1
             pool.pop(best_pos)
 
-        # Overwrite score with cosine similarity to the query so the
-        # returned items carry a consistent, interpretable relevance
-        # signal (matching VectorStore.search_mmr's behaviour). This
-        # is especially important in the hybrid path, where the input
-        # `score` was the RRF fused score — not the cosine similarity.
+        # Report the value the list was actually ordered by, so the top hit
+        # never shows a lower number than the runner-up. Without a supplied
+        # relevance that is the cosine similarity (unchanged behaviour); with
+        # one — the hybrid path's fused scores — it is that relevance,
+        # normalised to [0, 1] within this result set.
         out: list[dict] = []
         for p in selected:
             item = dict(cand_meta[p])
-            item["score"] = float(similarities[cand_vec_idx[p]])
+            item["score"] = float(relevance_by_candidate[p])
             out.append(item)
         return out
 
@@ -615,6 +659,13 @@ class BM25Store:
 
     INDEX_SUBDIR = "bm25_index"
     IDS_FILE = "chunk_ids.json"
+    META_FILE = "bm25_meta.json"
+    # Bump when the text fed to the index changes, so an index built from
+    # different text is discarded and rebuilt instead of silently serving
+    # results the current code would never produce.
+    #   1: chunk content only
+    #   2: heading breadcrumb + chunk content
+    CORPUS_VERSION = 2
 
     def __init__(self, store_path: Path):
         """Initialize the store; load from disk if available.
@@ -635,11 +686,36 @@ class BM25Store:
     def _ids_path(self) -> Path:
         return self.store_path / self.IDS_FILE
 
+    def _meta_path(self) -> Path:
+        return self.store_path / self.META_FILE
+
+    def _persisted_corpus_version(self) -> int:
+        """Corpus version of the index on disk (1 for pre-versioning indexes)."""
+        try:
+            with open(self._meta_path()) as f:
+                return int(json.load(f).get("corpus_version", 1))
+        except FileNotFoundError:
+            return 1
+        except Exception as e:
+            logger.warning("Unreadable BM25 metadata (%s); rebuilding", e)
+            return -1
+
     def _load(self) -> None:
         """Load the persisted BM25 index, or start empty."""
         index_dir = self._index_dir()
         ids_path = self._ids_path()
         if not index_dir.exists() or not ids_path.exists():
+            return
+        persisted = self._persisted_corpus_version()
+        if persisted != self.CORPUS_VERSION:
+            # Leaving the store empty makes the engine's existing
+            # rebuild-from-vector-metadata path pick it up on start-up.
+            logger.info(
+                "BM25 index was built from a different corpus (v%s, expected v%s); "
+                "it will be rebuilt",
+                persisted,
+                self.CORPUS_VERSION,
+            )
             return
         try:
             import bm25s
@@ -678,7 +754,17 @@ class BM25Store:
             self._dirty = False
             return
 
-        corpus = [m.get("content", "") for m in chunks]
+        # Index the breadcrumb alongside the chunk. Unlike the dense vector —
+        # where the breadcrumb's words dilute the chunk's own and measurably
+        # hurt — BM25 scores each term independently with IDF, so this only
+        # adds ways to match. It also makes file paths searchable at all:
+        # without it, no keyword query can reach a document by its name.
+        corpus = [
+            f"{m['context']}\n{m.get('content', '')}"
+            if m.get("context")
+            else m.get("content", "")
+            for m in chunks
+        ]
         self._chunk_ids = [
             (m.get("file_path", ""), int(m.get("chunk_index", 0)))
             for m in chunks
@@ -729,9 +815,9 @@ class BM25Store:
         self.store_path.mkdir(parents=True, exist_ok=True)
         if self._retriever is None or not self._chunk_ids:
             # Empty state — remove any stale on-disk files.
-            ids_path = self._ids_path()
-            if ids_path.exists():
-                ids_path.unlink()
+            for path in (self._ids_path(), self._meta_path()):
+                if path.exists():
+                    path.unlink()
             index_dir = self._index_dir()
             if index_dir.exists():
                 import shutil
@@ -740,6 +826,8 @@ class BM25Store:
         self._retriever.save(str(self._index_dir()), corpus=None)
         with open(self._ids_path(), "w") as f:
             json.dump(self._chunk_ids, f)
+        with open(self._meta_path(), "w") as f:
+            json.dump({"corpus_version": self.CORPUS_VERSION}, f)
 
     async def save_async(self) -> None:
         await asyncio.to_thread(self.save)
@@ -798,6 +886,38 @@ def _merge_candidates(primary: list[dict], extra: list[dict]) -> list[dict]:
     return merged
 
 
+def _apply_boost(
+    items: list[dict], scores: list[float], boosts: list[str], weight: float
+) -> list[float]:
+    """Scale each score by ``(1 + weight)`` when its file lies under *boosts*.
+
+    Only positive scores are eligible: multiplying a negative score by
+    ``(1 + weight)`` drives it further negative, i.e. demotes the very
+    candidate boosting was asked to promote. ``VectorStore.search`` and
+    ``search_mmr`` both drop non-positive scores before a candidate is
+    selectable, and the hybrid path boosts RRF fused scores (always > 0),
+    so this is a guard rather than a live case — but ``mmr_rerank`` falls
+    back to raw cosine when no ``relevance`` is supplied, and raw cosine
+    can be negative, so the guard stays.
+
+    Args:
+        items: Candidate dicts, each carrying ``file_path``.
+        scores: One score per item, on any scale.
+        boosts: Normalized subtree prefixes to prefer.
+        weight: Bonus fraction; 0 leaves every score untouched.
+
+    Returns:
+        A new list of scores, aligned with *items*.
+    """
+    return [
+        score * (1.0 + weight)
+        if score > 0
+        and path_under_any(_normalize_path(item.get("file_path", "")), boosts)
+        else score
+        for item, score in zip(items, scores)
+    ]
+
+
 def _enforce_max_per_file(results: list[dict], max_per_file: int | None) -> list[dict]:
     """Drop entries beyond ``max_per_file`` per file_path, preserving input order.
 
@@ -828,26 +948,55 @@ def _chunk_text_sliding_window_with_offsets(
     text: str,
     chunk_size: int = 1000,
     chunk_overlap: int = 100,
-) -> list[tuple[str, int]]:
-    """Sliding-window chunks with the start offset of each chunk in ``text.strip()``."""
+) -> list[tuple[int, str]]:
+    """Split text into fixed-size overlapping chunks, keeping source offsets.
+
+    Same windowing as :func:`_chunk_text_sliding_window`; each chunk is
+    returned with the index in *text* where it starts, so callers can work
+    out what section of the document a chunk came from.
+
+    Args:
+        text: The text to chunk.
+        chunk_size: Number of characters per chunk.
+        chunk_overlap: Number of characters to overlap between adjacent chunks.
+
+    Returns:
+        List of ``(offset, chunk)`` pairs. ``text[offset:offset + len(chunk)]``
+        is the chunk.
+    """
     if not text or not text.strip():
         return []
-    text = text.strip()
-    if len(text) <= chunk_size:
-        return [(text, 0)]
-    pairs: list[tuple[str, int]] = []
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    step = max(1, chunk_size - max(0, chunk_overlap))
+
+    # Offsets are tracked against the original text, so account for the
+    # leading whitespace that the outer strip() would remove.
+    lead = len(text) - len(text.lstrip())
+    stripped = text.strip()
+
+    if len(stripped) <= chunk_size:
+        return [(lead, stripped)]
+
+    chunks: list[tuple[int, str]] = []
     start = 0
-    while start < len(text):
-        raw = text[start:start + chunk_size]
-        lead = len(raw) - len(raw.lstrip())
-        chunk = raw.strip()
+    while start < len(stripped):
+        window = stripped[start:start + chunk_size]
+        inner = len(window) - len(window.lstrip())
+        chunk = window.strip()
         if chunk:
-            pairs.append((chunk, start + lead))
-        start += chunk_size - chunk_overlap
-    return pairs
+            chunks.append((lead + start + inner, chunk))
+        start += step
+
+    return chunks
 
 
-def _chunk_text_sliding_window(text, chunk_size=1000, chunk_overlap=100) -> list[str]:
+def _chunk_text_sliding_window(
+    text: str,
+    chunk_size: int = 1000,
+    chunk_overlap: int = 100,
+) -> list[str]:
     """Split text into fixed-size overlapping chunks.
 
     Simple sliding window — no structural parsing, no boundary detection.
@@ -860,7 +1009,12 @@ def _chunk_text_sliding_window(text, chunk_size=1000, chunk_overlap=100) -> list
     Returns:
         List of text chunks.
     """
-    return [c for c, _ in _chunk_text_sliding_window_with_offsets(text, chunk_size, chunk_overlap)]
+    return [
+        chunk
+        for _, chunk in _chunk_text_sliding_window_with_offsets(
+            text, chunk_size, chunk_overlap
+        )
+    ]
 
 
 def _chunk_text(text: str, max_chunk_size: int = 1500) -> list[str]:
@@ -928,18 +1082,173 @@ def _chunk_text(text: str, max_chunk_size: int = 1500) -> list[str]:
     return chunks if chunks else [text.strip()]
 
 
+def _even_split_params(
+    length: int, budget: int, preferred_overlap: int
+) -> tuple[int, int]:
+    """Pick ``(chunk_size, chunk_overlap)`` that split *length* evenly under *budget*.
+
+    Taking budget-sized bites out of an oversized chunk leaves a runt at the
+    end (1000 chars with an 864 budget → 864 + 136), and a runt embeds to a
+    weak, noisy vector. Solving for the number of pieces first — and then for
+    the window that, *including its overlap*, covers the text in exactly that
+    many pieces — gives evenly-sized chunks instead.
+
+    Args:
+        length: Characters to cover.
+        budget: Maximum characters per piece.
+        preferred_overlap: Overlap to use if the budget can afford it.
+
+    Returns:
+        ``(chunk_size, chunk_overlap)`` for the sliding window, with
+        ``chunk_size <= budget``.
+    """
+    budget = max(1, budget)
+    overlap = max(0, min(preferred_overlap, budget // 10))
+    if length <= 0:
+        return budget, 0
+    pieces = max(1, math.ceil(length / budget))
+    # The window advances by (size - overlap) per piece and emits another
+    # window whenever the next start is still inside the text, so `pieces`
+    # windows cover the text only when pieces * step >= length. Solving for
+    # size gives ceil(length / pieces) + overlap; step the piece count up if
+    # that no longer fits the budget.
+    while True:
+        target = math.ceil(length / pieces) + overlap
+        if target <= budget:
+            return target, overlap
+        pieces += 1
+
+
 def _content_hash(content: str) -> str:
     """Compute SHA-256 hash of content."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+# Extensions whose '#' lines are markdown headings (elsewhere '#' is a comment)
+_MARKDOWN_SUFFIXES = {".md", ".markdown", ".mdx"}
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+MAX_BREADCRUMB_CHARS = 200
+
+# Bounds for re-splitting chunks that overflow the embedding model's context
+# window: how many split passes to attempt, and the smallest window worth
+# splitting for. A real window is hundreds of characters (256 tokens ≈ 700+
+# chars); anything under this floor means the backend is misreporting, so we
+# let the tokenizer truncate rather than emit a chunk per word.
+_MAX_FIT_PASSES = 3
+_MIN_FIT_CHARS = 64
+# Characters of slack before a chunk counts as overflowing. Tokenizer
+# normalisation silently drops a few trailing characters — a variation
+# selector (the invisible half of ⚠️), a zero-width space, a BOM — which
+# shortens the reported window by 1-2 characters with no truncation at all.
+# Without slack those chunks would be split for nothing.
+_FIT_SLACK_CHARS = 4
+
+
+def _format_breadcrumb(file_path: str, headings: list[str]) -> str:
+    """Join a path and its heading stack, capped at ``MAX_BREADCRUMB_CHARS``."""
+    breadcrumb = " > ".join([file_path, *headings])
+    if len(breadcrumb) > MAX_BREADCRUMB_CHARS:
+        breadcrumb = breadcrumb[:MAX_BREADCRUMB_CHARS - 1].rstrip() + "…"
+    return breadcrumb
+
+
+def _heading_breadcrumbs(
+    file_path: str, text: str, offsets: list[int]
+) -> list[str]:
+    """Build a ``path > H1 > H2`` breadcrumb for each chunk offset.
+
+    A sliding-window chunk loses the document title and section it came from,
+    which is exactly the context a search query tends to name ("oauth setup
+    docs"). Prepending the breadcrumb to the embedded text puts that signal
+    back, cheaply and without an LLM call.
+
+    All offsets are answered in a single walk of the document — a file with
+    2000 chunks would otherwise re-scan itself 2000 times, which cost seconds
+    per megabyte. Headings inside fenced code blocks are ignored, so a
+    ``# comment`` in a shell snippet never becomes a section. Only markdown
+    files are scanned; everything else gets the path alone.
+
+    Args:
+        file_path: Normalized relative path of the file.
+        text: Full document text.
+        offsets: Indices in *text* where chunks start; any order, duplicates
+            allowed.
+
+    Returns:
+        One breadcrumb per entry in *offsets*, in the same order.
+    """
+    if not offsets:
+        return []
+    if Path(file_path).suffix.lower() not in _MARKDOWN_SUFFIXES:
+        return [_format_breadcrumb(file_path, [])] * len(offsets)
+
+    # Walk the document once, emitting the heading stack as each requested
+    # offset is passed. A heading exactly at a chunk's start still describes
+    # that chunk, hence "position > offset" rather than ">=".
+    pending = sorted(range(len(offsets)), key=lambda i: offsets[i])
+    result: list[str] = [""] * len(offsets)
+    next_pending = 0
+
+    headings: list[tuple[int, str]] = []  # (level, title) stack
+    in_fence = False
+    position = 0
+    for line in text.splitlines(keepends=True):
+        while (
+            next_pending < len(pending)
+            and position > offsets[pending[next_pending]]
+        ):
+            result[pending[next_pending]] = _format_breadcrumb(
+                file_path, [title for _, title in headings]
+            )
+            next_pending += 1
+        if next_pending >= len(pending):
+            break
+        position += len(line)
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = _HEADING_RE.match(line.rstrip("\n"))
+        if not match:
+            continue
+        level = len(match.group(1))
+        title = match.group(2).strip()
+        if not title:
+            continue
+        while headings and headings[-1][0] >= level:
+            headings.pop()
+        headings.append((level, title))
+
+    # Offsets at or past the end of the document see the final heading stack.
+    final = _format_breadcrumb(file_path, [title for _, title in headings])
+    for index in pending[next_pending:]:
+        result[index] = final
+    return result
+
+
+def _heading_breadcrumb(file_path: str, text: str, offset: int) -> str:
+    """Breadcrumb for a single chunk offset (see :func:`_heading_breadcrumbs`)."""
+    return _heading_breadcrumbs(file_path, text, [offset])[0]
+
+
 @dataclass
 class IndexMeta:
-    """Tracks file hashes and chunk counts for incremental indexing."""
+    """Tracks file hashes and chunk counts for incremental indexing.
+
+    ``embedder_fingerprint`` covers every setting that changes the stored
+    vectors — not just the model, but chunking and the text fed to the model
+    — so a config change invalidates the index instead of leaving a mix of
+    incompatible vectors behind. ``embedder_model`` is kept alongside it for
+    display (``/api/search/status``) and to interpret indexes written before
+    fingerprints existed.
+    """
 
     file_hashes: dict[str, str] = field(default_factory=dict)
     chunk_counts: dict[str, int] = field(default_factory=dict)
     embedder_model: str = ""
+    embedder_fingerprint: str = ""
     schema_version: int = INDEX_SCHEMA_VERSION
 
     def save(self, path: Path) -> None:
@@ -951,6 +1260,7 @@ class IndexMeta:
                     "file_hashes": self.file_hashes,
                     "chunk_counts": self.chunk_counts,
                     "embedder_model": self.embedder_model,
+                    "embedder_fingerprint": self.embedder_fingerprint,
                     "schema_version": self.schema_version,
                 },
                 f,
@@ -973,6 +1283,7 @@ class IndexMeta:
                 file_hashes=data.get("file_hashes", {}),
                 chunk_counts=data.get("chunk_counts", {}),
                 embedder_model=data.get("embedder_model", ""),
+                embedder_fingerprint=data.get("embedder_fingerprint", ""),
                 schema_version=data.get("schema_version", 0),
             )
         except Exception as e:
@@ -991,15 +1302,20 @@ class SearchEngine:
         content_dir: Path,
         index_dir: Path,
         *,
-        embedder_model: str = "sentence-transformers:all-MiniLM-L6-v2",
+        embedder_model: str = DEFAULT_EMBEDDER_MODEL,
         contextual_retrieval: bool = False,
         contextual_model: str = "claude-haiku-4-5-20251001",
         anthropic_api_key: str | None = None,
         embed_fn=None,
+        model_cache_dir: Path | str | None = None,
+        onnx_threads: int | None = None,
+        query_prefix: str | None = None,
+        document_prefix: str | None = None,
         filesystem=None,
         git_backend=None,
         chunk_size: int = 1000,
         chunk_overlap: int = 100,
+        heading_context: bool = True,
         mmr_enabled: bool = True,
         mmr_lambda: float = 0.7,
         max_per_file: int = 2,
@@ -1009,6 +1325,11 @@ class SearchEngine:
         hybrid_enabled: bool = False,
         rrf_k: int = 60,
         bm25_candidate_pool: int = 30,
+        rerank_enabled: bool = False,
+        rerank_model: str = DEFAULT_RERANK_MODEL,
+        rerank_candidates: int = 10,
+        rerank_margin: float = 0.1,
+        reranker=None,
         default_exclude_patterns: list[str] | None = None,
         default_boost_weight: float = 0.15,
     ):
@@ -1017,16 +1338,42 @@ class SearchEngine:
         Args:
             content_dir: Root directory for content files.
             index_dir: Directory for index persistence.
-            embedder_model: Pydantic AI embedder model string.
+            embedder_model: Embedder model string. ``onnx:<fastembed model>``
+                selects the local ONNX Runtime backend (default:
+                ``onnx:sentence-transformers/all-MiniLM-L6-v2``); any other
+                prefix (``openai:``, ``cohere:``, ``sentence-transformers:``)
+                is passed to Pydantic AI's ``Embedder``.
             contextual_retrieval: Whether to use Claude-powered chunk enrichment.
             contextual_model: Model string for contextual retrieval.
             anthropic_api_key: API key for contextual retrieval (required if enabled).
             embed_fn: Optional custom embedding function for testing.
                       Signature: async (texts: list[str]) -> list[list[float]]
+                      Takes precedence over ``embedder_model``.
+            model_cache_dir: Root directory for locally cached model weights
+                (``STASH_MODEL_CACHE_DIR``). The ONNX backend stores its files
+                in a ``fastembed`` subdirectory; None lets fastembed pick.
+            onnx_threads: onnxruntime intra/inter-op thread count for the
+                ``onnx:`` backend (``STASH_SEARCH_ONNX_THREADS``). None keeps
+                onnxruntime's default (one thread per host core, which can
+                oversubscribe under container CPU limits).
+            query_prefix: Instruction prepended to queries for the ``onnx:``
+                backend (``STASH_SEARCH_QUERY_PREFIX``). None uses the model's
+                documented prefix; ``""`` forces none.
+            document_prefix: Same for documents (``STASH_SEARCH_DOCUMENT_PREFIX``).
             filesystem: Optional FileSystem instance for content path filtering.
             git_backend: Optional GitBackend instance for blame-enriched results.
             chunk_size: Number of characters per chunk for the sliding window.
             chunk_overlap: Number of characters to overlap between adjacent chunks.
+            heading_context: Fold each chunk's ``path > H1 > H2`` breadcrumb
+                into the text that gets embedded. Worth it in proportion to
+                how many documents there are to tell apart — measured +0.056
+                MRR over 1,097 documents but -0.055 over 52, where a chunk's
+                own wording already identifies its source. On by default; turn
+                it off for small collections. The breadcrumb is recorded as
+                the chunk's context, returned with results, and indexed by
+                BM25 regardless of this setting. Ignored when
+                ``contextual_retrieval`` is on: the LLM-generated context
+                takes its place and is always embedded.
             mmr_enabled: Apply MMR diversification + per-file cap to the
                 cosine candidate pool before truncating to max_results.
             mmr_lambda: MMR relevance/diversity balance (1.0 = relevance-only,
@@ -1046,6 +1393,18 @@ class SearchEngine:
                 from the original paper.
             bm25_candidate_pool: How many sparse candidates to fetch
                 per query before fusion.
+            rerank_enabled: Rescore the retrieved shortlist with a
+                cross-encoder, which reads query and chunk together instead
+                of comparing two independently-made vectors. Off by default:
+                it is the biggest precision lever available but costs an
+                extra model download and ~10 ms per candidate per query.
+            rerank_model: fastembed cross-encoder to use.
+            rerank_candidates: How many top candidates to rescore.
+            rerank_margin: Only rerank when the two best retrieval scores are
+                within this margin of each other — a clear winner is left
+                alone. 0 reranks unconditionally.
+            reranker: Pre-built reranker (used by tests); when None and
+                reranking is enabled, a FastEmbedReranker is created.
             default_exclude_patterns: Globs (STASH_CONTENT_PATHS dialect)
                 excluded from every search unless include_excluded=True.
             default_boost_weight: Bonus applied to results under
@@ -1063,6 +1422,8 @@ class SearchEngine:
         self._git_backend = git_backend
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.heading_context = heading_context
+        self._document_prefix = document_prefix
         self.mmr_enabled = mmr_enabled
         self.mmr_lambda = mmr_lambda
         self.max_per_file = max_per_file
@@ -1072,6 +1433,11 @@ class SearchEngine:
         self.hybrid_enabled = hybrid_enabled
         self.rrf_k = rrf_k
         self.bm25_candidate_pool = bm25_candidate_pool
+        self.rerank_enabled = rerank_enabled
+        self.rerank_model = rerank_model
+        self.rerank_candidates = max(1, rerank_candidates)
+        self.rerank_margin = max(0.0, rerank_margin)
+        self._reranker = reranker
         self.default_exclude_patterns = [p for p in (default_exclude_patterns or []) if p]
         self.default_boost_weight = max(0.0, float(default_boost_weight))
 
@@ -1096,27 +1462,53 @@ class SearchEngine:
                     "Install with: pip install 'stash-mcp[search-hybrid]'"
                 )
 
+        # Resolve the embedding backend BEFORE touching the persisted index:
+        # a typo in the model string or a missing provider package must raise
+        # here, not after the model-changed check below has wiped a good index.
+        #
+        # Local ONNX Runtime backend: install the fastembed adapter as the
+        # embed_fn so _embed/_embed_query need no provider-specific branches.
+        # The adapter validates the model name now (fail fast on typos) but
+        # downloads/loads the model on first use, so start-up isn't blocked.
+        if self._embed_fn is None and is_onnx_model(embedder_model):
+            cache_dir = (
+                Path(model_cache_dir) / "fastembed"
+                if model_cache_dir is not None
+                else None
+            )
+            self._embed_fn = FastEmbedAdapter(
+                onnx_model_name(embedder_model),
+                cache_dir=cache_dir,
+                threads=onnx_threads,
+                query_prefix=query_prefix,
+                document_prefix=document_prefix,
+            )
+
+        # Remote / torch providers go through Pydantic AI's Embedder
+        self._embedder = self._create_embedder()
+
+        # Same fail-fast-then-lazy-load contract as the embedding backend.
+        if self.rerank_enabled and self._reranker is None:
+            cache_dir = (
+                Path(model_cache_dir) / "fastembed"
+                if model_cache_dir is not None
+                else None
+            )
+            self._reranker = FastEmbedReranker(
+                rerank_model, cache_dir=cache_dir, threads=onnx_threads
+            )
+
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.store = VectorStore(index_dir / "vectors.pkl")
         self.meta = IndexMeta.load(index_dir / "index_meta.json")
         self.bm25_store = BM25Store(index_dir)
 
-        # If embedder model changed, clear stale index for rebuild —
-        # the BM25 store must be wiped in the same block so the two
-        # indexes don't drift.
-        if self.meta.embedder_model and self.meta.embedder_model != embedder_model:
-            self._clear_index_for_rebuild(
-                f"Embedder model changed from '{self.meta.embedder_model}' "
-                f"to '{embedder_model}'. Clearing stale index for rebuild."
-            )
-
-        # Chunk-metadata layout changed (e.g. the `metadata` dict was added):
-        # clear everything so the startup build re-embeds and repopulates.
-        if self.meta.schema_version != INDEX_SCHEMA_VERSION:
-            self._clear_index_for_rebuild(
-                f"Search index schema version {self.meta.schema_version} != "
-                f"{INDEX_SCHEMA_VERSION}; clearing index for rebuild."
-            )
+        # If anything that determines the stored vectors — or the per-chunk
+        # metadata layout — changed, clear the stale index for rebuild. The
+        # BM25 store is wiped in the same block so the two indexes don't drift.
+        stale_reason = self._stale_index_reason()
+        if stale_reason:
+            self._clear_index_for_rebuild(f"{stale_reason} Clearing index for rebuild.")
 
         # Upgrade path: vectors.pkl exists from a pre-hybrid deployment
         # but no BM25 index yet — rebuild it now so the first query
@@ -1134,8 +1526,63 @@ class SearchEngine:
         self._indexing = False
         self._lock = asyncio.Lock()
 
-        # Eagerly initialise the embedder so the first search query is fast
-        self._embedder = self._create_embedder()
+    @property
+    def embedder_fingerprint(self) -> str:
+        """Identity of everything that determines the stored vectors.
+
+        Two indexes are interchangeable only if this string matches: the model
+        decides the vector space, and chunking and the document prefix/heading
+        breadcrumb decide what text was fed to it. Retrieval-time settings
+        (MMR, recency, hybrid weights) are deliberately excluded — they change
+        ranking, not vectors, so they must not force a re-index.
+        """
+        # Prefer the backend's resolved prefix (the ONNX adapter fills in the
+        # model's documented one when the caller passed None); fall back to
+        # whatever was configured for backends that don't expose it.
+        document_prefix = getattr(
+            self._embed_fn, "document_prefix", self._document_prefix or ""
+        )
+        return "|".join(
+            [
+                self.embedder_model,
+                f"doc:{document_prefix}",
+                f"head:{int(self.heading_context)}",
+                f"ctx:{int(self.contextual_retrieval)}",
+                f"cs:{self.chunk_size}",
+                f"co:{self.chunk_overlap}",
+            ]
+        )
+
+    def _stale_index_reason(self) -> str | None:
+        """Explain why the persisted index can't be reused, or None if it can."""
+        if not self.meta.file_hashes and self.store.count == 0:
+            return None
+        # Chunk-metadata *layout* change (e.g. the `metadata` dict or
+        # `heading_path` was added). Orthogonal to the fingerprint below,
+        # which covers the text that was embedded rather than what is stored
+        # alongside it — so check it first: a matching fingerprint must not
+        # let an index with the old per-chunk layout survive.
+        if self.meta.schema_version != INDEX_SCHEMA_VERSION:
+            return (
+                f"Search index schema version {self.meta.schema_version} != "
+                f"{INDEX_SCHEMA_VERSION}."
+            )
+        if self.meta.embedder_fingerprint:
+            if self.meta.embedder_fingerprint == self.embedder_fingerprint:
+                return None
+            return (
+                f"Search index settings changed from "
+                f"'{self.meta.embedder_fingerprint}' to "
+                f"'{self.embedder_fingerprint}'."
+            )
+        # Written before fingerprints existed, i.e. before heading breadcrumbs
+        # and context-window splitting changed what text gets embedded. The
+        # model string alone can't tell us those vectors are still current, and
+        # keeping them would mix two encodings in one index forever, so rebuild.
+        return (
+            "Search index predates the current indexing pipeline "
+            "(no fingerprint recorded)."
+        )
 
     def _clear_index_for_rebuild(self, reason: str) -> None:
         """Wipe the vector store, BM25 store, and index metadata, then persist.
@@ -1157,10 +1604,11 @@ class SearchEngine:
         self.meta.save(self.index_dir / "index_meta.json")
 
     def _create_embedder(self):
-        """Create and return the embedding model instance, or None for custom embed_fn.
+        """Create and return the Pydantic AI embedder, or None when an embed_fn is set.
 
         Returns:
-            Embedder instance, or None if a custom embed_fn is provided.
+            Embedder instance, or None if a custom embed_fn (or the ONNX
+            adapter) is in use.
 
         Raises:
             RuntimeError: If pydantic-ai is not installed.
@@ -1172,10 +1620,22 @@ class SearchEngine:
 
             return Embedder(self.embedder_model)
         except ImportError:
-            raise RuntimeError(
-                "pydantic-ai is required for semantic search. "
-                "Install with: pip install 'stash-mcp[search]'"
+            provider = self.embedder_model.split(":", 1)[0]
+            extra = _PYDANTIC_AI_EXTRAS.get(provider, "search-openai")
+            hint = (
+                f"pydantic-ai is required for the '{provider}:' embedding provider. "
+                f"Install with: pip install 'stash-mcp[{extra}]'"
             )
+            if provider == "sentence-transformers":
+                # sentence-transformers:<m> -> onnx:sentence-transformers/<m>
+                model = self.embedder_model.partition(":")[2]
+                model = model.removeprefix("sentence-transformers/")
+                hint += (
+                    " (Docker: build with --build-arg SEARCH_EXTRA=search-torch), "
+                    f"or switch to 'onnx:sentence-transformers/{model}' to run the "
+                    "same model on ONNX Runtime with the default image"
+                )
+            raise RuntimeError(hint)
 
     async def _embed(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of document texts using the configured embedder.
@@ -1205,6 +1665,12 @@ class SearchEngine:
             Single embedding vector.
         """
         if self._embed_fn is not None:
+            # Backends that distinguish queries from documents (the ONNX
+            # adapter's instruction prefixes) expose embed_query; a plain
+            # async callable — the documented embed_fn contract — does not.
+            embed_query = getattr(self._embed_fn, "embed_query", None)
+            if embed_query is not None:
+                return await embed_query(text)
             result = await self._embed_fn([text])
             return result[0]
 
@@ -1312,6 +1778,7 @@ class SearchEngine:
 
             # Final save
             self.meta.embedder_model = self.embedder_model
+            self.meta.embedder_fingerprint = self.embedder_fingerprint
             await self.store.save_async()
             await self.meta.save_async(self.index_dir / "index_meta.json")
             await self._rebuild_bm25_if_dirty()
@@ -1343,6 +1810,88 @@ class SearchEngine:
             snapshot = list(self.store._metadata)
             await asyncio.to_thread(self.bm25_store.rebuild, snapshot)
             await self.bm25_store.save_async()
+
+    async def _fit_windows_to_context(
+        self,
+        windows: list[tuple[int, str]],
+        normalized_path: str,
+        body: str,
+    ) -> list[tuple[int, str]]:
+        """Re-split any window the embedding model would truncate.
+
+        ``chunk_size`` is in characters, but models cap *tokens* — markdown and
+        code tokenize densely enough that the default 1000-character chunk can
+        exceed a 256-token window, and the overflow is dropped silently by the
+        tokenizer. Backends that can report their context window (the ONNX
+        adapter's ``measure_visible_chars``) let us detect that and split the
+        offending window into pieces that fit, so no text goes unembedded.
+
+        No-op for backends without the measurement hook, and for the common
+        case where everything already fits. ``body`` is the frontmatter-
+        stripped text the window offsets are relative to.
+        """
+        measure = getattr(self._embed_fn, "measure_visible_chars", None)
+        if measure is None or not windows:
+            return windows
+
+        pending = list(windows)
+        fitted: list[tuple[int, str]] = []
+        split_count = 0
+        # Each pass either accepts a window or splits it strictly smaller, and
+        # the floor stops a backend that reports an absurdly small window from
+        # looping forever.
+        for _ in range(_MAX_FIT_PASSES):
+            if not pending:
+                break
+            texts = self._embed_texts_for(normalized_path, body, pending)
+            visible = await measure(texts)
+            if visible is None:
+                return windows
+
+            still_pending: list[tuple[int, str]] = []
+            for (offset, chunk), embed_text, room in zip(pending, texts, visible):
+                # `room` counts characters of the *embedded* text, which may
+                # carry a context prefix; charge that overhead to the chunk.
+                budget = room - (len(embed_text) - len(chunk))
+                if budget >= len(chunk) - _FIT_SLACK_CHARS or budget < _MIN_FIT_CHARS:
+                    fitted.append((offset, chunk))
+                    continue
+                split_count += 1
+                for inner_offset, piece in _chunk_text_sliding_window_with_offsets(
+                    chunk, *_even_split_params(len(chunk), budget, self.chunk_overlap)
+                ):
+                    still_pending.append((offset + inner_offset, piece))
+            pending = still_pending
+
+        fitted.extend(pending)
+        fitted.sort(key=lambda pair: pair[0])
+        if split_count:
+            logger.info(
+                "Split %d oversized chunk(s) in %s to fit the embedding "
+                "model's context window (%d chunks total)",
+                split_count,
+                normalized_path,
+                len(fitted),
+            )
+        return fitted
+
+    def _embed_texts_for(
+        self, normalized_path: str, body: str, windows: list[tuple[int, str]]
+    ) -> list[str]:
+        """The texts that will actually be embedded for these windows.
+
+        Used when measuring the context window. The contextual-retrieval
+        preamble is not known until it is generated, so its (bounded, ~200
+        token) length is approximated by the heading breadcrumb instead —
+        with ``STASH_CONTEXTUAL_RETRIEVAL=true`` the budget is therefore
+        optimistic and long chunks may still be truncated.
+        """
+        if not (self.contextual_retrieval or self.heading_context):
+            return [chunk for _, chunk in windows]
+        crumbs = _heading_breadcrumbs(
+            normalized_path, body, [offset for offset, _ in windows]
+        )
+        return [f"{crumb}\n\n{chunk}" for crumb, (_, chunk) in zip(crumbs, windows)]
 
     async def _index_file_locked(
         self, relative_path: str, *, content: str | None = None
@@ -1377,24 +1926,45 @@ class SearchEngine:
                 logger.warning(f"Could not read {normalized_path}: {e}")
                 return 0
 
+        # Chunk the body, not the raw file: frontmatter is metadata, not
+        # prose, and embedding it would put every document's YAML keys in
+        # the vector space. All chunk offsets below are therefore relative
+        # to `body`, and so is everything derived from them (breadcrumbs,
+        # heading paths).
         doc_metadata, body = extract_metadata(content)
-        chunk_pairs = _chunk_text_sliding_window_with_offsets(
+        windows = _chunk_text_sliding_window_with_offsets(
             body, self.chunk_size, self.chunk_overlap
         )
-        if not chunk_pairs:
+        if not windows:
             return 0
-        headings = scan_headings(body.strip())   # offsets are relative to the stripped body
+        windows = await self._fit_windows_to_context(windows, normalized_path, body)
+        headings = scan_headings(body)
 
         content_h = _content_hash(content)
         metadata_list: list[dict] = []
         texts_to_embed: list[str] = []
 
-        for i, (chunk, start) in enumerate(chunk_pairs):
-            context = None
+        # Where each chunk sits in the document, computed for the whole file
+        # in one pass. Always recorded so results can show it; only folded
+        # into the embedding when heading_context asks for it.
+        breadcrumbs = (
+            [None] * len(windows)
+            if self.contextual_retrieval
+            else _heading_breadcrumbs(
+                normalized_path, body, [offset for offset, _ in windows]
+            )
+        )
+
+        for i, ((offset, chunk), breadcrumb) in enumerate(zip(windows, breadcrumbs)):
+            context = breadcrumb
             if self.contextual_retrieval:
                 context = await self._contextualise_chunk(chunk, body)
 
-            embed_text = f"{context}\n\n{chunk}" if context else chunk
+            embed_text = (
+                f"{context}\n\n{chunk}"
+                if context and (self.contextual_retrieval or self.heading_context)
+                else chunk
+            )
             texts_to_embed.append(embed_text)
 
             meta = ChunkMetadata(
@@ -1404,7 +1974,7 @@ class SearchEngine:
                 context=context,
                 content_hash=content_h,
                 metadata=doc_metadata,
-                heading_path=heading_path_at(headings, start),
+                heading_path=heading_path_at(headings, offset),
             )
             metadata_list.append(asdict(meta))
 
@@ -1413,9 +1983,14 @@ class SearchEngine:
         self.bm25_store.mark_dirty()
 
         self.meta.file_hashes[normalized_path] = content_h
-        self.meta.chunk_counts[normalized_path] = len(chunk_pairs)
+        self.meta.chunk_counts[normalized_path] = len(metadata_list)
+        # Record what produced these vectors so a later config change (model,
+        # chunking, prefixes, breadcrumbs) is detected and the index rebuilt.
+        self.meta.embedder_model = self.embedder_model
+        self.meta.embedder_fingerprint = self.embedder_fingerprint
+        self.meta.schema_version = INDEX_SCHEMA_VERSION
 
-        return len(chunk_pairs)
+        return len(metadata_list)
 
     async def index_file(
         self, relative_path: str, *, content: str | None = None
@@ -1563,6 +2138,9 @@ class SearchEngine:
         async with self._lock:
             mask = None
             boost_mask = None
+            # Set by the branch that folds the boost into its own ranking
+            # scores, so the post-retrieval pass below doesn't apply it twice.
+            boost_applied = False
             rows = self.store._metadata
             if predicate is not None or boosting:
                 import numpy as np
@@ -1590,16 +2168,23 @@ class SearchEngine:
                 # sparse index would produce inconsistent rankings.
                 dense = self.store.search(query_embedding, top_n=fetch_n, mask=mask)
                 if boost_mask is not None:
-                    # NOTE: _merge_candidates appends the boost-scoped rescues
-                    # *after* the general pool, and _rrf_fuse scores purely by
-                    # position, so a rescued candidate enters fusion at the
-                    # worst reciprocal rank in the list. With MMR disabled
-                    # nothing reorders afterwards except the score multiplier
-                    # below, which acts on RRF scores that already encode that
-                    # penalty -- so boosting is near-inert in the
-                    # hybrid + MMR-disabled combination. Fixing it properly
-                    # needs a scoping parameter on BM25Store.search so the
-                    # sparse side can be fetched boost-scoped too.
+                    # A second, boost-scoped fetch so candidates the general
+                    # pool missed can still be *admitted*; boost_mask ANDs the
+                    # base predicate, so this can never re-admit a chunk the
+                    # filter excluded. Weighting them is a separate step below.
+                    #
+                    # NOTE: _merge_candidates appends the rescues *after* the
+                    # general pool, and _rrf_fuse scores purely by position, so
+                    # a rescued candidate enters fusion at the worst reciprocal
+                    # rank in the list. With MMR enabled the boost is folded
+                    # into the relevance MMR ranks on, which compensates; with
+                    # MMR disabled nothing reorders afterwards except the
+                    # post-hoc multiplier, which acts on RRF scores that
+                    # already encode that penalty -- so boosting stays
+                    # near-inert in the hybrid + MMR-disabled combination.
+                    # Fixing that properly needs a scoping parameter on
+                    # BM25Store.search so the sparse side can be fetched
+                    # boost-scoped too.
                     dense = _merge_candidates(
                         dense,
                         self.store.search(query_embedding, top_n=max_results, mask=boost_mask),
@@ -1635,12 +2220,30 @@ class SearchEngine:
                     merged["score"] = r.get("score", 0.0)
                     hydrated.append(merged)
                 if self.mmr_enabled:
+                    # Rank on the fused score, not cosine: otherwise MMR
+                    # re-sorts by the dense signal alone and BM25 can only
+                    # widen the pool, never change the order.
+                    #
+                    # The boost is applied *here*, to the fused scores on
+                    # their native scale, instead of to what mmr_rerank
+                    # reports. mmr_rerank min-max normalises its relevance
+                    # into [0, 1] so it stays commensurate with the cosine
+                    # diversity term — which pins the best candidate at
+                    # exactly 1.0 and the worst at exactly 0.0. A post-hoc
+                    # multiplier on that scale can never lift anything past
+                    # the leader (and can never lift 0.0 at all), so
+                    # boosting would be silently inert in hybrid mode.
+                    relevance = [r.get("score", 0.0) for r in hydrated]
+                    if boosting:
+                        relevance = _apply_boost(hydrated, relevance, boosts, weight)
+                        boost_applied = True
                     raw_results = self.store.mmr_rerank(
                         query_embedding,
                         hydrated,
                         top_n=fetch_n,
                         mmr_lambda=self.mmr_lambda,
                         max_per_file=self.max_per_file,
+                        relevance=relevance,
                     )
                 else:
                     raw_results = hydrated[:fetch_n]
@@ -1673,22 +2276,19 @@ class SearchEngine:
                         self.store.search(query_embedding, top_n=max_results, mask=boost_mask),
                     )
 
-        if boosting and raw_results:
-            boosted: list[dict] = []
-            for r in raw_results:
-                rr = dict(r)
-                score = float(rr.get("score", 0.0))
-                # Only reward positive (genuinely relevant) scores. mmr_rerank
-                # (the hybrid + MMR path) overwrites score with the raw cosine
-                # similarity and, unlike search()/search_mmr(), does not filter
-                # out non-positive values — a BM25-rescued, dense-irrelevant
-                # candidate can legitimately have a negative score there.
-                # Multiplying a negative score by (1 + weight) makes it more
-                # negative, i.e. demotes the very candidate boosting was asked
-                # to promote.
-                if score > 0 and path_under_any(_normalize_path(rr.get("file_path", "")), boosts):
-                    rr["score"] = score * (1.0 + weight)
-                boosted.append(rr)
+        # Cosine-scored paths (dense, dense+MMR) carry the boost as a
+        # post-retrieval multiplier on their reported score. The hybrid+MMR
+        # branch has already folded it into the relevance it ranked on, and
+        # re-applying it to mmr_rerank's normalised output would both
+        # double-count the bonus and undo MMR's diversity ordering.
+        if boosting and not boost_applied and raw_results:
+            scores = _apply_boost(
+                raw_results,
+                [float(r.get("score", 0.0)) for r in raw_results],
+                boosts,
+                weight,
+            )
+            boosted = [{**r, "score": s} for r, s in zip(raw_results, scores)]
             boosted.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
             raw_results = boosted
 
@@ -1707,6 +2307,25 @@ class SearchEngine:
             # applying it here would silently start capping them. Don't
             # "fix" this by dropping the gate.
             raw_results = _enforce_max_per_file(raw_results, self.max_per_file)
+
+        # Cross-encoder rescoring of the shortlist. Runs after the boost and
+        # the per-file cap (no point scoring candidates that were already
+        # dropped) and before the recency blend, so recency adjusts the
+        # cross-encoder's judgement rather than the retriever's.
+        #
+        # This is a reordering of `raw_results`, not a new retrieval: the
+        # shortlist and the demoted tail together are exactly the candidates
+        # that came out of the masked/filtered retrieval above, so it cannot
+        # reintroduce a chunk that ChunkFilter excluded. Keep it that way —
+        # anything that re-fetches or widens the pool here would need its own
+        # `predicate` pass.
+        if (
+            self.rerank_enabled
+            and self._reranker is not None
+            and raw_results
+            and self._should_rerank(raw_results)
+        ):
+            raw_results = await self._rerank_results(query, raw_results)
 
         # Blame is needed up-front only when recency reranking is on
         # (it needs every candidate's timestamp before truncation). When
@@ -1794,6 +2413,82 @@ class SearchEngine:
 
         return results
 
+    def _decide_rerank_scores(self, results: list[dict]) -> list[float]:
+        """Scores the skip decision looks at (separated out for testing)."""
+        return [float(r.get("score", 0.0)) for r in results]
+
+    def _should_rerank(self, results: list[dict]) -> bool:
+        """Whether the cross-encoder is worth running on this result set.
+
+        Reranking costs roughly 20 ms per candidate and buys nothing when
+        retrieval has already produced a clear winner, so it runs only when
+        the two best scores are within ``rerank_margin`` of each other — the
+        contested case where a second opinion can change the answer. Measured
+        on a 42-query documentation benchmark, the default margin skipped 29%
+        of queries and cut mean latency from 218 ms to 160 ms with no change
+        in ranking quality. Set it to 0 to rerank unconditionally.
+
+        The two best scores are used rather than the first two entries: MMR
+        returns candidates in diversity order, so the list is not necessarily
+        sorted by score.
+        """
+        if self.rerank_margin <= 0 or len(results) < 2:
+            return True
+        best, runner_up = sorted(self._decide_rerank_scores(results), reverse=True)[:2]
+        return (best - runner_up) < self.rerank_margin
+
+    async def _rerank_results(self, query: str, results: list[dict]) -> list[dict]:
+        """Rescore the top candidates with the cross-encoder and reorder them.
+
+        Only ``rerank_candidates`` entries are scored — the cost is one model
+        pass per candidate — and the rest keep their retrieval order behind
+        them. A failure here (e.g. the model can't be downloaded) must not
+        take search down, so it logs and returns the input untouched.
+        """
+        shortlist = results[: self.rerank_candidates]
+        tail = results[self.rerank_candidates:]
+        # Score the raw chunk, deliberately *without* the heading breadcrumb
+        # that the embedding sees. Cross-encoders are trained on natural
+        # (query, passage) pairs and the "path > heading" prefix reads as
+        # noise: measured over 24 queries on this repo, including it scored
+        # MRR 0.868 against 0.938 for the chunk alone (and 0.904 for no
+        # reranking at all), with the damage concentrated in code chunks.
+        documents = [r.get("content", "") for r in shortlist]
+        try:
+            scores = await self._reranker.rerank(query, documents)
+        except Exception as e:
+            logger.warning(
+                "Reranking failed (%s); falling back to retrieval order", e
+            )
+            return results
+        if len(scores) != len(shortlist):
+            logger.warning(
+                "Reranker returned %d scores for %d candidates; "
+                "falling back to retrieval order",
+                len(scores),
+                len(shortlist),
+            )
+            return results
+
+        rescored = []
+        for candidate, score in zip(shortlist, scores):
+            item = dict(candidate)
+            item["score"] = float(score)
+            rescored.append(item)
+        rescored.sort(key=lambda d: d["score"], reverse=True)
+
+        # The tail was never scored by the cross-encoder, and its retrieval
+        # scores live on a different scale (cosine or normalised fusion).
+        # Restate them strictly below the shortlist, preserving retrieval
+        # order among themselves, so a downstream stage that compares scores
+        # (the recency blend) can never float an unscored item to the top.
+        floor = min((item["score"] for item in rescored), default=0.0)
+        demoted = [
+            {**item, "score": floor - 1.0 - position}
+            for position, item in enumerate(tail)
+        ]
+        return rescored + demoted
+
     async def _fetch_blame_batch(
         self, file_paths: list[str]
     ) -> dict[str, list]:
@@ -1822,7 +2517,6 @@ class SearchEngine:
         if last_changed_at is None:
             return 0.5
         from datetime import datetime, timezone
-        import math
 
         ts = last_changed_at
         if ts.tzinfo is None:

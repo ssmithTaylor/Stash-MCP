@@ -1762,6 +1762,12 @@ def create_mcp_server(
             directories (e.g. report/scan output) from results by default;
             pass include_excluded=true to search them too.
 
+            Results are ranked best-first. The score is a relative relevance
+            signal, comparable only within one result set — its scale depends
+            on the server's retrieval configuration and it can be negative
+            when cross-encoder reranking is enabled. Rank order is what
+            carries meaning, not the absolute number.
+
             Args:
                 query: Natural language search query
                 max_results: Maximum number of results (default 5)

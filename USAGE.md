@@ -281,7 +281,7 @@ services:
       - STASH_SEARCH_ENABLED=true
 ```
 
-The default Docker image includes the `sentence-transformers` embedding provider. To use a different provider, override the build argument:
+The default Docker image includes the local ONNX Runtime embedding backend ([fastembed](https://github.com/qdrant/fastembed) — no PyTorch or CUDA libraries, so the image stays small). To use a different provider, override the build argument:
 
 ```bash
 # OpenAI embeddings
@@ -290,8 +290,14 @@ docker build --build-arg SEARCH_EXTRA=search-openai -t stash-mcp .
 # Cohere embeddings
 docker build --build-arg SEARCH_EXTRA=search-cohere -t stash-mcp .
 
-# Sentence-transformers + Anthropic contextual retrieval
+# ONNX Runtime + Anthropic contextual retrieval
 docker build --build-arg SEARCH_EXTRA=search-contextual -t stash-mcp .
+
+# ONNX Runtime + BM25 hybrid retrieval
+docker build --build-arg SEARCH_EXTRA=search-hybrid -t stash-mcp .
+
+# Local PyTorch / sentence-transformers backend (opt-in; adds ~5 GB of torch + CUDA wheels)
+docker build --build-arg SEARCH_EXTRA=search-torch -t stash-mcp .
 ```
 
 #### Local Development
@@ -299,7 +305,7 @@ docker build --build-arg SEARCH_EXTRA=search-contextual -t stash-mcp .
 Install the search dependencies for your preferred embedding provider:
 
 ```bash
-# Sentence-transformers (local, no API key needed)
+# Local ONNX Runtime embeddings (default, no API key needed)
 pip install -e ".[search]"
 
 # OpenAI embeddings
@@ -308,8 +314,11 @@ pip install -e ".[search-openai]"
 # Cohere embeddings
 pip install -e ".[search-cohere]"
 
-# Sentence-transformers + Anthropic contextual retrieval
+# ONNX Runtime + Anthropic contextual retrieval
 pip install -e ".[search-contextual]"
+
+# Local PyTorch / sentence-transformers embeddings (opt-in)
+pip install -e ".[search-torch]"
 ```
 
 Then enable search by setting the environment variable:
@@ -318,17 +327,73 @@ Then enable search by setting the environment variable:
 export STASH_SEARCH_ENABLED=true
 ```
 
+#### Choosing an Embedding Model
+
+`STASH_SEARCH_EMBEDDER_MODEL` selects both the backend (by prefix) and the model:
+
+| Model string | Backend | Notes |
+|---|---|---|
+| `onnx:BAAI/bge-small-en-v1.5` | ONNX Runtime (default) | 384-dim, 512-token window, ~66 MB. MTEB retrieval 51.7. |
+| `onnx:BAAI/bge-base-en-v1.5` | ONNX Runtime | 768-dim, higher quality, ~210 MB (doubles index size) |
+| `onnx:sentence-transformers/all-MiniLM-L6-v2` | ONNX Runtime | The pre-0.2 default. fp32, 384-dim, 256-token window, ~90 MB; identical vectors to the PyTorch model (~1e-7). |
+| `onnx:<any fastembed model>` | ONNX Runtime | See `python -c "from fastembed import TextEmbedding; print([m['model'] for m in TextEmbedding.list_supported_models()])"` |
+| `openai:text-embedding-3-small` | OpenAI API | Requires `OPENAI_API_KEY` and the `search-openai` extra |
+| `cohere:embed-english-v3.0` | Cohere API | Requires `CO_API_KEY` and the `search-cohere` extra |
+| `sentence-transformers:all-mpnet-base-v2` | PyTorch | Requires the `search-torch` extra |
+
+Models trained with instruction prefixes get them automatically — `query: ` / `passage: ` for the e5 family, `search_query: ` / `search_document: ` for nomic, the "Represent this sentence…" instruction for arctic, mxbai and bge v1. (bge **v1.5** models are used bare, as their model card recommends.) Override with `STASH_SEARCH_QUERY_PREFIX` and `STASH_SEARCH_DOCUMENT_PREFIX`.
+
+Local model files are downloaded on first use into `STASH_MODEL_CACHE_DIR` (default `/data/models`; ONNX models under a `fastembed/` subdirectory). Mount a volume there so the download happens once. With the HTTP server the download happens in the background during the first index build, so the server starts and answers health checks immediately (the stdio server, `stash-mcp-stdio`, builds the index before it starts serving, as before).
+
+Set `STASH_SEARCH_ONNX_THREADS` (e.g. `2`) to cap onnxruntime's thread pool when the container runs under a CPU limit — by default onnxruntime sizes it from the host's core count.
+
+> **CPU requirement:** numpy ≥ 2.4 wheels are built for the x86-64-v2 baseline (SSE4.2/POPCNT). On Proxmox/QEMU VMs using the generic `kvm64` CPU type the process dies with `Illegal instruction` when search is enabled, whichever backend you pick — use CPU type `host` (or `x86-64-v2-AES`) for the VM.
+
 ### How Search Works
 
 When search is enabled, the server:
 
-1. **Indexes content at startup** — All files are chunked (using markdown-aware splitting) and embedded into vectors
-2. **Keeps the index up-to-date** — File creates, updates, and deletes automatically update the search index
-3. **Persists the index to disk** — The vector index is saved to `STASH_SEARCH_INDEX_DIR` and reloaded on restart
-4. **Skips unchanged files** — Incremental indexing only re-embeds files whose content has changed
-5. **Auto-reindexes on model change** — If `STASH_SEARCH_EMBEDDER_MODEL` changes between restarts, the stale index is automatically cleared and rebuilt with the new model
-6. **Auto-reindexes on index schema change** — The server stamps an internal `INDEX_SCHEMA_VERSION` into the index. When an upgrade bumps it (because the per-chunk layout changed — e.g. the chunk `metadata` dict or `heading_path` was added), the whole index is cleared on the next startup and rebuilt, exactly like a model change. Two consequences to plan for: `search_content` returns **no results** until the rebuild finishes, and every chunk is re-embedded, which on a paid embedding provider is a real, one-off bill proportional to the size of your store. Upgrade during a quiet window, and watch for the `Search index schema version ... clearing index for rebuild` warning in the logs to know it happened
-7. **Scoped search** — `search_content` and `GET /api/search` accept `path_prefix` (hard scope: one or more subtrees; anything outside them is hidden from results) and `boost_prefix` (soft scope: boosts a subtree's ranking without hiding anything outside it), plus `exclude_patterns` (globs), `include_excluded`, and metadata filters (`metadata_filters={"layer": "x"}` / `?filter=layer:x`). Results report the heading path a snippet came from, when the source has one. Document metadata comes from YAML frontmatter (any top-level scalar key) or, leniently, from `Key: value` fields in the blockquote directly under the H1; it is returned on every result, on `read_content`/`inspect_content_structure`, and can be changed with `update_metadata`. `list_content` accepts `max_depth`, `glob`, `limit` and `with_metadata` for large stores
+1. **Indexes content at startup** — Files are split into overlapping windows and embedded into vectors. Each chunk also records a `path > heading > subheading` breadcrumb: returned with the result so you can see where a snippet came from, indexed by BM25 so documents are reachable by name, and folded into the embedded text as well unless you set `STASH_SEARCH_HEADING_CONTEXT=false` (worth doing below ~100 documents). The structured `heading_path` and the document's metadata are stored on every chunk and returned with every result
+2. **Never truncates silently** — A window that would overflow the embedding model's token limit is split into evenly-sized pieces first, so no text goes unembedded (`STASH_SEARCH_CHUNK_SIZE` is in characters, models cap tokens)
+3. **Keeps the index up-to-date** — File creates, updates, and deletes automatically update the search index
+4. **Persists the index to disk** — The vector index and the BM25 index are saved to `STASH_SEARCH_INDEX_DIR` and reloaded on restart
+5. **Skips unchanged files** — Incremental indexing only re-embeds files whose content has changed
+6. **Auto-reindexes when the index would be stale** — The index records a fingerprint of everything that determines its vectors: the embedder model, chunk size and overlap, the heading-breadcrumb setting and any document prefix. Change any of them and the index is cleared and rebuilt on the next start. Retrieval-only settings (MMR, recency, hybrid, reranking) never force a rebuild
+7. **Auto-reindexes on index schema change** — The server also stamps an internal `INDEX_SCHEMA_VERSION` into the index. When an upgrade bumps it (because the per-chunk layout changed — e.g. the chunk `metadata` dict or `heading_path` was added), the whole index is cleared on the next startup and rebuilt, exactly like a fingerprint change. Two consequences to plan for: `search_content` returns **no results** until the rebuild finishes, and every chunk is re-embedded, which on a paid embedding provider is a real, one-off bill proportional to the size of your store. Upgrade during a quiet window, and watch for the `Search index schema version ... clearing index for rebuild` warning in the logs to know it happened
+8. **Scoped search** — `search_content` and `GET /api/search` accept `path_prefix` (hard scope: one or more subtrees; anything outside them is hidden from results) and `boost_prefix` (soft scope: boosts a subtree's ranking without hiding anything outside it), plus `exclude_patterns` (globs), `include_excluded`, and metadata filters (`metadata_filters={"layer": "x"}` / `?filter=layer:x`). Results report the heading path a snippet came from, when the source has one. Document metadata comes from YAML frontmatter (any top-level scalar key) or, leniently, from `Key: value` fields in the blockquote directly under the H1; it is returned on every result, on `read_content`/`inspect_content_structure`, and can be changed with `update_metadata`. `list_content` accepts `max_depth`, `glob`, `limit` and `with_metadata` for large stores
+
+At query time:
+
+1. `path_prefix`, `exclude_patterns`, `file_types` and `metadata_filters` are compiled into a single predicate and applied to the stored chunks **before** anything is ranked, so `max_results` still returns that many results when most of the store is out of scope, and no excluded chunk can reach the output from any retrieval route
+2. The query is embedded (with the model's query instruction, if it has one) and matched against the vector index
+3. In parallel, BM25 matches the query's literal tokens — env var names, function names, paths — against the same chunks, filtered by the same predicate
+4. The two rankings are fused with Reciprocal Rank Fusion, then diversified with MMR (and capped per file)
+5. `boost_prefix` multiplies the surviving scores under it by `(1 + STASH_SEARCH_BOOST_WEIGHT)` and the per-file cap is re-applied to the merged list
+6. If `STASH_SEARCH_RERANK_ENABLED=true`, a cross-encoder rescores the top `STASH_SEARCH_RERANK_CANDIDATES` results (reordering only — it never adds candidates)
+7. Optionally, a git-blame recency boost is blended in (`STASH_SEARCH_RECENCY_WEIGHT`)
+
+### Reranking
+
+Vector search compares a query vector with chunk vectors that were made without ever seeing the query. A cross-encoder reads both together and scores the pair directly. Measured over 42 queries against a 52-document (~305 KB) technical-documentation corpus (MRR):
+
+| Corpus | Metric | Without reranking | With reranking |
+|---|---|---|---|
+| Kubernetes docs (1,097 documents, 54 queries) | MRR | 0.536 | 0.544 |
+| BEIR SciFact (5,183 documents, 300 human-judged queries) | nDCG@10 | 0.698 | 0.709 |
+| Small documentation stash (52 documents, 42 queries) | MRR | 0.865 | 0.882 |
+
+(Measured with `STASH_SEARCH_HEADING_CONTEXT=false` so the reranking delta is isolated.)
+
+```bash
+export STASH_SEARCH_RERANK_ENABLED=true      # ~120 MB extra download
+export STASH_SEARCH_RERANK_CANDIDATES=10     # ~22 ms per candidate, per query
+```
+
+Reranking runs only on contested result sets — when the top two retrieval scores are further apart than `STASH_SEARCH_RERANK_MARGIN` (default `0.1`), retrieval already has a clear winner and the cross-encoder is skipped, which on the benchmark skipped 29% of queries and cut mean latency from 218 ms to 160 ms with no quality change. Queries go from ~4 ms to ~160 ms at the default 10 candidates, which is why it is off by default. Rescoring 20 instead doubles the latency for no gain (0.880 vs 0.882), and truncating chunks to save time costs more accuracy than it saves (0.845). Worth it when precision matters more than latency — note it is slightly *negative* on exact-identifier queries, which the lexical index already answers perfectly.
+
+Model choice matters more than model size. On this corpus `Xenova/ms-marco-MiniLM-L-12-v2` (~120 MB, the default) scored 0.880 and `Xenova/ms-marco-MiniLM-L-6-v2` (~80 MB) scored 0.863 — no better than not reranking — while `jinaai/jina-reranker-v1-tiny-en` (0.824) and `jinaai/jina-reranker-v1-turbo-en` (0.816) both scored *worse than no reranking at all* despite being larger. `BAAI/bge-reranker-base` is stronger again but over 1 GB.
+
+> With reranking on, the `score` field in search results is the cross-encoder's logit — unbounded, sometimes negative, comparable only within one result set — instead of a 0–1 cosine similarity.
 
 ### Using Search via MCP
 
@@ -411,9 +476,19 @@ Environment variables:
 | `STASH_LOG_LEVEL` | Log level (debug, info, warning, error) | `info` |
 | `STASH_SEARCH_ENABLED` | Enable semantic search | `false` |
 | `STASH_SEARCH_INDEX_DIR` | Search index directory | `/data/.stash-index` |
-| `STASH_SEARCH_EMBEDDER_MODEL` | Embedder model string | `sentence-transformers:all-MiniLM-L6-v2` |
+| `STASH_SEARCH_EMBEDDER_MODEL` | Embedder model string (`onnx:`, `openai:`, `cohere:`, `sentence-transformers:` prefix selects the backend) | `onnx:BAAI/bge-small-en-v1.5` |
 | `STASH_SEARCH_EXCLUDE_PATTERNS` | Globs excluded from search unless `include_excluded=true` | — |
 | `STASH_SEARCH_BOOST_WEIGHT` | Bonus for results under `boost_prefix` | `0.15` |
+| `STASH_MODEL_CACHE_DIR` | Cache directory for locally downloaded model weights | `/data/models` |
+| `STASH_SEARCH_ONNX_THREADS` | onnxruntime thread count for the `onnx:` backend | *(onnxruntime default)* |
+| `STASH_SEARCH_QUERY_PREFIX` | Instruction prepended to queries (`""` to disable) | *(model default)* |
+| `STASH_SEARCH_DOCUMENT_PREFIX` | Instruction prepended to documents (`""` to disable) | *(model default)* |
+| `STASH_SEARCH_HEADING_CONTEXT` | Also embed the `path > heading` breadcrumb (always recorded, returned and BM25-indexed regardless) | `true` |
+| `STASH_SEARCH_HYBRID_ENABLED` | Fuse BM25 keyword search with vector search | *(on if `bm25s` installed)* |
+| `STASH_SEARCH_RERANK_ENABLED` | Rescore top results with a cross-encoder | `false` |
+| `STASH_SEARCH_RERANK_MODEL` | Cross-encoder used for reranking | `Xenova/ms-marco-MiniLM-L-12-v2` |
+| `STASH_SEARCH_RERANK_CANDIDATES` | How many results to rescore | `10` |
+| `STASH_SEARCH_RERANK_MARGIN` | Rerank only when the top two scores are this close (`0` = always) | `0.1` |
 | `STASH_CONTEXTUAL_RETRIEVAL` | Enable contextual chunk enrichment | `false` |
 | `STASH_CONTEXTUAL_MODEL` | Model for contextual retrieval | `claude-haiku-4-5-20251001` |
 | `ANTHROPIC_API_KEY` | API key for contextual retrieval | *(none)* |
