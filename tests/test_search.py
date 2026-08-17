@@ -984,6 +984,39 @@ class TestMCPSearchTool:
             finally:
                 _current_context.reset(token)
 
+    async def test_search_tool_marks_truncated_meta_values(self):
+        """A Meta value cut at 60 chars must say so — otherwise an agent
+        can't tell a truncated `describes:` from a complete one.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from fastmcp.server.context import Context, _current_context
+
+        long_value = "x" * 75
+        short_value = "y" * 60      # exactly at the limit: not truncated
+        with TemporaryDirectory() as content_dir, TemporaryDirectory() as index_dir:
+            tool = await self._tool_with_store(
+                content_dir, index_dir,
+                {"docs/a.md": (
+                    f"---\ndescribes: {long_value}\nlayer: {short_value}\n---\n"
+                    "# A\n\nauth oauth flow"
+                )},
+            )
+            ctx = MagicMock(spec=Context)
+            ctx.session = AsyncMock()
+            token = _current_context.set(ctx)
+            try:
+                # the raw text payload, not str(content) -- TextContent's repr
+                # escapes the ellipsis to a literal "\\u2026" and would hide it
+                text = (await tool.run({"query": "auth oauth"})).content[0].text
+                assert f"describes={'x' * 60}…" in text
+                assert long_value not in text                 # genuinely cut
+                # exactly at the limit is complete, so it gets no marker
+                assert f"layer={short_value}" in text
+                assert f"layer={short_value}…" not in text
+            finally:
+                _current_context.reset(token)
+
     async def test_search_tool_rejects_parent_traversal_prefix(self):
         from unittest.mock import AsyncMock, MagicMock
 

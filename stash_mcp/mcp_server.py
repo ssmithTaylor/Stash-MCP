@@ -1569,11 +1569,13 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                     describes, verified)
             Returns:
                 Search results formatted as a string; each result shows the
-                path, score, the Section (heading path) the chunk came from,
-                optional Meta/Context/Last changed lines, and a snippet. The
-                Section line names the heading the snippet came from, so
-                after read_content you can jump straight to that part of the
-                file instead of scanning the whole thing.
+                path, score and a snippet, plus — only when the underlying
+                value exists — the Section (heading path) the chunk came
+                from and Meta/Context/Last changed lines. The Section line
+                names the heading the snippet came from, so after
+                read_content you can jump straight to that part of the file
+                instead of scanning the whole thing. A Meta value cut at 60
+                characters ends in "…".
             """
             types_list = None
             if file_types:
@@ -1615,8 +1617,11 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 if r.heading_path:
                     lines.append(f"   Section: {' > '.join(r.heading_path)}")
                 if r.metadata:
+                    # Mark the cut: without it an agent can't tell a truncated
+                    # `describes:` from a complete one.
                     meta_str = " ".join(
-                        f"{k}={v[:60]}" for k, v in sorted(r.metadata.items())
+                        f"{k}={v[:60]}…" if len(v) > 60 else f"{k}={v}"
+                        for k, v in sorted(r.metadata.items())
                     )
                     lines.append(f"   Meta: {meta_str}")
                 if r.context:
