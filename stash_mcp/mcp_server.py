@@ -659,6 +659,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             ones. All edits are validated in memory and the file is written once;
             if any edit fails, nothing is written.
 
+            To change only YAML frontmatter keys, prefer update_metadata.
+
             Args:
                 file_path: File path relative to content root
                 sha: SHA-256 hex digest of the current file content (from read_content)
@@ -704,7 +706,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             ctx: Context,
         ) -> dict:
             """
-            Atomically apply edits to multiple files (max 10 per call).
+            Apply string-replacement edits to up to 10 files in one call;
+            every file is validated before any is written.
 
             All validations run before any writes — if any file fails validation
             the entire operation is aborted and no files are modified.
@@ -772,6 +775,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             """
             Delete a content file.
 
+            On git-tracked servers the deletion is recoverable from git
+            history; without git tracking it is permanent.
+
             Args:
                 path: File path relative to content root
                 sha: SHA-256 hex digest of the current file content (from read_content)
@@ -813,8 +819,12 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             ] = [],
             sha: Annotated[
                 str | None,
-                Field(description="Optional SHA-256 of the current full content; omit for a "
-                      "merge that only requires the frontmatter to be valid YAML"),
+                Field(
+                    description="Optional staleness check: SHA-256 of the current "
+                    "full content, from read_content. Omit to apply the merge "
+                    "without checking whether the file changed since you read it "
+                    "(the body is preserved either way)."
+                ),
             ] = None,
         ) -> dict:
             """Set or remove keys in a file's YAML frontmatter without touching the body.
@@ -886,8 +896,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
     ) -> dict:
         """
         Read and return the contents of a file along with its SHA-256 hash.
-        The sha is required by overwrite_content, edit_content, and
-        delete_content to ensure the file has not changed since it was read.
+        The sha is the concurrency token required by the write tools
+        (overwrite_content, edit_content, edit_content_batch, delete_content)
+        when they are registered.
 
         Args:
             path: File path relative to content root
@@ -938,8 +949,10 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
     ) -> dict:
         """Read multiple files and return their contents with SHA-256 hashes.
 
-        Reads up to 10 files in a single call. Each file's sha is required
-        by overwrite_content, edit_content, and delete_content.
+        Reads up to 10 files in a single call. Each file's sha is the
+        concurrency token required by the write tools (overwrite_content,
+        edit_content, edit_content_batch, delete_content) when they are
+        registered.
 
         Args:
             paths: List of file paths relative to content root (max 10)
@@ -1099,7 +1112,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             Field(description="Markdown file path (.md or .markdown) relative to content root"),
         ],
     ) -> dict:
-        """Read a markdown file and return its document structure based on headings.
+        """Return a markdown file's heading outline (title + nested sections
+        with line numbers) without its body text.
 
         Parses the heading hierarchy (h1-h6) and returns a nested outline of
         the document. Useful for understanding document organization before
@@ -1224,18 +1238,21 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
 
         Args:
             pattern: Literal substring (default) or regex (when is_regex=True).
-            is_regex: Treat pattern as a Python regex.
+            is_regex: Treat pattern as a Python regex, matched line by line —
+                a pattern can never span lines.
             case_sensitive: Match case-sensitively. Default false.
             max_results: Hard cap on total matches returned. Default 50.
             file_types: Optional comma-separated file extensions
                 (e.g. ".md,.py").
-            path_prefix: Optional path prefix to limit the search
-                (e.g. "docs/" restricts to that subtree).
+            path_prefix: Single subtree to scan, e.g. "docs/". One prefix
+                only — unlike search_content's path_prefix, this is NOT
+                comma-separated.
             context_lines: Lines of context to include before and after
                 each match. Default 0, max 10.
             exclude_patterns: Optional comma-separated globs to skip (e.g. "**/_reports/**");
-                the search tool's default exclusions do not apply here —
-                find_content is exhaustive unless you exclude explicitly.
+                the server's default search-exclusion patterns are NOT
+                applied here — find_content scans everything text-like
+                unless you exclude explicitly.
         Returns:
             A dict with 'matches' (list of {file_path, line_number, line,
             context_before, context_after}), 'truncated' (bool), and
@@ -1561,12 +1578,13 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                     results under them rank first, others still appear
                 exclude_patterns: Optional comma-separated glob patterns to
                     drop (root-anchored; "**/_reports/**" matches at any
-                    depth). Always applied.
+                    depth). Applied even when include_excluded=true.
                 include_excluded: Also return files matched by the server's
                     default exclusion patterns (default false)
                 metadata_filters: Optional {key: value} equality filters on
                     document metadata (frontmatter keys such as layer,
-                    describes, verified)
+                    describes, verified); keys are format-insensitive;
+                    values must match exactly as strings.
             Returns:
                 Search results formatted as a string; each result shows the
                 path, score and a snippet, plus — only when the underlying
