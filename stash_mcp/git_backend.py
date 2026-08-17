@@ -10,6 +10,12 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Wall-clock ceiling for git subprocesses that talk to a remote. Git sets no
+# low-speed limits by default, so a blackholed TCP connection or a stalled TLS
+# handshake would otherwise hang forever — and these run under the process-wide
+# write lock, which would take every write down with them.
+NETWORK_TIMEOUT_SECONDS = 120.0
+
 
 @dataclass
 class BlameLine:
@@ -133,6 +139,20 @@ def _parse_pull_file_statuses(
     return added, modified, deleted
 
 
+_AUTHOR_RE = re.compile(r"^.+\s*<[^>]*>\s*$")
+
+
+def is_valid_author(author: str) -> bool:
+    """True when *author* has the ``"Name <email>"`` shape ``git commit --author`` needs.
+
+    Git only accepts a bare name when it happens to match an author already in
+    the repository's history, so a value like ``"doc-writer"`` fails with
+    ``exit 128`` on some repositories and succeeds on others. Callers validate
+    up front to keep that ambiguity out of the commit path.
+    """
+    return bool(_AUTHOR_RE.match(author.strip()))
+
+
 def _parse_author_string(author: str) -> tuple[str, str]:
     """Parse a ``"Name <email>"`` string into ``(name, email)``.
 
@@ -153,9 +173,11 @@ class GitBackend:
         content_dir: Path,
         sync_token: str | None = None,
         author_default: str = "stash-mcp <stash@local>",
+        network_timeout: float = NETWORK_TIMEOUT_SECONDS,
     ) -> None:
         self.content_dir = content_dir
         self.author_default = author_default
+        self.network_timeout = network_timeout
         if sync_token:
             self._configure_credentials(sync_token)
 
@@ -253,6 +275,15 @@ class GitBackend:
     def validate_remote(self, remote: str) -> bool:
         """Return True if *remote* is configured in this repository."""
         result = self._run(["git", "remote", "get-url", remote])
+        return result.returncode == 0
+
+    def merge_in_progress(self) -> bool:
+        """True while an unresolved merge is in flight (``MERGE_HEAD`` exists).
+
+        ``git commit -- <pathspec>`` refuses to run during a merge, so every
+        path-scoped commit fails until an operator resolves it.
+        """
+        result = self._run(["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"])
         return result.returncode == 0
 
     def rename_remote(self, old_name: str, new_name: str) -> None:
@@ -393,6 +424,152 @@ class GitBackend:
 
         logger.info("Committed: %s", message)
 
+    # ------------------------------------------------------------------
+    # Path-scoped operations (autocommit / concurrent transactions)
+    # ------------------------------------------------------------------
+
+    def _normalize_paths(self, paths: list[str] | None) -> list[str]:
+        """Strip leading/trailing ``/`` from each path and drop empties.
+
+        Shared by every path-taking method in this section so pathspecs
+        handed to git are always POSIX-relative to ``content_dir`` with no
+        leading slash.
+        """
+        if not paths:
+            return []
+        return [p.strip("/") for p in paths if p and p.strip("/")]
+
+    def _stageable(self, paths: list[str]) -> list[str]:
+        """Return the subset of *paths* that exist on disk or are tracked.
+
+        ``git add -A -- <path>`` errors on a pathspec that matches nothing
+        (neither worktree nor index), e.g. a file created and deleted within
+        one transaction. Filtering keeps the commit robust.
+        """
+        clean = self._normalize_paths(paths)
+        if not clean:
+            return []
+        existing = [p for p in clean if (self.content_dir / p).exists()]
+        missing = [p for p in clean if p not in existing]
+        tracked: set[str] = set()
+        if missing:
+            result = self._run(["git", "ls-files", "-z", "--", *missing])
+            if result.returncode == 0:
+                tracked = {p for p in result.stdout.split("\0") if p}
+        ordered = []
+        for p in clean:
+            if (p in existing or p in tracked) and p not in ordered:
+                ordered.append(p)
+        return ordered
+
+    def has_staged_changes(self, paths: list[str] | None = None) -> bool:
+        """True when the index differs from HEAD (optionally only for *paths*).
+
+        A non-empty *paths* that normalizes to nothing (e.g. ``["/"]``) is a
+        no-op and reports ``False`` — it must never silently widen to the
+        whole index. Only ``paths=None`` (or an empty list) means "check the
+        whole index".
+        """
+        args = ["git", "diff", "--cached", "--quiet"]
+        if paths:
+            normalized = self._normalize_paths(paths)
+            if not normalized:
+                return False
+            args += ["--", *normalized]
+        result = self._run(args)
+        if result.returncode == 0:
+            return False
+        if result.returncode == 1:
+            return True
+        raise RuntimeError(f"git diff --cached failed: {result.stderr.strip()}")
+
+    def unstage(self, paths: list[str] | None = None) -> None:
+        """``git reset -q [-- paths]`` — clears the index, leaves the worktree alone.
+
+        A non-empty *paths* that normalizes to nothing (e.g. ``["/"]``) is a
+        no-op — it must never silently widen to a whole-index reset. Only
+        ``paths=None`` (or an empty list) resets the whole index.
+        """
+        args = ["git", "reset", "-q"]
+        if paths:
+            normalized = self._normalize_paths(paths)
+            if not normalized:
+                return
+            args += ["--", *normalized]
+        result = self._run(args)
+        if result.returncode != 0:
+            logger.warning("git reset failed: %s", result.stderr.strip())
+
+    def commit_paths(
+        self, paths: list[str], message: str, author: str | None = None
+    ) -> str | None:
+        """Stage exactly *paths* and commit them.
+
+        Returns the short commit hash, or ``None`` when none of the paths
+        changed relative to HEAD. On commit failure the paths are unstaged
+        again and ``RuntimeError`` is raised.
+        """
+        stageable = self._stageable(paths)
+        if not stageable:
+            return None
+        add_result = self._run(["git", "add", "-A", "--", *stageable])
+        if add_result.returncode != 0:
+            raise RuntimeError(f"git add failed: {add_result.stderr.strip()}")
+        if not self.has_staged_changes(stageable):
+            return None
+        commit_args = ["git", "commit", "-q", "-m", message]
+        if author:
+            commit_args.extend(["--author", author])
+        commit_args.extend(["--", *stageable])
+        commit_result = self._run(commit_args)
+        if commit_result.returncode != 0:
+            self.unstage(stageable)
+            raise RuntimeError(f"git commit failed: {commit_result.stderr.strip()}")
+        head = self._run(["git", "rev-parse", "--short", "HEAD"])
+        short = head.stdout.strip() if head.returncode == 0 else ""
+        logger.info("Committed %s: %s", short or "?", message.splitlines()[0] if message else "")
+        return short or None
+
+    def restore_paths(self, paths: list[str]) -> tuple[list[str], list[str]]:
+        """Revert *paths* to HEAD without touching anything else.
+
+        Paths present in HEAD are checked out (restoring deletions too);
+        paths unknown to HEAD are removed from the worktree.
+
+        Returns:
+            ``(restored, deleted)`` lists of relative paths.
+        """
+        clean = self._normalize_paths(paths)
+        if not clean:
+            return [], []
+        ls = self._run(["git", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", *clean])
+        in_head = {p for p in ls.stdout.split("\0") if p} if ls.returncode == 0 else set()
+        to_checkout = [p for p in clean if p in in_head]
+        to_delete = [p for p in clean if p not in in_head]
+        restored: list[str] = []
+        if to_checkout:
+            result = self._run(["git", "checkout", "-q", "HEAD", "--", *to_checkout])
+            if result.returncode != 0:
+                raise RuntimeError(f"git checkout failed: {result.stderr.strip()}")
+            restored = to_checkout
+        deleted: list[str] = []
+        for p in to_delete:
+            full = self.content_dir / p
+            if full.is_file():
+                full.unlink()
+                deleted.append(p)
+        return restored, deleted
+
+    def ahead_count(self, remote: str, branch: str) -> int:
+        """Number of local commits not on ``remote/branch`` (0 if that ref is unknown)."""
+        result = self._run(["git", "rev-list", "--count", f"{remote}/{branch}..HEAD"])
+        if result.returncode != 0:
+            return 0
+        try:
+            return int(result.stdout.strip() or "0")
+        except ValueError:
+            return 0
+
     def reset_hard(self) -> None:
         """Discard all uncommitted changes with ``git reset --hard HEAD``.
 
@@ -412,9 +589,19 @@ class GitBackend:
             branch: Branch name (e.g. ``"main"``).
 
         Raises:
-            RuntimeError: If the push fails.
+            RuntimeError: If the push fails, including when it exceeds
+                :attr:`network_timeout` seconds. The timeout is translated
+                here so callers only ever have to handle ``RuntimeError``.
         """
-        result = self._run(["git", "push", remote, branch])
+        try:
+            result = self._run(
+                ["git", "push", remote, branch], timeout=self.network_timeout
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"git push timed out after {self.network_timeout:g}s "
+                f"({remote}/{branch}); the remote may be unreachable."
+            ) from exc
         if result.returncode != 0:
             raise RuntimeError(f"git push failed: {result.stderr.strip()}")
         logger.info("Pushed %s to %s/%s.", branch, remote, branch)
@@ -512,6 +699,10 @@ class GitBackend:
             branch: Branch name (e.g. ``"main"``).
             recursive: If True, pass ``--recurse-submodules``.
 
+        A pull that exceeds :attr:`network_timeout` seconds is reported as an
+        ordinary failed :class:`PullResult` rather than raising, so a hung
+        remote cannot escape as an unhandled exception from the sync loop.
+
         Returns:
             :class:`PullResult` with success flag, categorised file lists,
             and the raw git output message.
@@ -528,7 +719,15 @@ class GitBackend:
         if recursive:
             pull_args.append("--recurse-submodules")
 
-        result = self._run(pull_args)
+        try:
+            result = self._run(pull_args, timeout=self.network_timeout)
+        except subprocess.TimeoutExpired:
+            message = (
+                f"git pull timed out after {self.network_timeout:g}s "
+                f"({remote}/{branch}); the remote may be unreachable."
+            )
+            logger.warning("Git pull failed: %s", message)
+            return PullResult(success=False, message=message)
         if result.returncode != 0:
             stderr = result.stderr or ""
             if any(

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
@@ -20,6 +21,7 @@ from .filesystem import (
 )
 from .mcp_server import MIME_TYPES
 from .metrics import get_metrics
+from .transactions import TransactionError, TransactionManager
 
 logger = logging.getLogger(__name__)
 
@@ -67,13 +69,22 @@ class TreeNode(BaseModel):
     children: list["TreeNode"] | None = None
 
 
-def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> FastAPI:
+def create_api(
+    filesystem: FileSystem,
+    lifespan=None,
+    search_engine=None,
+    transaction_manager: TransactionManager | None = None,
+) -> FastAPI:
     """Create FastAPI application.
 
     Args:
         filesystem: Filesystem instance
         lifespan: Optional lifespan context manager for the app
         search_engine: Optional SearchEngine instance for semantic search
+        transaction_manager: Optional TransactionManager. When given, write
+            routes take its write lock and autocommit/record through it;
+            when None, write routes behave exactly as before (no locking,
+            no commits).
 
     Returns:
         FastAPI application
@@ -106,6 +117,31 @@ def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> Fas
             duration_ms=duration_ms,
         )
         return response
+
+    tm = transaction_manager
+
+    @asynccontextmanager
+    async def _write_guard():
+        if tm is None:
+            yield
+            return
+        try:
+            async with tm.guard(None):
+                yield
+        except TransactionError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    async def _after_write(paths: list[str], commit_message: str | None,
+                           author: str | None, default_message: str) -> str | None:
+        if tm is None:
+            return None
+        try:
+            return await tm.after_write(
+                paths, session_id=None, message=commit_message, author=author,
+                default_message=default_message,
+            )
+        except TransactionError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     def _get_updated_at(relative_path: str) -> str | None:
         """Get file modification time as ISO string."""
@@ -236,17 +272,21 @@ def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> Fas
             raise HTTPException(status_code=500, detail="Internal server error")
 
     @app.post("/api/content/{path:path}", status_code=201)
-    async def create_content(path: str, data: ContentCreate):
+    async def create_content(path: str, data: ContentCreate,
+                             commit_message: str | None = None, author: str | None = None):
         """Create a new content file. Returns 409 if file already exists."""
         try:
-            if filesystem.file_exists(path):
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"File '{path}' already exists. Use PUT to update.",
-                )
-            filesystem.write_file(path, data.content)
+            async with _write_guard():
+                if filesystem.file_exists(path):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"File '{path}' already exists. Use PUT to update.",
+                    )
+                filesystem.write_file(path, data.content)
+                commit = await _after_write([path], commit_message, author, f"Create {path}")
             emit(CONTENT_CREATED, path)
-            return {"message": f"File '{path}' created successfully", "path": path}
+            return {"message": f"File '{path}' created successfully", "path": path,
+                    "commit": commit}
         except HTTPException:
             raise
         except InvalidPathError as e:
@@ -256,13 +296,20 @@ def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> Fas
             raise HTTPException(status_code=500, detail="Internal server error")
 
     @app.put("/api/content/{path:path}")
-    async def update_content(path: str, data: ContentCreate):
+    async def update_content(path: str, data: ContentCreate,
+                             commit_message: str | None = None, author: str | None = None):
         """Update an existing content file (also allows creation)."""
         try:
-            is_new = not filesystem.file_exists(path)
-            filesystem.write_file(path, data.content)
+            async with _write_guard():
+                is_new = not filesystem.file_exists(path)
+                filesystem.write_file(path, data.content)
+                verb = "Create" if is_new else "Update"
+                commit = await _after_write([path], commit_message, author, f"{verb} {path}")
             emit(CONTENT_CREATED if is_new else CONTENT_UPDATED, path)
-            return {"message": f"File '{path}' saved successfully", "path": path}
+            return {"message": f"File '{path}' saved successfully", "path": path,
+                    "commit": commit}
+        except HTTPException:
+            raise
         except InvalidPathError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
@@ -270,12 +317,18 @@ def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> Fas
             raise HTTPException(status_code=500, detail="Internal server error")
 
     @app.delete("/api/content/{path:path}")
-    async def delete_content(path: str):
+    async def delete_content(path: str,
+                             commit_message: str | None = None, author: str | None = None):
         """Delete content file."""
         try:
-            filesystem.delete_file(path)
+            async with _write_guard():
+                filesystem.delete_file(path)
+                commit = await _after_write([path], commit_message, author, f"Delete {path}")
             emit(CONTENT_DELETED, path)
-            return {"message": f"File '{path}' deleted successfully", "path": path}
+            return {"message": f"File '{path}' deleted successfully", "path": path,
+                    "commit": commit}
+        except HTTPException:
+            raise
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="File not found")
         except InvalidPathError as e:
@@ -285,16 +338,25 @@ def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> Fas
             raise HTTPException(status_code=500, detail="Internal server error")
 
     @app.patch("/api/content/{path:path}")
-    async def move_content(path: str, data: ContentMove):
+    async def move_content(path: str, data: ContentMove,
+                           commit_message: str | None = None, author: str | None = None):
         """Move or rename a content file."""
         try:
-            filesystem.move_file(path, data.destination)
+            async with _write_guard():
+                filesystem.move_file(path, data.destination)
+                commit = await _after_write(
+                    [path, data.destination], commit_message, author,
+                    f"Move {path} -> {data.destination}",
+                )
             emit(CONTENT_MOVED, data.destination, source_path=path)
             return {
                 "message": f"File moved from '{path}' to '{data.destination}'",
                 "source": path,
                 "destination": data.destination,
+                "commit": commit,
             }
+        except HTTPException:
+            raise
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Source file not found")
         except FileSystemError as e:

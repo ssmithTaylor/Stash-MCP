@@ -1,5 +1,6 @@
 """Tests for UI routes."""
 
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from stash_mcp.api import create_api
 from stash_mcp.filesystem import FileSystem
+from stash_mcp.transactions import TransactionManager
 from stash_mcp.ui import create_ui_router
 
 
@@ -1215,3 +1217,55 @@ class TestUIReadOnly:
         response = ro_client.get("/ui/browse/hello.md")
         assert response.status_code == 200
         assert "Hello World" in response.text
+
+
+# --- UI autocommit / write-lock tests ---
+
+
+class TestUIAutocommit:
+    def _client(self, tmpdir: Path):
+        from stash_mcp.git_backend import GitBackend
+
+        subprocess.run(["git", "init", str(tmpdir)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(tmpdir), "config", "user.email", "t@example.com"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(tmpdir), "config", "user.name", "T"],
+            check=True, capture_output=True,
+        )
+        (tmpdir / "seed.md").write_text("seed")
+        subprocess.run(["git", "-C", str(tmpdir), "add", "."], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(tmpdir), "commit", "-q", "-m", "init"],
+            check=True, capture_output=True,
+        )
+        fs = FileSystem(tmpdir)
+        tm = TransactionManager(
+            fs, GitBackend(tmpdir), autocommit=True, author_default="UI <ui@x>"
+        )
+        app = create_api(fs, transaction_manager=tm)
+        app.include_router(create_ui_router(fs, transaction_manager=tm))
+        return TestClient(app)
+
+    def _last(self, tmpdir: Path) -> str:
+        return subprocess.run(
+            ["git", "-C", str(tmpdir), "show", "--name-only", "--format=%s", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout
+
+    def test_save_move_delete_commit(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            client = self._client(path)
+            r = client.post(
+                "/ui/save", data={"path": "n.md", "content": "new"}, follow_redirects=False
+            )
+            assert r.status_code == 303 and "UI: save n.md" in self._last(path)
+            r = client.post(
+                "/ui/move/n.md", data={"destination": "m.md"}, follow_redirects=False
+            )
+            assert r.status_code == 303 and "UI: move n.md -> m.md" in self._last(path)
+            r = client.post("/ui/delete/m.md", follow_redirects=False)
+            assert r.status_code == 303 and "UI: delete m.md" in self._last(path)

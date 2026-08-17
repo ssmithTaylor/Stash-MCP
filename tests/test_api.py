@@ -1,5 +1,6 @@
 """Tests for REST API."""
 
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from stash_mcp.api import create_api
 from stash_mcp.events import _listeners, add_listener
 from stash_mcp.filesystem import FileSystem
+from stash_mcp.transactions import TransactionManager
 
 
 @pytest.fixture
@@ -370,3 +372,110 @@ def test_event_emitted_on_patch_move(test_client, event_listener):
     assert args[0] == "content_moved"
     assert args[1] == "moved.md"
     assert kwargs.get("source_path") == "test.md"
+
+
+# --- REST autocommit / write-lock tests ---
+
+
+def _init_git_repo(path: Path) -> None:
+    subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "t@example.com"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "T"],
+                   check=True, capture_output=True)
+    (path / "seed.md").write_text("seed")
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "init"],
+                   check=True, capture_output=True)
+
+
+class TestRestAutocommit:
+    def _client(self, tmpdir: Path):
+        from stash_mcp.git_backend import GitBackend
+
+        _init_git_repo(tmpdir)
+        fs = FileSystem(tmpdir)
+        git = GitBackend(tmpdir)
+        tm = TransactionManager(fs, git, autocommit=True, author_default="Bot <bot@x>")
+        return TestClient(create_api(fs, transaction_manager=tm))
+
+    def _last_commit(self, tmpdir: Path) -> str:
+        return subprocess.run(
+            ["git", "-C", str(tmpdir), "show", "--name-only", "--format=%s%n%an", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout
+
+    def test_post_put_patch_delete_commit(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            client = self._client(path)
+            r = client.post("/api/content/a.md", json={"content": "A"},
+                            params={"commit_message": "made a", "author": "Me <me@x>"})
+            assert r.status_code == 201 and r.json()["commit"]
+            assert "made a" in self._last_commit(path) and "Me" in self._last_commit(path)
+
+            r = client.put("/api/content/a.md", json={"content": "A2"})
+            assert r.status_code == 200 and r.json()["commit"]
+            assert "Update a.md" in self._last_commit(path)
+
+            r = client.patch("/api/content/a.md", json={"destination": "b.md"})
+            assert r.status_code == 200 and r.json()["commit"]
+            assert "Move a.md -> b.md" in self._last_commit(path)
+
+            r = client.delete("/api/content/b.md")
+            assert r.status_code == 200 and r.json()["commit"]
+            assert "Delete b.md" in self._last_commit(path)
+
+    def test_put_without_change_has_null_commit(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            client = self._client(path)
+            r = client.put("/api/content/seed.md", json={"content": "seed"})
+            assert r.status_code == 200 and r.json()["commit"] is None
+
+    def test_no_manager_keeps_old_shape(self):
+        with TemporaryDirectory() as tmp:
+            client = TestClient(create_api(FileSystem(Path(tmp))))
+            r = client.post("/api/content/x.md", json={"content": "x"})
+            assert r.status_code == 201 and r.json().get("commit") is None
+
+    def test_rest_commits_even_with_autocommit_off(self):
+        """REST callers pass session_id=None, so they skip the transaction gate
+        and commit immediately even in the default STASH_GIT_AUTOCOMMIT=false
+        deployment. That is a real behavior change for existing
+        tracking=true/autocommit=false servers — whose REST writes used to
+        leave the working tree dirty — so it is pinned here rather than only
+        at manager level."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            _init_git_repo(path)
+            fs = FileSystem(path)
+            tm = TransactionManager(
+                fs, GitBackend(path), autocommit=False, author_default="Bot <bot@x>"
+            )
+            client = TestClient(create_api(fs, transaction_manager=tm))
+
+            r = client.post("/api/content/gated.md", json={"content": "G"})
+            assert r.status_code == 201 and r.json()["commit"]
+            assert "Create gated.md" in self._last_commit(path)
+
+            r = client.put("/api/content/gated.md", json={"content": "G2"})
+            assert r.status_code == 200 and r.json()["commit"]
+            assert "Update gated.md" in self._last_commit(path)
+
+            assert tm.open_transaction_count == 0        # no transaction was involved
+            assert not tm.git.has_staged_changes()       # index invariant holds
+
+    def test_rest_rejects_a_malformed_author(self):
+        """`author` is an unauthenticated query parameter; a bare name would
+        make `git commit --author` exit 128 after the file is already on disk."""
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            client = self._client(path)
+            r = client.post("/api/content/bad.md", json={"content": "B"},
+                            params={"author": "doc-writer"})
+            assert r.status_code == 500
+            assert "Invalid author" in r.json()["detail"]
+            assert "bad.md" not in self._last_commit(path)

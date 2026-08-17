@@ -31,7 +31,7 @@
 - **MCP native** — Content is exposed as MCP resources (read path) and MCP tools (write path), so agents can both consume and update documentation
 - **Rich rendering** — Markdown with Mermaid diagrams, syntax-highlighted code, and a built-in OpenAPI viewer for `.json` specs
 - **Semantic search** *(opt-in)* — Vector-based search across all stashed content, with pluggable embedding providers
-- **Git tracking** *(opt-in)* — File history, diffs, and blame are exposed as MCP tools; writes are gated behind atomic git-committed transactions
+- **Git tracking** *(opt-in)* — File history, diffs, and blame are exposed as MCP tools; writes are gated behind atomic, git-committed transactions by default
 - **Read-only mode** — Serve reference docs to agents without allowing any modifications
 - **Simple deployment** — Single Docker container with a volume mount. No external dependencies
 
@@ -262,7 +262,7 @@ What it enables:
 
 - Three additional MCP tools: `log_content`, `diff_content`, and `blame_content`
 - Search results enriched with `last_changed_at`, `changed_by`, and `commit_message`
-- All writes (when `STASH_READ_ONLY=false`) are automatically committed to the local git repo and gated behind transactions (see [Transactions](#transactions))
+- Writes (when `STASH_READ_ONLY=false`) are automatically committed to the local git repo — gated behind transactions by default, or immediately per-write when `STASH_GIT_AUTOCOMMIT=true` (see [Transactions](#transactions))
 
 ```yaml
 environment:
@@ -300,27 +300,30 @@ environment:
 
 ### Transactions
 
-When `STASH_GIT_TRACKING=true` and `STASH_READ_ONLY=false`, all writes are gated behind transactions. A batch of related changes is committed to git as a single atomic unit.
+When `STASH_GIT_TRACKING=true` and `STASH_READ_ONLY=false`, writes are gated behind transactions by default: an agent must open one before it can write, and a batch of related changes lands in git as a single, path-scoped commit. Set `STASH_GIT_AUTOCOMMIT=true` to commit every write immediately instead and make transactions optional. The gate applies to MCP writes only: REST (`/api/content/...`) and web-UI writes take the write lock but are never transaction-gated, so they commit immediately regardless of `STASH_GIT_AUTOCOMMIT`.
 
 Workflow:
 
-1. Call `start_content_transaction` — acquires an exclusive write lock and returns a transaction ID
-2. Perform any number of write calls (`create_content`, `overwrite_content`, `edit_content`, `edit_content_batch`, `delete_content`, `move_content`, `move_content_directory`, `move_content_batch`) — all changes are staged
-3. Call `commit_content_transaction` with a commit message — commits all staged changes to git and releases the lock
-4. If something goes wrong, call `abort_content_transaction` — rolls back all staged changes and releases the lock
+1. Call `start_content_transaction` — returns a transaction ID immediately; it never waits on the write lock
+2. Perform any number of write calls (`create_content`, `overwrite_content`, `edit_content`, `edit_content_batch`, `delete_content`, `move_content`, `move_content_directory`, `move_content_batch`) — each write lands on disk right away and is recorded as part of the transaction; committing to git is deferred to step 3
+3. Call `commit_content_transaction` with a commit message — stages and commits only the files this transaction touched, then releases the write lock
+4. If something goes wrong, call `abort_content_transaction` — restores only the files this transaction touched to their last-committed state, then releases the write lock
 
-**Concurrency.** Only one transaction can be active at a time. A second agent attempting `start_content_transaction` waits up to `STASH_TRANSACTION_LOCK_WAIT` seconds for the lock. If the active transaction is not committed or aborted within `STASH_TRANSACTION_TIMEOUT` seconds, it is automatically aborted.
+**Concurrency.** Transactions are per-session and non-exclusive: each MCP session may have at most one open transaction, but any number of sessions may each hold one at the same time — one session's open transaction never blocks another session from opening its own or from writing. The write lock is short: it's held only for the duration of a single write or a single commit/abort, never for a transaction's whole lifetime, and `start_content_transaction` never waits on it. A write only queues for the lock (up to `STASH_TRANSACTION_LOCK_WAIT` seconds, then fails with "server busy") if another write or commit/abort is in progress at that exact instant. If a transaction sits idle for `STASH_TRANSACTION_TIMEOUT` seconds — no writes, no commit, no abort — it is automatically aborted.
 
 ### Mode matrix
 
-| `STASH_READ_ONLY` | `STASH_GIT_TRACKING` | `STASH_GIT_SYNC_ENABLED` | Behavior |
-|---|---|---|---|
-| `false` | `false` | — | Default: writes go directly to disk, no git |
-| `true`  | `false` | — | Read-only: no write tools registered |
-| `false` | `true`  | `false` | Writes committed to local git via transactions |
-| `true`  | `true`  | `false` | Read-only + git history/blame tools available |
-| `false` | `true`  | `true`  | Writes committed to git + periodic pulls from remote |
-| `true`  | `true`  | `true`  | Read-only + git history/blame + auto-sync from remote |
+| `STASH_READ_ONLY` | `STASH_GIT_TRACKING` | `STASH_GIT_AUTOCOMMIT` | `STASH_GIT_SYNC_ENABLED` | Behavior |
+|---|---|---|---|---|
+| `false` | `false` | — | — | Default: writes go directly to disk, no git |
+| `true`  | `false` | — | — | Read-only: no write tools registered |
+| `false` | `true`  | `false` | `false` | MCP writes gated behind transactions; REST/UI writes commit immediately |
+| `false` | `true`  | `true`  | `false` | Every write commits immediately; transactions optional, for grouping |
+| `true`  | `true`  | — | `false` | Read-only + git history/blame tools available |
+| `false` | `true`  | either | `true`  | As the matching row above, plus periodic pulls from the remote and a push whenever the branch is ahead |
+| `true`  | `true`  | — | `true`  | Read-only + git history/blame + auto-sync from remote |
+
+`STASH_GIT_AUTOCOMMIT=true` without `STASH_GIT_TRACKING=true` is ignored with a warning; it never fails startup.
 
 ### Docker Compose examples
 
@@ -431,8 +434,9 @@ What is collected:
 | `STASH_GIT_SYNC_RECURSIVE` | `false` | Include submodule updates on pull |
 | `STASH_GIT_SYNC_TOKEN` | — | HTTPS token for git authentication |
 | `STASH_GIT_AUTHOR_DEFAULT` | `stash-mcp <stash@local>` | Fallback committer/author identity |
+| `STASH_GIT_AUTOCOMMIT` | `false` | With git tracking: commit every write outside a transaction immediately (per-write `commit_message`/`author`); transactions become optional grouping. `false` keeps the transaction gate |
 | `STASH_TRANSACTION_TIMEOUT` | `300` | Seconds before an active transaction is auto-aborted |
-| `STASH_TRANSACTION_LOCK_WAIT` | `120` | Seconds a queued agent waits for the transaction lock |
+| `STASH_TRANSACTION_LOCK_WAIT` | `120` | Seconds a write waits for the write lock before failing with "server busy" |
 | `STASH_SEARCH_ENABLED` | `false` | Enable semantic search |
 | `STASH_SEARCH_INDEX_DIR` | `/data/.stash-index` | Search index directory |
 | `STASH_SEARCH_EMBEDDER_MODEL` | `sentence-transformers:all-MiniLM-L6-v2` | Pydantic AI embedder model |

@@ -1,6 +1,7 @@
 """Tests for TransactionManager and git backend transaction methods."""
 
 import asyncio
+import json
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,32 +12,35 @@ import pytest
 from stash_mcp.filesystem import FileSystem
 from stash_mcp.transactions import TransactionError, TransactionManager
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
+def _git_setup(*args: str) -> None:
+    """Run a git setup command, surfacing git's own stderr when it fails.
+
+    ``check=True`` alone raises a CalledProcessError that reports only a
+    return code, which makes a one-off setup failure (e.g. ``git commit``
+    exiting 128) impossible to root-cause from CI output.
+    """
+    try:
+        subprocess.run(list(args), check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"Test git setup failed ({' '.join(args)}): exit {exc.returncode}\n"
+            f"stdout: {exc.stdout}\nstderr: {exc.stderr}"
+        ) from exc
+
+
 def _init_repo(path: Path) -> None:
     """Initialise a bare git repo at *path* with a single commit."""
-    subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(path), "config", "user.email", "test@example.com"],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(path), "config", "user.name", "Test User"],
-        check=True,
-        capture_output=True,
-    )
+    _git_setup("git", "init", str(path))
+    _git_setup("git", "-C", str(path), "config", "user.email", "test@example.com")
+    _git_setup("git", "-C", str(path), "config", "user.name", "Test User")
     (path / "README.md").write_text("# Test\n")
-    subprocess.run(["git", "-C", str(path), "add", "."], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(path), "commit", "-m", "Initial commit"],
-        check=True,
-        capture_output=True,
-    )
+    _git_setup("git", "-C", str(path), "add", ".")
+    _git_setup("git", "-C", str(path), "commit", "-m", "Initial commit")
 
 
 def _make_tm(tmpdir: Path) -> tuple[TransactionManager, FileSystem]:
@@ -119,6 +123,295 @@ class TestGitBackendNewMethods:
             git = GitBackend(path)
             with pytest.raises(RuntimeError, match="git push failed"):
                 git.push("nonexistent-remote", "main")
+
+    def _log(self, path: Path, *fmt: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), "log", *fmt], capture_output=True, text=True,
+        ).stdout
+
+    def test_commit_paths_commits_only_the_given_paths(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "a.md").write_text("A")
+            (path / "b.md").write_text("B")           # dirty but not part of the commit
+            short = git.commit_paths(["a.md"], "Add a", author="Agent A <a@example.com>")
+            assert short and len(short) >= 7
+            names = subprocess.run(
+                ["git", "-C", tmpdir, "show", "--name-only", "--format=%an", "HEAD"],
+                capture_output=True, text=True,
+            ).stdout
+            assert "Agent A" in names and "a.md" in names and "b.md" not in names
+            status = subprocess.run(
+                ["git", "-C", tmpdir, "status", "--porcelain"], capture_output=True, text=True,
+            ).stdout
+            assert "?? b.md" in status                # b.md still untracked, not staged
+            assert not git.has_staged_changes()
+
+    def test_commit_paths_records_deletion_and_move(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "old.md").write_text("x")
+            git.commit_paths(["old.md"], "Add old")
+            (path / "old.md").rename(path / "new.md")
+            assert git.commit_paths(["old.md", "new.md"], "Move old -> new")
+            (path / "new.md").unlink()
+            assert git.commit_paths(["new.md"], "Delete new")
+            assert "Delete new" in self._log(path, "--oneline")
+            tracked = subprocess.run(
+                ["git", "-C", tmpdir, "ls-files"], capture_output=True, text=True,
+            ).stdout.split()
+            assert "new.md" not in tracked and "old.md" not in tracked
+
+    def test_commit_paths_noop_when_nothing_changed_or_path_unknown(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            assert git.commit_paths(["README.md"], "no change") is None
+            assert git.commit_paths(["never-existed.md"], "ghost") is None
+            assert git.commit_paths([], "empty") is None
+
+    def test_commit_paths_does_not_sweep_in_unrelated_staged_changes(self):
+        """Regression test: ``git commit`` with no trailing pathspec commits the
+        *entire* index, not just the paths this call just staged. A concurrent
+        writer's own staged-but-uncommitted path must survive untouched."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "a.md").write_text("A")
+            (path / "other.md").write_text("OTHER")
+            # Simulate a second, concurrent session that staged its own change
+            # but hasn't committed yet.
+            subprocess.run(
+                ["git", "-C", tmpdir, "add", "other.md"], check=True, capture_output=True,
+            )
+            short = git.commit_paths(["a.md"], "Add a")
+            assert short
+            names = subprocess.run(
+                ["git", "-C", tmpdir, "show", "--name-only", "--format=", "HEAD"],
+                capture_output=True, text=True,
+            ).stdout
+            assert "a.md" in names and "other.md" not in names
+            assert git.has_staged_changes(["other.md"])      # untouched: still staged
+            assert not git.has_staged_changes(["a.md"])       # committed: index clean
+
+    def test_commit_paths_unstages_on_commit_failure(self):
+        """A malformed --author makes ``git commit`` fail deterministically;
+        the index invariant requires the just-staged paths to be unstaged."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "b.md").write_text("B")
+            with pytest.raises(RuntimeError, match="git commit failed"):
+                git.commit_paths(["b.md"], "msg", author="not a valid author")
+            assert not git.has_staged_changes(["b.md"])
+
+    def test_restore_paths_checks_out_tracked_and_deletes_untracked(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "README.md").write_text("corrupted")
+            (path / "brand-new.md").write_text("temp")
+            (path / "other.md").write_text("keep me")   # not part of the restore
+            restored, deleted = git.restore_paths(["README.md", "brand-new.md"])
+            assert restored == ["README.md"] and deleted == ["brand-new.md"]
+            assert (path / "README.md").read_text() == "# Test\n"
+            assert not (path / "brand-new.md").exists()
+            assert (path / "other.md").read_text() == "keep me"
+
+    def test_restore_paths_recreates_deleted_tracked_file(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "README.md").unlink()
+            restored, deleted = git.restore_paths(["README.md"])
+            assert restored == ["README.md"] and deleted == []
+            assert (path / "README.md").exists()
+
+    def test_restore_paths_raises_on_checkout_failure(self):
+        """Pre-creating an empty ``.git/index.lock`` makes the underlying
+        ``git checkout`` fail deterministically (exit 128, "Unable to create
+        ... index.lock: File exists") with no second process and no repo
+        corruption — the same class of clean trigger as a malformed
+        --author. The lock is removed in ``finally`` so a failing assertion
+        can't leave it behind and break the temp repo's teardown."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "README.md").write_text("corrupted")
+            lock = path / ".git" / "index.lock"
+            lock.write_text("")
+            try:
+                with pytest.raises(RuntimeError, match="git checkout failed"):
+                    git.restore_paths(["README.md"])
+            finally:
+                lock.unlink(missing_ok=True)
+            # Repo is fully functional again once the lock is gone — no
+            # corruption from the failed attempt.
+            restored, deleted = git.restore_paths(["README.md"])
+            assert restored == ["README.md"] and deleted == []
+            assert (path / "README.md").read_text() == "# Test\n"
+
+    def test_unstage_and_has_staged_changes(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "s.md").write_text("s")
+            subprocess.run(["git", "-C", tmpdir, "add", "s.md"], check=True, capture_output=True)
+            assert git.has_staged_changes()
+            git.unstage()
+            assert not git.has_staged_changes()
+            assert (path / "s.md").exists()      # worktree untouched
+
+    def test_degenerate_paths_are_a_noop_not_whole_index(self):
+        """A non-empty ``paths`` that normalizes to nothing (e.g. ``["/"]``)
+        must be a no-op for has_staged_changes/unstage — it must never
+        silently widen to the whole index, which is reserved for
+        paths=None."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            (path / "x.md").write_text("x")
+            subprocess.run(["git", "-C", tmpdir, "add", "x.md"], check=True, capture_output=True)
+
+            assert not git.has_staged_changes(["/"])
+            assert not git.has_staged_changes([""])
+            git.unstage(["/"])
+            assert git.has_staged_changes()           # x.md still staged: no-op confirmed
+            assert git.has_staged_changes(["x.md"])
+
+            # paths=None keeps its documented whole-index meaning.
+            git.unstage()
+            assert not git.has_staged_changes()
+
+    def test_ahead_count_without_remote_is_zero(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            assert GitBackend(path).ahead_count("origin", "main") == 0
+
+    def test_merge_in_progress_is_false_on_a_clean_repo(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            assert GitBackend(path).merge_in_progress() is False
+
+    def test_merge_in_progress_detects_a_conflicted_merge(self):
+        """A pull that conflicts leaves MERGE_HEAD behind, and from then on
+        every `git commit -- <pathspec>` fails with 'cannot do a partial
+        commit during a merge'."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path)
+            base = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "HEAD"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            # Two branches that both rewrite README.md -> guaranteed conflict.
+            (path / "README.md").write_text("# ours\n")
+            _git_setup("git", "-C", str(path), "commit", "-qam", "ours")
+            _git_setup("git", "-C", str(path), "checkout", "-q", "-b", "theirs", base)
+            (path / "README.md").write_text("# theirs\n")
+            _git_setup("git", "-C", str(path), "commit", "-qam", "theirs")
+            _git_setup("git", "-C", str(path), "checkout", "-q", "-")
+            merge = subprocess.run(
+                ["git", "-C", str(path), "merge", "theirs"], capture_output=True, text=True
+            )
+            assert merge.returncode != 0                   # the merge really conflicted
+            assert git.merge_in_progress() is True
+            (path / "other.md").write_text("unrelated")
+            with pytest.raises(RuntimeError, match="git commit failed"):
+                git.commit_paths(["other.md"], "should not be possible mid-merge")
+
+    def test_push_timeout_becomes_a_runtime_error(self):
+        """A blackholed remote must not hang forever under the write lock, and
+        the TimeoutExpired must not escape as a type callers do not handle."""
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path, network_timeout=7.0)
+            seen: list[dict] = []
+
+            def fake_run(args, **kwargs):
+                seen.append(kwargs)
+                raise subprocess.TimeoutExpired(cmd=args, timeout=7.0)
+
+            with patch.object(git, "_run", side_effect=fake_run):
+                with pytest.raises(RuntimeError, match="git push timed out after 7s"):
+                    git.push("origin", "main")
+            assert seen and seen[0]["timeout"] == 7.0       # the bound was actually passed
+
+    def test_pull_timeout_is_a_failed_pull_result(self):
+        from stash_mcp.git_backend import GitBackend
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            _init_repo(path)
+            git = GitBackend(path, network_timeout=7.0)
+            real_run = git._run
+            seen: list[dict] = []
+
+            def fake_run(args, **kwargs):
+                if args[:2] == ["git", "pull"]:
+                    seen.append(kwargs)
+                    raise subprocess.TimeoutExpired(cmd=args, timeout=7.0)
+                return real_run(args, **kwargs)
+
+            with patch.object(git, "_run", side_effect=fake_run):
+                result = git.pull("origin", "main")
+            assert result.success is False and "timed out" in result.message
+            assert seen and seen[0]["timeout"] == 7.0
+
+    def test_is_valid_author_requires_the_name_and_email_shape(self):
+        from stash_mcp.git_backend import is_valid_author
+
+        assert is_valid_author("doc-writer <dw@agents>")
+        assert is_valid_author("Bot  <bot@example.com>  ")
+        assert is_valid_author("A B <>")                    # git accepts an empty email
+        assert not is_valid_author("doc-writer")            # the plausible agent mistake
+        assert not is_valid_author("not a valid author")
+        assert not is_valid_author("<only@email>")
+        assert not is_valid_author("")
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +517,21 @@ class TestTransactionManagerWriteGating:
             tm, fs = _make_tm(Path(tmpdir))
             assert tm.file_exists("README.md")
 
+    def test_wrapper_write_in_autocommit_mode_names_the_misconfiguration(self):
+        """The delegated write methods always demand a transaction, so
+        installing this wrapper as the filesystem in autocommit mode would
+        make every MCP write fail. The invariant lives here, next to the code
+        that depends on it, and must say what is actually wrong."""
+        with TemporaryDirectory() as tmpdir:
+            from stash_mcp.git_backend import GitBackend
+
+            path = Path(tmpdir)
+            _init_repo(path)
+            tm = TransactionManager(FileSystem(path), GitBackend(path), autocommit=True)
+            with pytest.raises(TransactionError, match="autocommit") as exc_info:
+                tm.write_file("test.txt", "content")
+            assert "No active transaction" not in str(exc_info.value)
+
 
 # ---------------------------------------------------------------------------
 # TransactionManager — lifecycle
@@ -316,16 +624,16 @@ class TestTransactionManagerLifecycle:
             await tm.abort_transaction("session-1")
 
     @pytest.mark.asyncio
-    async def test_second_session_waits_for_lock(self):
+    async def test_second_session_opens_concurrently(self):
         with TemporaryDirectory() as tmpdir:
             tm, _ = _make_tm(Path(tmpdir))
-            await tm.start_transaction("session-1", timeout=30, lock_wait=5)
-
-            # Session 2 should time out because session 1 holds the lock
-            with pytest.raises(TransactionError, match="unavailable"):
-                await tm.start_transaction("session-2", timeout=30, lock_wait=0.1)
-
+            a = await tm.start_transaction("session-1", timeout=30, lock_wait=5)
+            b = await tm.start_transaction("session-2", timeout=30, lock_wait=0.1)
+            assert a != b
+            assert tm.open_transaction_count == 2
             await tm.abort_transaction("session-1")
+            await tm.abort_transaction("session-2")
+            assert tm.open_transaction_count == 0
 
     @pytest.mark.asyncio
     async def test_end_by_wrong_session_raises(self):
@@ -364,19 +672,48 @@ class TestTransactionManagerTimeout:
             await asyncio.sleep(0.5)
             assert (path / "README.md").read_text() == original
             assert not tm._lock.locked()
-            assert tm._active_id is None
+            assert tm.open_transaction_count == 0
 
     @pytest.mark.asyncio
-    async def test_second_session_acquires_lock_after_timeout(self):
+    async def test_timeout_reverts_writes_and_frees_the_session(self):
+        """After the idle timeout the transaction is gone, its writes are
+        reverted and it leaves nothing staged, so the same session can open a
+        fresh one."""
         with TemporaryDirectory() as tmpdir:
-            tm, _ = _make_tm(Path(tmpdir))
+            path = Path(tmpdir)
+            tm, _ = _make_tm(path)
             await tm.start_transaction("session-1", timeout=0.1, lock_wait=5)
+            tm.write_file("scratch.md", "in flight")
             # Wait for auto-abort
             await asyncio.sleep(0.5)
-            # Session 2 should now be able to acquire
-            txn_id = await tm.start_transaction("session-2", timeout=30, lock_wait=5)
+            assert tm.open_transaction_count == 0
+            assert not (path / "scratch.md").exists()
+            assert not tm.git.has_staged_changes()
+            txn_id = await tm.start_transaction("session-1", timeout=0, lock_wait=5)
             assert txn_id is not None
-            await tm.abort_transaction("session-2")
+            await tm.abort_transaction("session-1")
+
+    @pytest.mark.asyncio
+    async def test_auto_abort_rearms_its_timer_when_the_lock_is_unavailable(self):
+        """The timeout task *is* the current task, so _cancel_timeout skips it
+        and nothing else re-arms it. An auto-abort that cannot take the write
+        lock must therefore re-arm itself, or the transaction stays open
+        forever — keeping periodic git pulls paused with it."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            tm.lock_wait = 0.05
+            await tm.start_transaction("s1", timeout=0.1)
+            txn = tm._txns["s1"]
+            await tm.write_lock.acquire()          # auto-abort cannot get in
+            try:
+                await asyncio.sleep(0.4)           # first attempt fails
+                assert tm.open_transaction_count == 1
+                assert txn.timeout_task is not None and not txn.timeout_task.done()
+            finally:
+                tm.write_lock.release()
+            await asyncio.sleep(0.5)               # the re-armed timer succeeds
+            assert tm.open_transaction_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +766,40 @@ class TestTransactionManagerSyncCallbacks:
             await tm.start_transaction("session-1", timeout=0.1, lock_wait=5)
             await asyncio.sleep(0.5)
             resume.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_fires_once_when_the_same_transaction_closes_twice(self):
+        """``_close`` must only resume sync on the path that actually removed
+        the transaction; a racing double-close would otherwise resume twice."""
+        with TemporaryDirectory() as tmpdir:
+            tm, _ = _make_tm(Path(tmpdir))
+            pause = MagicMock()
+            resume = MagicMock()
+            tm.set_sync_callbacks(pause, resume)
+            await tm.start_transaction("session-1", timeout=0)
+            txn = tm._txns["session-1"]
+            await tm.abort_transaction("session-1")   # closes it for real
+            resume.assert_called_once()
+            tm._close(txn)                            # a racing path closes it again
+            resume.assert_called_once()               # still exactly once
+
+    @pytest.mark.asyncio
+    async def test_raising_sync_callback_cannot_strand_the_write_lock(self):
+        """Sync callbacks come from the host app. ``resume`` runs inside the
+        ``finally`` that releases the write lock, so a raising one must not
+        take writes down server-wide."""
+        with TemporaryDirectory() as tmpdir:
+            tm, _ = _make_tm(Path(tmpdir))
+
+            def boom():
+                raise RuntimeError("sync callback exploded")
+
+            tm.set_sync_callbacks(pause=boom, resume=boom)
+            await tm.start_transaction("session-1", timeout=0)   # pause raises
+            assert tm.open_transaction_count == 1
+            await tm.abort_transaction("session-1")              # resume raises
+            assert tm.open_transaction_count == 0
+            assert not tm.write_lock.locked()
 
 
 # ---------------------------------------------------------------------------
@@ -536,8 +907,8 @@ class TestMCPTransactionTools:
                 from fastmcp.server.context import _current_context
 
                 _current_context.reset(token)
-                if tm._active_session is not None:
-                    await tm.abort_transaction(tm._active_session)
+                for sid in list(tm._txns):
+                    await tm.abort_transaction(sid)
 
     @pytest.mark.asyncio
     async def test_write_blocked_without_transaction(self):
@@ -570,8 +941,8 @@ class TestMCPTransactionTools:
                 from fastmcp.server.context import _current_context
 
                 _current_context.reset(token)
-                if tm._active_session is not None:
-                    await tm.abort_transaction(tm._active_session)
+                for sid in list(tm._txns):
+                    await tm.abort_transaction(sid)
 
     @pytest.mark.asyncio
     async def test_abort_resets_changes(self):
@@ -788,8 +1159,8 @@ class TestListContentTransactionsTool:
             finally:
                 from fastmcp.server.context import _current_context
                 _current_context.reset(token)
-                if tm._active_session is not None:
-                    await tm.abort_transaction(tm._active_session)
+                for sid in list(tm._txns):
+                    await tm.abort_transaction(sid)
 
     @pytest.mark.asyncio
     async def test_not_registered_when_read_only(self):
@@ -804,3 +1175,778 @@ class TestListContentTransactionsTool:
                 mcp = create_mcp_server(fs, git_backend=git)
             tool_names = set((await mcp.get_tools()).keys())
             assert "list_content_transactions" not in tool_names
+
+
+# ---------------------------------------------------------------------------
+# TransactionManager — write lock, path-scoped commit/abort, autocommit
+# ---------------------------------------------------------------------------
+
+
+def _git_log(path: Path, *fmt: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(path), "log", *fmt], capture_output=True, text=True,
+    ).stdout
+
+
+def _show_names(path: Path, ref: str = "HEAD") -> str:
+    return subprocess.run(
+        ["git", "-C", str(path), "show", "--name-only", "--format=%s%n%an", ref],
+        capture_output=True, text=True,
+    ).stdout
+
+
+class TestPathScopedTransactions:
+    @pytest.mark.asyncio
+    async def test_concurrent_transactions_commit_only_their_own_files(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=30)
+            await tm.start_transaction("s2", timeout=30)
+            async with tm.guard("s1"):
+                fs.write_file("one.md", "1")
+                await tm.after_write(["one.md"], session_id="s1", message="wrote one")
+            async with tm.guard("s2"):
+                fs.write_file("two.md", "2")
+                await tm.after_write(["two.md"], session_id="s2")
+            h1 = await tm.end_transaction("s1", "Txn one")
+            assert h1
+            shown = _show_names(path)
+            assert "one.md" in shown and "two.md" not in shown
+            assert "- wrote one" in _git_log(path, "-1", "--format=%b")
+            assert (path / "two.md").exists()           # untouched, still uncommitted
+            h2 = await tm.end_transaction("s2", "Txn two")
+            assert h2 and "two.md" in _show_names(path)
+            assert tm.open_transaction_count == 0
+
+    @pytest.mark.asyncio
+    async def test_abort_restores_only_own_paths(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=30)
+            await tm.start_transaction("s2", timeout=30)
+            async with tm.guard("s1"):
+                fs.write_file("README.md", "corrupted")
+                fs.write_file("created.md", "new")
+                await tm.after_write(["README.md", "created.md"], session_id="s1")
+            async with tm.guard("s2"):
+                fs.write_file("other.md", "keep")
+                await tm.after_write(["other.md"], session_id="s2")
+            await tm.abort_transaction("s1")
+            assert (path / "README.md").read_text() == "# Test\n"
+            assert not (path / "created.md").exists()
+            assert (path / "other.md").read_text() == "keep"
+            await tm.abort_transaction("s2")
+
+    @pytest.mark.asyncio
+    async def test_abort_leaves_nothing_staged(self):
+        """Abort must clear the index entries of the paths it reverts.
+
+        ``restore_paths`` deletes a file that is absent from HEAD but leaves
+        its staged addition behind (``AD`` in ``git status``), so aborting a
+        transaction that created a brand-new file would otherwise violate the
+        "nothing stays staged between operations" invariant. The explicit
+        ``git add`` reproduces exactly that half-staged state.
+        """
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=30)
+            async with tm.guard("s1"):
+                fs.write_file("created.md", "new")
+                await tm.after_write(["created.md"], session_id="s1")
+            subprocess.run(
+                ["git", "-C", str(path), "add", "created.md"],
+                check=True, capture_output=True,
+            )
+            assert tm.git.has_staged_changes(["created.md"])
+            await tm.abort_transaction("s1")
+            assert not (path / "created.md").exists()
+            assert not tm.git.has_staged_changes()
+
+    @pytest.mark.asyncio
+    async def test_guard_rechecks_the_gate_after_waiting_for_the_lock(self):
+        """A transaction that closes while its session is queued on the write
+        lock must not let the queued write through ungated.
+
+        ``_txns`` is cleared directly because ``abort_transaction`` needs the
+        very lock this test is holding to create the queue.
+        """
+        with TemporaryDirectory() as tmpdir:
+            tm, _ = _make_tm(Path(tmpdir))
+            await tm.start_transaction("s1", timeout=0)      # no idle timer
+            await tm.write_lock.acquire()                    # force s1 to queue
+
+            async def queued_write():
+                async with tm.guard("s1"):
+                    pass
+
+            task = asyncio.create_task(queued_write())
+            await asyncio.sleep(0.05)                        # task is now waiting
+            tm._txns.clear()                                 # its txn ends meanwhile
+            tm.write_lock.release()
+            with pytest.raises(TransactionError, match="No active transaction"):
+                await task
+            assert not tm.write_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_abort_is_a_noop_once_its_transaction_was_replaced(self):
+        """A timeout timer that fires late must not revert paths belonging to
+        whatever transaction replaced the one it was armed for."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=0)
+            stale = tm._txns["s1"]
+            async with tm.guard("s1"):
+                fs.write_file("keep.md", "v1")
+                await tm.after_write(["keep.md"], session_id="s1")
+            await tm.end_transaction("s1", "Committed v1")
+            await tm.start_transaction("s1", timeout=0)      # a fresh transaction
+            async with tm.guard("s1"):
+                fs.write_file("keep.md", "v2")
+                await tm.after_write(["keep.md"], session_id="s1")
+            await tm._abort(stale)                           # the late timer fires
+            assert (path / "keep.md").read_text() == "v2"    # v2 survives
+            assert tm.open_transaction_count == 1
+            await tm.abort_transaction("s1")
+
+    @pytest.mark.asyncio
+    async def test_end_transaction_refuses_once_its_transaction_was_closed(self):
+        """A commit that wakes after its own transaction was aborted must not
+        commit whatever another writer has since put in those paths.
+
+        ``_txns`` is cleared directly to stand in for the idle timer, which
+        would need the very lock this test holds to create the queue.
+        """
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=0)
+            async with tm.guard("s1"):
+                fs.write_file("shared.md", "s1 content")
+                await tm.after_write(["shared.md"], session_id="s1")
+            await tm.write_lock.acquire()                # force the commit to queue
+            task = asyncio.create_task(tm.end_transaction("s1", "s1 commit"))
+            await asyncio.sleep(0.05)                    # task is now waiting
+            tm._txns.clear()                             # s1's txn is aborted meanwhile
+            fs.write_file("shared.md", "s2 content")     # another writer moves in
+            tm.write_lock.release()
+            with pytest.raises(TransactionError, match="No active transaction"):
+                await task
+            assert (path / "shared.md").read_text() == "s2 content"
+            assert "shared.md" not in _show_names(path)  # nothing was committed
+            assert not tm.write_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_abort_propagates_a_failed_restore(self):
+        """An abort that could not revert must not report success.
+
+        A pre-created ``.git/index.lock`` makes ``git checkout`` fail
+        deterministically; it is removed in ``finally`` so a failing assertion
+        cannot break the temp repo's teardown.
+        """
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=0)
+            async with tm.guard("s1"):
+                fs.write_file("README.md", "corrupted")
+                await tm.after_write(["README.md"], session_id="s1")
+            lock = path / ".git" / "index.lock"
+            lock.write_text("")
+            try:
+                with pytest.raises(RuntimeError, match="git checkout failed"):
+                    await tm.abort_transaction("s1")
+            finally:
+                lock.unlink(missing_ok=True)
+            assert (path / "README.md").read_text() == "corrupted"  # really not reverted
+            assert tm.open_transaction_count == 0      # still closed …
+            assert not tm.write_lock.locked()          # … and the lock still released
+
+    @pytest.mark.asyncio
+    async def test_timeout_still_swallows_a_failed_restore(self):
+        """The idle timer must never die noisily, even when the restore fails."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=0)   # drive the timer by hand
+            txn = tm._txns["s1"]
+            async with tm.guard("s1"):
+                fs.write_file("README.md", "corrupted")
+                await tm.after_write(["README.md"], session_id="s1")
+            lock = path / ".git" / "index.lock"
+            lock.write_text("")
+            try:
+                await tm._auto_abort(txn, 0)              # must not raise
+            finally:
+                lock.unlink(missing_ok=True)
+            assert tm.open_transaction_count == 0
+            assert not tm.write_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_abort_emits_content_events_for_reverted_paths(self):
+        from stash_mcp import events as events_mod
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            seen: list[tuple[str, str]] = []
+            listener = lambda event_type, p, **kw: seen.append((event_type, p))  # noqa: E731
+            events_mod.add_listener(listener)
+            try:
+                await tm.start_transaction("s1", timeout=30)
+                async with tm.guard("s1"):
+                    fs.write_file("README.md", "x")
+                    fs.write_file("tmp.md", "y")
+                    await tm.after_write(["README.md", "tmp.md"], session_id="s1")
+                await tm.abort_transaction("s1")
+            finally:
+                events_mod._listeners.remove(listener)   # events.py has no remove_listener
+            assert ("content_updated", "README.md") in seen
+            assert ("content_deleted", "tmp.md") in seen
+
+    @pytest.mark.asyncio
+    async def test_wrapper_writes_record_touched_paths(self):
+        """Gated-mode writes through the FileSystem wrapper are commit-scoped too."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            fs.write_file("stray.md", "not mine")          # dirty, outside any txn
+            await tm.start_transaction("s1", timeout=30)
+            tm.write_file("mine.md", "mine")
+            await tm.end_transaction("s1", "Only mine")
+            shown = _show_names(path)
+            assert "mine.md" in shown and "stray.md" not in shown
+
+    @pytest.mark.asyncio
+    async def test_end_transaction_with_no_changes_returns_none(self):
+        with TemporaryDirectory() as tmpdir:
+            tm, _ = _make_tm(Path(tmpdir))
+            await tm.start_transaction("s1", timeout=30)
+            assert await tm.end_transaction("s1", "nothing") is None
+            assert tm.open_transaction_count == 0
+
+    @pytest.mark.asyncio
+    async def test_status_lists_all_open_transactions(self):
+        with TemporaryDirectory() as tmpdir:
+            tm, fs = _make_tm(Path(tmpdir))
+            a = await tm.start_transaction("s1", timeout=30)
+            b = await tm.start_transaction("s2", timeout=30)
+            async with tm.guard("s2"):
+                fs.write_file("f.md", "f")
+                await tm.after_write(["f.md"], session_id="s2")
+            status = tm.get_transaction_status("s2")
+            assert status["has_active_transaction"] is True
+            assert status["transaction_id"] == b            # caller's own txn is primary
+            assert status["owned_by_current_session"] is True
+            assert status["count"] == 2
+            by_id = {t["transaction_id"]: t for t in status["transactions"]}
+            assert by_id[a]["session_id"] == "s1" and by_id[a]["owned_by_current_session"] is False
+            assert by_id[b]["touched_paths"] == ["f.md"]
+            await tm.abort_transaction("s1")
+            await tm.abort_transaction("s2")
+
+    @pytest.mark.asyncio
+    async def test_end_transaction_destroys_the_transaction_even_when_commit_fails(self):
+        """Documents current, deliberately-kept behavior (see Task 3's report):
+        a commit failure still closes the transaction and releases the lock.
+        The caller's edit remains on disk, dirty and unstaged, but the
+        transaction that owned it is gone -- it cannot be retried or aborted.
+
+        The failure is injected at ``commit_paths`` rather than triggered by a
+        malformed ``author``: since author strings are now validated before
+        anything is torn down, that trigger no longer reaches the commit.
+        """
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=30)
+            async with tm.guard("s1"):
+                fs.write_file("orphan.md", "stuck")
+                await tm.after_write(["orphan.md"], session_id="s1")
+            with patch.object(
+                tm.git, "commit_paths", side_effect=RuntimeError("git commit failed: boom")
+            ):
+                with pytest.raises(RuntimeError, match="git commit failed"):
+                    await tm.end_transaction("s1", "msg")
+            assert tm.open_transaction_count == 0            # transaction destroyed...
+            assert not tm.write_lock.locked()                 # ...and the lock released
+            assert (path / "orphan.md").read_text() == "stuck"   # ...edit survives, orphaned
+            assert not tm.git.has_staged_changes()             # index invariant still holds
+            with pytest.raises(TransactionError, match="No active transaction"):
+                await tm.end_transaction("s1", "retry")       # cannot retry: nothing to retry
+
+    @pytest.mark.asyncio
+    async def test_end_transaction_rejects_a_malformed_author_up_front(self):
+        """`author` is free text from an agent. A bare name is the plausible
+        mistake and `git commit --author` exits 128 on it unless it happens to
+        match an existing author in history. Reaching the commit with it would
+        destroy the transaction and orphan every edit it held; rejected before
+        _acquire it is just a retryable input error."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=30)
+            async with tm.guard("s1"):
+                fs.write_file("keep.md", "safe")
+                await tm.after_write(["keep.md"], session_id="s1")
+            with pytest.raises(TransactionError, match="Invalid author"):
+                await tm.end_transaction("s1", "msg", author="doc-writer")
+            assert tm.open_transaction_count == 1              # transaction intact...
+            assert not tm.write_lock.locked()                  # ...lock never taken
+            assert tm._txns["s1"].touched == ["keep.md"]       # ...edits still held
+            commit = await tm.end_transaction("s1", "msg", author="doc-writer <dw@agents>")
+            assert commit and "keep.md" in _show_names(path)   # the retry lands
+
+    @pytest.mark.asyncio
+    async def test_end_transaction_never_pushes(self):
+        """A push here would add a network round-trip under the write lock and
+        give a *successful* commit a second way to be reported as a failure.
+        The periodic sync loop pushes whenever the branch is ahead."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = _make_tm(path)
+            await tm.start_transaction("s1", timeout=30)
+            async with tm.guard("s1"):
+                fs.write_file("p.md", "p")
+                await tm.after_write(["p.md"], session_id="s1")
+            with patch.object(tm.git, "push") as push:
+                assert await tm.end_transaction("s1", "no push please")
+            push.assert_not_called()
+
+
+class TestAutocommit:
+    def _make_autocommit_tm(self, tmpdir: Path):
+        from stash_mcp.git_backend import GitBackend
+
+        _init_repo(tmpdir)
+        fs = FileSystem(tmpdir)
+        git = GitBackend(tmpdir)
+        return TransactionManager(fs, git, autocommit=True,
+                                  author_default="Bot <bot@example.com>"), fs
+
+    @pytest.mark.asyncio
+    async def test_after_write_outside_transaction_commits_immediately(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = self._make_autocommit_tm(path)
+            async with tm.guard("session-x"):
+                fs.write_file("doc.md", "hello")
+                short = await tm.after_write(
+                    ["doc.md"], session_id="session-x",
+                    message="doc-writer s1 describes=openpilot@v0.11.1",
+                    author="Agent Smith <agent@example.com>",
+                )
+            assert short
+            shown = _show_names(path)
+            assert "doc.md" in shown and "doc-writer s1" in shown and "Agent Smith" in shown
+
+    @pytest.mark.asyncio
+    async def test_default_message_and_author(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = self._make_autocommit_tm(path)
+            async with tm.guard(None):                          # REST/UI caller
+                fs.write_file("doc.md", "hello")
+                await tm.after_write(["doc.md"], session_id=None, default_message="Create doc.md")
+            shown = _show_names(path)
+            assert "Create doc.md" in shown and "Bot" in shown
+
+    @pytest.mark.asyncio
+    async def test_no_change_returns_none(self):
+        with TemporaryDirectory() as tmpdir:
+            tm, fs = self._make_autocommit_tm(Path(tmpdir))
+            async with tm.guard(None):
+                assert await tm.after_write(["README.md"], session_id=None) is None
+
+    @pytest.mark.asyncio
+    async def test_after_write_rejects_a_malformed_author(self):
+        """Autocommit callers get the same clear error as transaction callers,
+        before the write is attributed."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = self._make_autocommit_tm(path)
+            async with tm.guard(None):
+                fs.write_file("doc.md", "hello")
+                with pytest.raises(TransactionError, match="Invalid author"):
+                    await tm.after_write(["doc.md"], session_id=None, author="doc-writer")
+            assert "doc.md" not in _show_names(path)          # nothing committed
+            assert not tm.git.has_staged_changes()            # index invariant holds
+            async with tm.guard(None):                        # and a valid retry lands
+                assert await tm.after_write(
+                    ["doc.md"], session_id=None, author="doc-writer <dw@agents>"
+                )
+
+    @pytest.mark.asyncio
+    async def test_open_transaction_still_groups_in_autocommit_mode(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = self._make_autocommit_tm(path)
+            await tm.start_transaction("s1", timeout=30)
+            async with tm.guard("s1"):
+                fs.write_file("a.md", "a")
+                # recorded on the open transaction, not committed
+                assert await tm.after_write(["a.md"], session_id="s1") is None
+            assert "a.md" not in _show_names(path)
+            await tm.end_transaction("s1", "Grouped")
+            assert "a.md" in _show_names(path)
+
+    @pytest.mark.asyncio
+    async def test_gated_mode_guard_requires_transaction_for_sessions_only(self):
+        with TemporaryDirectory() as tmpdir:
+            tm, fs = _make_tm(Path(tmpdir))                     # autocommit=False
+            with pytest.raises(TransactionError, match="No active transaction"):
+                async with tm.guard("session-1"):
+                    pass
+            async with tm.guard(None):                          # REST/UI: lock only
+                fs.write_file("rest.md", "r")
+                assert await tm.after_write(["rest.md"], session_id=None) is not None
+
+    @pytest.mark.asyncio
+    async def test_write_lock_wait_timeout(self):
+        with TemporaryDirectory() as tmpdir:
+            tm, _ = self._make_autocommit_tm(Path(tmpdir))
+            tm.lock_wait = 0.05
+            await tm.write_lock.acquire()
+            try:
+                with pytest.raises(TransactionError, match="busy"):
+                    async with tm.guard(None):
+                        pass
+            finally:
+                tm.write_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_writers_each_get_their_own_commit(self):
+        """Lock covers write+commit, so interleaved writers keep exact attribution."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            tm, fs = self._make_autocommit_tm(path)
+
+            async def writer(name: str, n: int):
+                for i in range(n):
+                    async with tm.guard(name):
+                        fs.write_file("shared.md", f"{name}-{i}")
+                        await tm.after_write(
+                            ["shared.md"], session_id=name,
+                            message=f"{name} write {i}", author=f"{name} <{name}@x>",
+                        )
+                    await asyncio.sleep(0)
+
+            await asyncio.gather(writer("alpha", 3), writer("beta", 3))
+            log = _git_log(path, "--format=%an|%s", "-6")
+            lines = [line for line in log.splitlines() if line]
+            assert len(lines) == 6
+            for line in lines:
+                author, subject = line.split("|")
+                assert subject.startswith(author)      # each commit attributed to its writer
+
+
+# ---------------------------------------------------------------------------
+# MCP write tools — guard, after_write, commit_message/author
+# ---------------------------------------------------------------------------
+
+
+class TestMCPAutocommitTools:
+    def _make_mcp(self, tmpdir: Path):
+        from stash_mcp.git_backend import GitBackend
+        from stash_mcp.mcp_server import create_mcp_server
+
+        _init_repo(tmpdir)
+        fs = FileSystem(tmpdir)
+        git = GitBackend(tmpdir)
+        tm = TransactionManager(fs, git, autocommit=True, author_default="Bot <bot@x>")
+        with (
+            patch("stash_mcp.mcp_server.Config.READ_ONLY", False),
+            patch("stash_mcp.mcp_server.Config.GIT_SYNC_ENABLED", False),
+        ):
+            mcp = create_mcp_server(fs, git_backend=git, transaction_manager=tm)
+        return mcp, tm, fs
+
+    def _mock_context(self, session_obj=None):
+        from fastmcp.server.context import Context, _current_context
+
+        ctx = MagicMock(spec=Context)
+        ctx.session = session_obj or MagicMock()
+        ctx.session.send_resource_updated = AsyncMock()
+        ctx.send_resource_list_changed = AsyncMock()
+        token = _current_context.set(ctx)
+        return ctx, token
+
+    @pytest.mark.asyncio
+    async def test_create_autocommits_with_message_and_author(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                tool = await mcp.get_tool("create_content")
+                result = await tool.run({
+                    "path": "new.md", "content": "hello",
+                    "commit_message": "doc-writer s7 describes=openpilot@v0.11.1",
+                    "author": "doc-writer <dw@agents>",
+                })
+                text = str(result.content)
+                assert "Created: new.md" in text and "(commit " in text
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            shown = _show_names(path)
+            assert "new.md" in shown and "doc-writer s7" in shown and "doc-writer" in shown
+
+    @pytest.mark.asyncio
+    async def test_edit_returns_commit_and_uses_default_message(self):
+        import hashlib
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                sha = hashlib.sha256(b"# Test\n").hexdigest()
+                tool = await mcp.get_tool("edit_content")
+                result = await tool.run({
+                    "file_path": "README.md", "sha": sha,
+                    "edits": [{"old_string": "Test", "new_string": "Tested"}],
+                })
+                data = json.loads(str(result.content[0].text))
+                assert data["result"] == "ok" and data["commit"]
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            assert "Update README.md" in _show_names(path)
+
+    @pytest.mark.asyncio
+    async def test_batch_edit_is_one_commit(self):
+        import hashlib
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            fs.write_file("a.md", "aa")
+            fs.write_file("b.md", "bb")
+            ctx, token = self._mock_context()
+            try:
+                tool = await mcp.get_tool("edit_content_batch")
+                await tool.run({"edit_operations": [
+                    {"file_path": "a.md", "sha": hashlib.sha256(b"aa").hexdigest(),
+                     "edits": [{"old_string": "aa", "new_string": "AA"}]},
+                    {"file_path": "b.md", "sha": hashlib.sha256(b"bb").hexdigest(),
+                     "edits": [{"old_string": "bb", "new_string": "BB"}]},
+                ]})
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            shown = _show_names(path)
+            assert "a.md" in shown and "b.md" in shown and "Update 2 files" in shown
+
+    @pytest.mark.asyncio
+    async def test_batch_edit_notifies_after_the_write_lock_is_released(self):
+        """send_resource_updated feeds this session's SSE stream, so a slow
+        (not disconnected) client applies backpressure on the await. Inside the
+        guard that would hold the process-wide write lock across a client
+        round-trip and make every other writer fail 'server busy'."""
+        import hashlib
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            fs.write_file("docs/README.md", "aa")          # a registered resource
+            fs.write_file("plain.md", "bb")
+            locked_when_notified: list[bool] = []
+
+            async def record(uri):
+                locked_when_notified.append(tm.write_lock.locked())
+
+            ctx, token = self._mock_context()
+            ctx.session.send_resource_updated = AsyncMock(side_effect=record)
+            try:
+                tool = await mcp.get_tool("edit_content_batch")
+                result = await tool.run({"edit_operations": [
+                    {"file_path": "docs/README.md", "sha": hashlib.sha256(b"aa").hexdigest(),
+                     "edits": [{"old_string": "aa", "new_string": "AA"}]},
+                    {"file_path": "plain.md", "sha": hashlib.sha256(b"bb").hexdigest(),
+                     "edits": [{"old_string": "bb", "new_string": "BB"}]},
+                ]})
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            data = json.loads(str(result.content[0].text))
+            assert [r["path"] for r in data["results"]] == ["docs/README.md", "plain.md"]
+            assert data["commit"]                            # the commit still happened
+            assert locked_when_notified == [False]           # ...and the lock was free
+
+    @pytest.mark.asyncio
+    async def test_single_move_batch_uses_the_move_arrow_message(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                tool = await mcp.get_tool("move_content_batch")
+                await tool.run({"moves": [
+                    {"source_path": "README.md", "dest_path": "docs/README.md"},
+                ]})
+                assert "Move README.md -> docs/README.md" in _show_names(path)
+                fs.write_file("a.md", "a")
+                fs.write_file("b.md", "b")
+                await tool.run({"moves": [
+                    {"source_path": "a.md", "dest_path": "x.md"},
+                    {"source_path": "b.md", "dest_path": "y.md"},
+                ]})
+                assert "Move 2 files" in _show_names(path)   # batches keep the count form
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_write_with_a_malformed_author_fails_clearly_and_commits_nothing(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                tool = await mcp.get_tool("create_content")
+                with pytest.raises(ValueError, match="Invalid author"):
+                    await tool.run({
+                        "path": "new.md", "content": "hi", "author": "doc-writer",
+                    })
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            assert "new.md" not in _show_names(path)
+            assert not tm.git.has_staged_changes()
+
+    @pytest.mark.asyncio
+    async def test_move_and_delete_autocommit(self):
+        import hashlib
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                move = await mcp.get_tool("move_content")
+                text = str((await move.run({
+                    "source_path": "README.md", "dest_path": "docs/README.md",
+                })).content)
+                assert "(commit " in text
+                assert "Move README.md -> docs/README.md" in _show_names(path)
+                delete = await mcp.get_tool("delete_content")
+                text = str((await delete.run({
+                    "path": "docs/README.md", "sha": hashlib.sha256(b"# Test\n").hexdigest(),
+                })).content)
+                assert "(commit " in text
+                assert "Delete docs/README.md" in _show_names(path)
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_transaction_groups_writes_and_folds_messages(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            session_obj = MagicMock()
+            ctx, token = self._mock_context(session_obj)
+            try:
+                await (await mcp.get_tool("start_content_transaction")).run({})
+                create = await mcp.get_tool("create_content")
+                await create.run({"path": "x.md", "content": "x", "commit_message": "made x"})
+                await create.run({"path": "y.md", "content": "y"})
+                assert "x.md" not in _show_names(path)          # not committed yet
+                result = await (await mcp.get_tool("commit_content_transaction")).run(
+                    {"message": "Group"}
+                )
+                assert "committed" in str(result.content).lower()
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            shown = _show_names(path)
+            assert "x.md" in shown and "y.md" in shown
+            assert "- made x" in _git_log(path, "-1", "--format=%b")
+
+    @pytest.mark.asyncio
+    async def test_instructions_and_note_mention_autocommit(self):
+        with TemporaryDirectory() as tmpdir:
+            mcp, tm, fs = self._make_mcp(Path(tmpdir))
+            assert "committed to git automatically" in (mcp.instructions or "")
+            tool = await mcp.get_tool("create_content")
+            assert "commit_message" in (tool.description or "")
+
+    @pytest.mark.asyncio
+    async def test_abort_tool_translates_a_failed_restore_into_a_clear_error(self):
+        """abort_transaction can raise RuntimeError when the restore itself
+        fails; the MCP tool must not let that surface as an unexplained raw
+        git error, and must not claim the abort succeeded either way."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                await (await mcp.get_tool("start_content_transaction")).run({})
+                overwrite = await mcp.get_tool("overwrite_content")
+                import hashlib
+
+                sha = hashlib.sha256(b"# Test\n").hexdigest()
+                await overwrite.run({"path": "README.md", "content": "corrupted", "sha": sha})
+                lock = path / ".git" / "index.lock"
+                lock.write_text("")
+                try:
+                    with pytest.raises(ValueError) as exc_info:
+                        await (await mcp.get_tool("abort_content_transaction")).run({})
+                finally:
+                    lock.unlink(missing_ok=True)
+                message = str(exc_info.value)
+                assert "not reverted" in message.lower()
+                assert "aborted." != message.strip()   # must not read as a plain success
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            # The transaction was closed (Task 2's design) but the file content
+            # genuinely was not reverted -- the tool must not have lied about it.
+            assert (path / "README.md").read_text() == "corrupted"
+            assert tm.open_transaction_count == 0
+
+    @pytest.mark.asyncio
+    async def test_commit_tool_translates_a_failed_commit_into_a_clear_error(self):
+        """end_transaction can raise RuntimeError when git commit itself fails
+        (index.lock contention, a conflicted merge, a hook rejection). The MCP
+        tool must not let that surface as an unexplained raw git error: the
+        caller must see a ValueError (never the bare RuntimeError), stating
+        plainly that the commit failed, the transaction is gone, and the
+        touched files are left dirty and unstaged."""
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                await (await mcp.get_tool("start_content_transaction")).run({})
+                create = await mcp.get_tool("create_content")
+                await create.run({"path": "orphan.md", "content": "stuck"})
+                commit_tool = await mcp.get_tool("commit_content_transaction")
+                with (
+                    patch.object(
+                        tm.git, "commit_paths",
+                        side_effect=RuntimeError("git commit failed: boom"),
+                    ),
+                    pytest.raises(ValueError) as exc_info,
+                ):
+                    # The raw RuntimeError must not reach the caller as-is:
+                    # pytest.raises(ValueError) itself is the proof it was
+                    # translated rather than propagated bare.
+                    await commit_tool.run({"message": "msg"})
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            message = str(exc_info.value)
+            assert "commit failed" in message.lower()
+            assert "dirty" in message.lower() or "unstaged" in message.lower()
+            assert not message.lower().startswith("transaction committed")
+            # The transaction was closed (the deliberate, documented decision)
+            # but the file survives on disk, dirty and unstaged -- not silently
+            # dropped, and not falsely reported as committed.
+            assert (path / "orphan.md").read_text() == "stuck"
+            assert tm.open_transaction_count == 0
+            assert not tm.git.has_staged_changes()
