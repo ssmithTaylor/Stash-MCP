@@ -372,6 +372,14 @@ export ANTHROPIC_API_KEY=your-api-key
 
 > **Note:** Contextual retrieval requires the `search-contextual` dependency group and an Anthropic API key. It increases indexing time and cost but improves search relevance.
 
+## Git tracking
+
+Stash-MCP can track every write in a local git repository, giving you file history, diffs, and blame alongside the content itself. Git tracking is **disabled by default**; set `STASH_GIT_TRACKING=true` to enable it — the content directory must already be a git repository (contain a `.git` folder). This adds `log_content`, `diff_content`, and `blame_content` MCP tools, and enriches search results with commit metadata.
+
+### Autocommit vs. transactions
+
+With `STASH_GIT_TRACKING=true` every write runs under one short write lock. Set `STASH_GIT_AUTOCOMMIT=true` to commit each write immediately — every write tool and REST endpoint accepts an optional `commit_message` and `author`, so `git log`/`blame_content` show which agent wrote what (the web UI's editor commits automatically instead, tagged `UI: save/move/delete <path>`). To land several writes as one commit, open a transaction first (`start_content_transaction` … `commit_content_transaction`); transactions are per-session, may be open concurrently, and commit/abort only the files they touched. With autocommit off (default) *MCP* writes outside a transaction are rejected, as before — but the REST API and the web UI are never transaction-gated: they take the write lock and commit each write immediately whatever `STASH_GIT_AUTOCOMMIT` is set to.
+
 ## Content Organization
 
 Organize your content in a way that makes sense for your use case:

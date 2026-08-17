@@ -22,7 +22,7 @@ from .config import Config
 from .events import CONTENT_CREATED, CONTENT_DELETED, CONTENT_MOVED, CONTENT_UPDATED, emit
 from .filesystem import FileNotFoundError, FileSystem, InvalidPathError
 from .metrics import get_metrics
-from .transactions import TransactionError, TransactionManager
+from .transactions import TransactionError, TransactionManager, default_commit_message
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +78,32 @@ MaxLines = Annotated[
         "file. Omit to return the full content — there is no offset parameter",
     ),
 ]
+CommitMessage = Annotated[
+    str | None,
+    Field(
+        description="Git commit message for this write (git-tracked servers only; ignored "
+        "otherwise). Inside an open transaction it is recorded as a bullet in the "
+        "transaction's commit body instead"
+    ),
+]
+CommitAuthor = Annotated[
+    str | None,
+    Field(description='Git author as "Name <email>" (git-tracked servers only; ignored otherwise)'),
+]
 
 # Appended to write-tool descriptions when writes are transaction-gated.
 _TXN_NOTE = (
     "\n\nNote: this server gates writes behind transactions. Call "
     "start_content_transaction before using this tool, then "
     "commit_content_transaction to persist the changes."
+)
+
+# Appended to write-tool descriptions when writes are auto-committed.
+_AUTOCOMMIT_NOTE = (
+    "\n\nNote: this server commits each write to git automatically; pass "
+    "commit_message and author to attribute the change. To group several "
+    "writes into one commit, call start_content_transaction first and "
+    "commit_content_transaction when done."
 )
 
 
@@ -93,6 +113,7 @@ def _build_instructions(
     search_enabled: bool,
     git_enabled: bool,
     transactions_active: bool,
+    autocommit: bool = False,
 ) -> str:
     """Assemble the server-level instructions string sent to MCP clients."""
     parts = [
@@ -113,12 +134,23 @@ def _build_instructions(
             "is only for files that do not exist yet; delete_content also requires "
             "the sha."
         )
-    if transactions_active:
+    if transactions_active and autocommit:
+        parts.append(
+            "Writes are committed to git automatically, one commit per write; pass "
+            "commit_message (and optionally author) on create/edit/overwrite/move/"
+            "delete to attribute the change. To land several writes as one commit, "
+            "call start_content_transaction first, make the changes, then "
+            "commit_content_transaction (or abort_content_transaction to revert "
+            "them). Transactions from different sessions may be open at the same "
+            "time; idle transactions are auto-aborted after a timeout."
+        )
+    elif transactions_active:
         parts.append(
             "Writes are gated behind transactions: call start_content_transaction "
             "before any create/edit/overwrite/move/delete, make the changes, then "
             "commit_content_transaction with a commit message to persist them (or "
-            "abort_content_transaction to discard). Idle transactions are "
+            "abort_content_transaction to discard). Transactions from different "
+            "sessions may be open at the same time; idle transactions are "
             "auto-aborted after a timeout."
         )
     if search_enabled:
@@ -338,28 +370,36 @@ def parse_markdown_structure(content: str) -> list[dict]:
     return _build_heading_tree(flat_headings)
 
 
-def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=None) -> FastMCP:
+def create_mcp_server(
+    filesystem: FileSystem,
+    search_engine=None,
+    git_backend=None,
+    transaction_manager: TransactionManager | None = None,
+) -> FastMCP:
     """Create and configure the FastMCP server.
 
     Args:
         filesystem: Filesystem instance for content management
         search_engine: Optional SearchEngine instance for semantic search
         git_backend: Optional GitBackend instance for git tools
+        transaction_manager: Optional TransactionManager providing the write
+            lock, autocommit and transactions. When omitted and *filesystem*
+            is itself a TransactionManager (gated mode), that instance is used.
 
     Returns:
         Configured FastMCP server
     """
+    tm: TransactionManager | None = transaction_manager
+    if tm is None and isinstance(filesystem, TransactionManager):
+        tm = filesystem
 
     @asynccontextmanager
     async def lifespan(server: FastMCP) -> AsyncIterator[dict]:
         """Lifespan handler to inject filesystem into context."""
         yield {"fs": filesystem}
 
-    transactions_active = (
-        not Config.READ_ONLY
-        and git_backend is not None
-        and isinstance(filesystem, TransactionManager)
-    )
+    transactions_active = not Config.READ_ONLY and git_backend is not None and tm is not None
+    autocommit = bool(tm.autocommit) if tm is not None else False
 
     mcp = FastMCP(
         name=Config.SERVER_NAME,
@@ -370,6 +410,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             search_enabled=search_engine is not None,
             git_enabled=git_backend is not None,
             transactions_active=transactions_active,
+            autocommit=autocommit,
         ),
     )
 
@@ -418,10 +459,54 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
 
         def decorate(fn):
             if transactions_active:
-                fn.__doc__ = inspect.cleandoc(fn.__doc__ or "") + _TXN_NOTE
+                fn.__doc__ = inspect.cleandoc(fn.__doc__ or "") + (
+                    _AUTOCOMMIT_NOTE if autocommit else _TXN_NOTE
+                )
             return mcp.tool(**tool_kwargs)(fn)
 
         return decorate
+
+    def _session_id(ctx: Context | None) -> str | None:
+        try:
+            return str(id(ctx.session)) if ctx is not None else None
+        except Exception:
+            return None
+
+    @asynccontextmanager
+    async def _write_guard(ctx: Context | None):
+        """Hold the write lock (and enforce the transaction gate) for one mutation."""
+        if tm is None:
+            yield
+            return
+        try:
+            async with tm.guard(_session_id(ctx)):
+                yield
+        except TransactionError as exc:
+            raise ValueError(str(exc)) from exc
+
+    async def _after_write(
+        ctx: Context | None,
+        paths: list[str],
+        commit_message: str | None,
+        author: str | None,
+        default_message: str,
+    ) -> str | None:
+        """Record in the caller's transaction or autocommit; None when git is off."""
+        if tm is None:
+            return None
+        try:
+            return await tm.after_write(
+                paths,
+                session_id=_session_id(ctx),
+                message=commit_message,
+                author=author,
+                default_message=default_message,
+            )
+        except TransactionError as exc:
+            raise ValueError(str(exc)) from exc
+
+    def _with_commit(text: str, commit: str | None) -> str:
+        return f"{text} (commit {commit})" if commit else text
 
     # --- Resources ---
 
@@ -510,6 +595,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             path: ContentPath,
             content: Annotated[str, Field(description="File content (UTF-8 text)")],
             ctx: Context,
+            commit_message: CommitMessage = None,
+            author: CommitAuthor = None,
         ) -> str:
             """
             Create a new file. Errors if the file already exists.
@@ -520,18 +607,22 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             Args:
                 path: File path relative to content root
                 content: File content
+                commit_message: Optional git commit message (git-tracked servers only)
+                author: Optional git author "Name <email>" (git-tracked servers only)
             """
-            if filesystem.file_exists(path):
-                raise ValueError(
-                    f"File already exists: {path}. Use overwrite_content to replace "
-                    "it or edit_content for targeted edits."
-                )
-            filesystem.write_file(path, content)
+            async with _write_guard(ctx):
+                if filesystem.file_exists(path):
+                    raise ValueError(
+                        f"File already exists: {path}. Use overwrite_content to replace "
+                        "it or edit_content for targeted edits."
+                    )
+                filesystem.write_file(path, content)
+                commit = await _after_write(ctx, [path], commit_message, author, f"Create {path}")
             if _register_resource(path):
                 await ctx.send_resource_list_changed()
             emit(CONTENT_CREATED, path)
             logger.info(f"Created: {path}")
-            return f"Created: {path}"
+            return _with_commit(f"Created: {path}", commit)
 
         @_write_tool(
             annotations=ToolAnnotations(
@@ -549,6 +640,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             ],
             sha: FileSha,
             ctx: Context,
+            commit_message: CommitMessage = None,
+            author: CommitAuthor = None,
         ) -> str:
             """
             Replace the full content of an existing file.
@@ -561,26 +654,30 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 path: File path relative to content root
                 content: New file content
                 sha: SHA-256 hex digest of the current file content (from read_content)
+                commit_message: Optional git commit message (git-tracked servers only)
+                author: Optional git author "Name <email>" (git-tracked servers only)
             """
-            if filesystem.file_exists(path):
-                current = filesystem.read_file(path)
-                current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
-                if sha != current_sha:
-                    raise ValueError(
-                        f"SHA mismatch for '{path}': expected {current_sha}, got {sha}. "
-                        "The file may have changed since it was last read."
+            async with _write_guard(ctx):
+                if filesystem.file_exists(path):
+                    current = filesystem.read_file(path)
+                    current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
+                    if sha != current_sha:
+                        raise ValueError(
+                            f"SHA mismatch for '{path}': expected {current_sha}, got {sha}. "
+                            "The file may have changed since it was last read."
+                        )
+                else:
+                    raise FileNotFoundError(
+                        f"File '{path}' does not exist. Use create_content for new files."
                     )
-            else:
-                raise FileNotFoundError(
-                    f"File '{path}' does not exist. Use create_content for new files."
-                )
-            filesystem.write_file(path, content)
+                filesystem.write_file(path, content)
+                commit = await _after_write(ctx, [path], commit_message, author, f"Update {path}")
             if _is_resource_file(path):
                 uri = AnyUrl(f"stash://{path}")
                 await ctx.session.send_resource_updated(uri=uri)
             emit(CONTENT_UPDATED, path)
             logger.info(f"Updated: {path}")
-            return f"Updated: {path}"
+            return _with_commit(f"Updated: {path}", commit)
 
         @_write_tool(
             annotations=ToolAnnotations(
@@ -599,6 +696,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 Field(min_length=1, description="Ordered list of edits to apply"),
             ],
             ctx: Context,
+            commit_message: CommitMessage = None,
+            author: CommitAuthor = None,
         ) -> dict:
             """
             Apply targeted string-replacement edits to an existing file.
@@ -612,25 +711,32 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 file_path: File path relative to content root
                 sha: SHA-256 hex digest of the current file content (from read_content)
                 edits: Ordered list of edit operations to apply
+                commit_message: Optional git commit message (git-tracked servers only)
+                author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
-                A dict with path, result status, and new_sha
+                A dict with path, result status, new_sha, and commit (git hash,
+                or null when nothing was committed — e.g. inside a transaction)
             """
-            current = filesystem.read_file(file_path)
-            current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
-            if sha != current_sha:
-                raise ValueError(
-                    f"SHA mismatch for '{file_path}': expected {current_sha}, got {sha}. "
-                    "The file may have changed since it was last read."
+            async with _write_guard(ctx):
+                current = filesystem.read_file(file_path)
+                current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
+                if sha != current_sha:
+                    raise ValueError(
+                        f"SHA mismatch for '{file_path}': expected {current_sha}, got {sha}. "
+                        "The file may have changed since it was last read."
+                    )
+                new_content = _apply_edits(current, edits, file_path)
+                filesystem.write_file(file_path, new_content)
+                commit = await _after_write(
+                    ctx, [file_path], commit_message, author, f"Update {file_path}"
                 )
-            new_content = _apply_edits(current, edits, file_path)
-            filesystem.write_file(file_path, new_content)
             if _is_resource_file(file_path):
                 uri = AnyUrl(f"stash://{file_path}")
                 await ctx.session.send_resource_updated(uri=uri)
             emit(CONTENT_UPDATED, file_path)
             logger.info(f"Edited: {file_path}")
             new_sha = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
-            return {"path": file_path, "result": "ok", "new_sha": new_sha}
+            return {"path": file_path, "result": "ok", "new_sha": new_sha, "commit": commit}
 
         @_write_tool(
             annotations=ToolAnnotations(
@@ -651,6 +757,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 ),
             ],
             ctx: Context,
+            commit_message: CommitMessage = None,
+            author: CommitAuthor = None,
         ) -> dict:
             """
             Atomically apply edits to multiple files (max 10 per call).
@@ -660,8 +768,13 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
 
             Args:
                 edit_operations: List of per-file edit operations (max 10)
+                commit_message: Optional git commit message (git-tracked servers only)
+                author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
-                A dict with a results list containing path, result status, and new_sha per file
+                A dict with a results list (path, result status, and new_sha per
+                file) and a top-level commit (git hash for the single commit
+                covering every file, or null when nothing was committed — e.g.
+                inside a transaction)
             """
             if len(edit_operations) == 0:
                 raise ValueError("At least one edit operation is required.")
@@ -674,36 +787,57 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             if len(paths) != len(set(paths)):
                 raise ValueError("Duplicate file_path entries are not allowed in a single edit_content_batch call.")
 
-            # Phase 1: read all files and validate SHAs
-            originals: dict[str, str] = {}
-            for op in edit_operations:
-                current = filesystem.read_file(op.file_path)
-                current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
-                if op.sha != current_sha:
-                    raise ValueError(
-                        f"SHA mismatch for '{op.file_path}': expected {current_sha}, got {op.sha}. "
-                        "The file may have changed since it was last read."
+            async with _write_guard(ctx):
+                # Phase 1: read all files and validate SHAs
+                originals: dict[str, str] = {}
+                for op in edit_operations:
+                    current = filesystem.read_file(op.file_path)
+                    current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
+                    if op.sha != current_sha:
+                        raise ValueError(
+                            f"SHA mismatch for '{op.file_path}': expected {current_sha}, "
+                            f"got {op.sha}. The file may have changed since it was last read."
+                        )
+                    originals[op.file_path] = current
+
+                # Phase 2: apply all edits in memory
+                new_contents: dict[str, str] = {}
+                for op in edit_operations:
+                    new_contents[op.file_path] = _apply_edits(
+                        originals[op.file_path], op.edits, op.file_path
                     )
-                originals[op.file_path] = current
 
-            # Phase 2: apply all edits in memory
-            new_contents: dict[str, str] = {}
-            for op in edit_operations:
-                new_contents[op.file_path] = _apply_edits(originals[op.file_path], op.edits, op.file_path)
+                # Phase 3: write all files, collecting what to notify about.
+                # Notifications are deliberately deferred until the guard has
+                # closed (see below).
+                results = []
+                updated_uris: list[AnyUrl] = []
+                for op in edit_operations:
+                    filesystem.write_file(op.file_path, new_contents[op.file_path])
+                    if _is_resource_file(op.file_path):
+                        updated_uris.append(AnyUrl(f"stash://{op.file_path}"))
+                    logger.info(f"Edited: {op.file_path}")
+                    new_sha = hashlib.sha256(new_contents[op.file_path].encode("utf-8")).hexdigest()
+                    results.append({"path": op.file_path, "result": "ok", "new_sha": new_sha})
 
-            # Phase 3: write all files and send notifications
-            results = []
+                commit = await _after_write(
+                    ctx,
+                    [op.file_path for op in edit_operations],
+                    commit_message,
+                    author,
+                    default_commit_message([op.file_path for op in edit_operations]),
+                )
+
+            # send_resource_updated writes to this session's SSE stream, so a
+            # slow (not disconnected) client applies backpressure here. Doing
+            # it inside the guard would hold the process-wide write lock
+            # across a client round-trip and stall every other writer.
+            for uri in updated_uris:
+                await ctx.session.send_resource_updated(uri=uri)
             for op in edit_operations:
-                filesystem.write_file(op.file_path, new_contents[op.file_path])
-                if _is_resource_file(op.file_path):
-                    uri = AnyUrl(f"stash://{op.file_path}")
-                    await ctx.session.send_resource_updated(uri=uri)
                 emit(CONTENT_UPDATED, op.file_path)
-                logger.info(f"Edited: {op.file_path}")
-                new_sha = hashlib.sha256(new_contents[op.file_path].encode("utf-8")).hexdigest()
-                results.append({"path": op.file_path, "result": "ok", "new_sha": new_sha})
 
-            return {"results": results}
+            return {"results": results, "commit": commit}
 
         @_write_tool(
             annotations=ToolAnnotations(
@@ -717,6 +851,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             path: ContentPath,
             sha: FileSha,
             ctx: Context,
+            commit_message: CommitMessage = None,
+            author: CommitAuthor = None,
         ) -> str:
             """
             Delete a content file.
@@ -724,22 +860,26 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             Args:
                 path: File path relative to content root
                 sha: SHA-256 hex digest of the current file content (from read_content)
+                commit_message: Optional git commit message (git-tracked servers only)
+                author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
                 Confirmation message
             """
-            current = filesystem.read_file(path)
-            current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
-            if sha != current_sha:
-                raise ValueError(
-                    f"SHA mismatch for '{path}': expected {current_sha}, got {sha}. "
-                    "The file may have changed since it was last read."
-                )
-            filesystem.delete_file(path)
+            async with _write_guard(ctx):
+                current = filesystem.read_file(path)
+                current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
+                if sha != current_sha:
+                    raise ValueError(
+                        f"SHA mismatch for '{path}': expected {current_sha}, got {sha}. "
+                        "The file may have changed since it was last read."
+                    )
+                filesystem.delete_file(path)
+                commit = await _after_write(ctx, [path], commit_message, author, f"Delete {path}")
             if _unregister_resource(path):
                 await ctx.send_resource_list_changed()
             emit(CONTENT_DELETED, path)
             logger.info(f"Deleted: {path}")
-            return f"Deleted: {path}"
+            return _with_commit(f"Deleted: {path}", commit)
 
     # --- Read-only tools (always registered) ---
 
@@ -1143,6 +1283,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 ),
             ],
             ctx: Context,
+            commit_message: CommitMessage = None,
+            author: CommitAuthor = None,
         ) -> str:
             """Move or rename a content file.
 
@@ -1153,17 +1295,24 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             Args:
                 source_path: Current file path relative to content root
                 dest_path: New file path relative to content root
+                commit_message: Optional git commit message (git-tracked servers only)
+                author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
                 Confirmation message
             """
-            filesystem.move_file(source_path, dest_path)
+            async with _write_guard(ctx):
+                filesystem.move_file(source_path, dest_path)
+                commit = await _after_write(
+                    ctx, [source_path, dest_path], commit_message, author,
+                    f"Move {source_path} -> {dest_path}",
+                )
             source_was_resource = _unregister_resource(source_path)
             dest_is_resource = _register_resource(dest_path)
             if source_was_resource or dest_is_resource:
                 await ctx.send_resource_list_changed()
             emit(CONTENT_MOVED, dest_path, source_path=source_path)
             logger.info(f"Moved: {source_path} -> {dest_path}")
-            return f"Moved: {source_path} -> {dest_path}"
+            return _with_commit(f"Moved: {source_path} -> {dest_path}", commit)
 
         @_write_tool(
             annotations=ToolAnnotations(
@@ -1185,6 +1334,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 ),
             ],
             ctx: Context,
+            commit_message: CommitMessage = None,
+            author: CommitAuthor = None,
         ) -> dict:
             """Move or rename an entire directory tree.
 
@@ -1194,10 +1345,22 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             Args:
                 source_path: Current directory path relative to content root
                 dest_path: New directory path relative to content root
+                commit_message: Optional git commit message (git-tracked servers only)
+                author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
-                A dict with 'source', 'destination', and 'files_moved' count
+                A dict with 'source', 'destination', 'files_moved' count, and
+                'commit' (git hash, or null when nothing was committed — e.g.
+                inside a transaction)
             """
-            moved_files = filesystem.move_directory(source_path, dest_path)
+            async with _write_guard(ctx):
+                moved_files = filesystem.move_directory(source_path, dest_path)
+                commit = await _after_write(
+                    ctx,
+                    [p for pair in moved_files for p in pair],
+                    commit_message,
+                    author,
+                    f"Move {source_path} -> {dest_path}",
+                )
 
             # Handle resource registration changes for any README.md files
             resources_changed = False
@@ -1216,6 +1379,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 "source": source_path,
                 "destination": dest_path,
                 "files_moved": len(moved_files),
+                "commit": commit,
             }
 
         @_write_tool(
@@ -1237,6 +1401,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 ),
             ],
             ctx: Context,
+            commit_message: CommitMessage = None,
+            author: CommitAuthor = None,
         ) -> dict:
             """Move or rename multiple files in a single operation.
 
@@ -1246,8 +1412,13 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
 
             Args:
                 moves: List of move operations (max 10), each with source_path and dest_path
+                commit_message: Optional git commit message (git-tracked servers only)
+                author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
-                A dict with 'results' list containing source, destination, and status per file
+                A dict with a 'results' list (source, destination, and status
+                per file) and a top-level 'commit' (git hash for the single
+                commit covering every move, or null when nothing was
+                committed — e.g. inside a transaction)
             """
             if len(moves) == 0:
                 raise ValueError("At least one move operation is required.")
@@ -1273,34 +1444,50 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                     "Use intermediate paths for swap operations."
                 )
 
-            for m in moves:
-                if not filesystem.file_exists(m.source_path):
-                    raise ValueError(f"Source file not found: {m.source_path}")
-                dst = filesystem._resolve_path(m.dest_path)
-                if dst.exists():
-                    raise ValueError(f"Destination already exists: {m.dest_path}")
+            async with _write_guard(ctx):
+                for m in moves:
+                    if not filesystem.file_exists(m.source_path):
+                        raise ValueError(f"Source file not found: {m.source_path}")
+                    dst = filesystem._resolve_path(m.dest_path)
+                    if dst.exists():
+                        raise ValueError(f"Destination already exists: {m.dest_path}")
 
-            results = []
-            resources_changed = False
+                results = []
+                resources_changed = False
 
-            for m in moves:
-                filesystem.move_file(m.source_path, m.dest_path)
-                if _unregister_resource(m.source_path):
-                    resources_changed = True
-                if _register_resource(m.dest_path):
-                    resources_changed = True
-                emit(CONTENT_MOVED, m.dest_path, source_path=m.source_path)
-                logger.info(f"Moved: {m.source_path} -> {m.dest_path}")
-                results.append({
-                    "source": m.source_path,
-                    "destination": m.dest_path,
-                    "result": "ok",
-                })
+                for m in moves:
+                    filesystem.move_file(m.source_path, m.dest_path)
+                    if _unregister_resource(m.source_path):
+                        resources_changed = True
+                    if _register_resource(m.dest_path):
+                        resources_changed = True
+                    emit(CONTENT_MOVED, m.dest_path, source_path=m.source_path)
+                    logger.info(f"Moved: {m.source_path} -> {m.dest_path}")
+                    results.append({
+                        "source": m.source_path,
+                        "destination": m.dest_path,
+                        "result": "ok",
+                    })
+
+                # A one-move batch reads as a plain move, so it gets the same
+                # "Move <src> -> <dst>" subject move_content produces.
+                default_message = (
+                    f"Move {moves[0].source_path} -> {moves[0].dest_path}"
+                    if len(moves) == 1
+                    else default_commit_message([m.dest_path for m in moves], "Move")
+                )
+                commit = await _after_write(
+                    ctx,
+                    [p for m in moves for p in (m.source_path, m.dest_path)],
+                    commit_message,
+                    author,
+                    default_message,
+                )
 
             if resources_changed:
                 await ctx.send_resource_list_changed()
 
-            return {"results": results}
+            return {"results": results, "commit": commit}
 
     # --- Search tool (conditional) ---
 
@@ -1505,145 +1692,159 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 )
             return "\n".join(lines)
 
-    # --- Transaction tools (only when write mode + git tracking are both active) ---
+    # --- Transaction tools (only when write mode + a TransactionManager are active) ---
 
-    if not Config.READ_ONLY and git_backend is not None:
-        tm = filesystem if isinstance(filesystem, TransactionManager) else None
+    if not Config.READ_ONLY and tm is not None:
 
-        if tm is not None:
-
-            @mcp.tool(
-                annotations=ToolAnnotations(
-                    title="Start transaction",
-                    readOnlyHint=False,
-                    destructiveHint=False,
-                    openWorldHint=False,
-                )
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                title="Start transaction",
+                readOnlyHint=False,
+                destructiveHint=False,
+                openWorldHint=False,
             )
-            async def start_content_transaction(ctx: Context) -> str:
-                """Begin a write transaction and return its UUID.
+        )
+        async def start_content_transaction(ctx: Context) -> str:
+            """Begin a write transaction for this session and return its UUID.
 
-                Acquires the global transaction lock.  All subsequent mutating
-                tool calls (create_content, overwrite_content, edit_content,
-                edit_content_batch, delete_content, move_content,
-                move_content_directory, move_content_batch) on this session
-                will be part of the transaction.  Call
-                commit_content_transaction to commit or abort_content_transaction
-                to discard.  Only one transaction may be active at a time
-                across all sessions; idle transactions are auto-aborted after
-                a timeout.
+            Subsequent writes from this session are grouped into one commit
+            made by commit_content_transaction (abort_content_transaction
+            reverts exactly those files). Transactions from other sessions
+            may be open at the same time and do not block this one. Fails
+            if this session already has an open transaction — commit or
+            abort it first (list_content_transactions shows it). Idle
+            transactions are auto-aborted after a timeout, discarding their
+            changes.
 
-                Returns:
-                    Transaction UUID string
-                """
-                session_id = str(id(ctx.session))
-                try:
-                    txn_id = await tm.start_transaction(
-                        session_id,
-                        Config.TRANSACTION_TIMEOUT,
-                        Config.TRANSACTION_LOCK_WAIT,
-                    )
-                except TransactionError as exc:
-                    raise ValueError(str(exc))
-                return (
-                    f"Transaction started: {txn_id}\n\n"
-                    "IMPORTANT: When you are finished making changes, call "
-                    "`commit_content_transaction` to save them. If you want to "
-                    "discard all changes, call `abort_content_transaction` instead."
+            Returns:
+                Confirmation string containing the transaction UUID.
+            """
+            session_id = str(id(ctx.session))
+            try:
+                txn_id = await tm.start_transaction(
+                    session_id,
+                    Config.TRANSACTION_TIMEOUT,
+                    Config.TRANSACTION_LOCK_WAIT,
                 )
-
-            @mcp.tool(
-                annotations=ToolAnnotations(
-                    title="Commit transaction",
-                    readOnlyHint=False,
-                    destructiveHint=False,
-                    openWorldHint=False,
-                )
+            except TransactionError as exc:
+                raise ValueError(str(exc))
+            return (
+                f"Transaction started: {txn_id}\n\n"
+                "IMPORTANT: When you are finished making changes, call "
+                "`commit_content_transaction` to save them. If you want to "
+                "discard all changes, call `abort_content_transaction` instead."
             )
-            async def commit_content_transaction(
-                message: Annotated[
-                    str,
-                    Field(description="Git commit message describing the changes"),
-                ],
-                ctx: Context,
-                author: Annotated[
-                    str | None,
-                    Field(
-                        description='Optional commit author as "Name <email>"; '
-                        "defaults to the repository's configured identity"
-                    ),
-                ] = None,
-            ) -> str:
-                """Commit all changes in the active transaction.
 
-                Runs ``git add -A && git commit -m <message>`` and, when
-                GIT_SYNC_ENABLED is true, pushes to the configured remote.
-                Releases the transaction lock so other sessions may proceed.
-
-                Args:
-                    message: Commit message describing the changes
-                    author: Optional commit author in ``"Name <email>"`` format.
-                        Defaults to the repository's configured identity.
-                Returns:
-                    Confirmation string
-                """
-                session_id = str(id(ctx.session))
-                sync_remote = Config.GIT_SYNC_REMOTE if Config.GIT_SYNC_ENABLED else None
-                sync_branch = Config.GIT_SYNC_BRANCH if Config.GIT_SYNC_ENABLED else None
-                try:
-                    await tm.end_transaction(
-                        session_id, message, author, sync_remote, sync_branch
-                    )
-                except TransactionError as exc:
-                    raise ValueError(str(exc))
-                return f"Transaction committed: {message}"
-
-            @mcp.tool(
-                annotations=ToolAnnotations(
-                    title="Abort transaction",
-                    readOnlyHint=False,
-                    destructiveHint=True,
-                    idempotentHint=True,
-                    openWorldHint=False,
-                )
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                title="Commit transaction",
+                readOnlyHint=False,
+                destructiveHint=False,
+                openWorldHint=False,
             )
-            async def abort_content_transaction(ctx: Context) -> str:
-                """Abort the active transaction and discard all uncommitted changes.
+        )
+        async def commit_content_transaction(
+            message: Annotated[
+                str,
+                Field(description="Git commit message describing the changes"),
+            ],
+            ctx: Context,
+            author: Annotated[
+                str | None,
+                Field(
+                    description='Optional commit author as "Name <email>"; '
+                    "defaults to the repository's configured identity"
+                ),
+            ] = None,
+        ) -> str:
+            """Commit the files written in this session's transaction (only those files).
 
-                Runs ``git reset --hard HEAD``, resumes git sync, and releases
-                the transaction lock.
+            Per-write commit_message values passed to individual write calls
+            during the transaction are appended to this commit's body as
+            bullets. When GIT_SYNC_ENABLED is true the commit is pushed to the
+            configured remote by the periodic sync task, not by this call.
+            Releases the transaction lock so other sessions may proceed.
 
-                Returns:
-                    Confirmation string
-                """
-                session_id = str(id(ctx.session))
-                try:
-                    await tm.abort_transaction(session_id)
-                except TransactionError as exc:
-                    raise ValueError(str(exc))
-                return "Transaction aborted."
+            Args:
+                message: Commit message describing the changes
+                author: Optional commit author in ``"Name <email>"`` format.
+                    Defaults to the repository's configured identity.
+            Returns:
+                Confirmation string, including the commit hash when one was made
+            """
+            session_id = str(id(ctx.session))
+            try:
+                commit = await tm.end_transaction(session_id, message, author)
+            except TransactionError as exc:
+                raise ValueError(str(exc))
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"Transaction closed, but the commit failed: {exc}. The "
+                    "touched files were NOT committed — they remain on disk, "
+                    "dirty and unstaged, and are no longer part of any "
+                    "transaction; inspect them manually."
+                ) from exc
+            return _with_commit(f"Transaction committed: {message}", commit)
 
-            @mcp.tool(
-                annotations=ToolAnnotations(
-                    title="List transactions",
-                    readOnlyHint=True,
-                    openWorldHint=False,
-                )
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                title="Abort transaction",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=True,
+                openWorldHint=False,
             )
-            async def list_content_transactions(ctx: Context) -> dict:
-                """List active content transactions.
+        )
+        async def abort_content_transaction(ctx: Context) -> str:
+            """Abort this session's transaction, restoring the files it
+            touched to their last committed state.
 
-                Returns the current transaction state including whether a
-                transaction is active, its ID, which session owns it, and
-                whether this session is the owner.  Useful for agent
-                retry/recovery scenarios where the agent needs to know if a
-                transaction is still open before attempting to start a new one.
+            Returns:
+                Confirmation string
+            """
+            session_id = str(id(ctx.session))
+            try:
+                await tm.abort_transaction(session_id)
+            except TransactionError as exc:
+                raise ValueError(str(exc))
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"Transaction closed, but restoring its files failed: {exc}. "
+                    "The working tree was NOT reverted for the paths this "
+                    "transaction touched — inspect them manually."
+                ) from exc
+            return "Transaction aborted."
 
-                Returns:
-                    A dict with 'has_active_transaction' (bool) and optional
-                    transaction details.
-                """
-                session_id = str(id(ctx.session))
-                return tm.get_transaction_status(session_id)
+        @mcp.tool(
+            annotations=ToolAnnotations(
+                title="List transactions",
+                readOnlyHint=True,
+                openWorldHint=False,
+            )
+        )
+        async def list_content_transactions(ctx: Context) -> dict:
+            """List active content transactions.
+
+            Returns the current transaction state including whether a
+            transaction is active, its ID, which session owns it, and
+            whether this session is the owner.  Useful for agent
+            retry/recovery scenarios where the agent needs to know if a
+            transaction is still open before attempting to start a new one.
+
+            Returns:
+                A dict with 'has_active_transaction' (bool) and, when true,
+                'transaction_id', 'session_id', 'owned_by_current_session',
+                'count' (number of transactions open across all sessions),
+                and 'transactions' (a list with every open transaction's own
+                transaction_id, session_id, started_at, touched_paths, and
+                owned_by_current_session).
+
+                Top-level transaction_id/session_id describe this session's
+                transaction when it has one, otherwise the oldest open one —
+                check owned_by_current_session. Another session's open
+                transaction does not block you from starting your own.
+            """
+            session_id = str(id(ctx.session))
+            return tm.get_transaction_status(session_id)
 
     return mcp
