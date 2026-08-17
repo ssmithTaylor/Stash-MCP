@@ -1718,6 +1718,51 @@ class TestMCPAutocommitTools:
             assert "Update README.md" in _show_names(path)
 
     @pytest.mark.asyncio
+    async def test_update_metadata_autocommits_with_message_and_author(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            ctx, token = self._mock_context()
+            try:
+                tool = await mcp.get_tool("update_metadata")
+                result = await tool.run({
+                    "path": "README.md",
+                    "values": {"owner": "doc-writer"},
+                    "commit_message": "doc-writer sets owner",
+                    "author": "doc-writer <dw@agents>",
+                })
+                data = json.loads(str(result.content[0].text))
+                assert data["metadata"]["owner"] == "doc-writer" and data["commit"]
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+            shown = _show_names(path)
+            assert "README.md" in shown
+            assert "doc-writer sets owner" in shown and "doc-writer" in shown
+
+    @pytest.mark.asyncio
+    async def test_update_metadata_inside_transaction_returns_no_commit(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            mcp, tm, fs = self._make_mcp(path)
+            session_obj = MagicMock()
+            ctx, token = self._mock_context(session_obj)
+            try:
+                head_before = _git_log(path, "-1", "--format=%H").strip()
+                await (await mcp.get_tool("start_content_transaction")).run({})
+                tool = await mcp.get_tool("update_metadata")
+                result = await tool.run({
+                    "path": "README.md", "values": {"owner": "doc-writer"},
+                })
+                data = json.loads(str(result.content[0].text))
+                assert data["metadata"]["owner"] == "doc-writer"
+                assert data["commit"] is None
+                assert _git_log(path, "-1", "--format=%H").strip() == head_before
+            finally:
+                from fastmcp.server.context import _current_context
+                _current_context.reset(token)
+
+    @pytest.mark.asyncio
     async def test_batch_edit_is_one_commit(self):
         import hashlib
 

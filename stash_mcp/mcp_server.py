@@ -966,6 +966,8 @@ def create_mcp_server(
                     "(the body is preserved either way)."
                 ),
             ] = None,
+            commit_message: CommitMessage = None,
+            author: CommitAuthor = None,
         ) -> dict:
             """Set or remove keys in a file's YAML frontmatter without touching the body.
 
@@ -983,11 +985,15 @@ def create_mcp_server(
                 values: Keys to set
                 unset: Keys to remove
                 sha: Optional current content sha (as returned by read_content)
+                commit_message: Optional git commit message (git-tracked servers only)
+                author: Optional git author "Name <email>" (git-tracked servers only)
             Returns:
-                A dict with 'path', 'metadata' and 'new_sha'. 'metadata' is the
-                document's full metadata after the write — frontmatter merged
+                A dict with 'path', 'metadata', 'new_sha' and 'commit'. 'metadata' is
+                the document's full metadata after the write — frontmatter merged
                 over the leading blockquote, exactly what read_content and
-                search results report — not just the frontmatter keys.
+                search results report — not just the frontmatter keys. 'commit' is
+                the git hash for this write, or null when nothing was committed —
+                e.g. inside an open transaction.
             """
             if not values and not unset:
                 raise ValueError("Provide at least one key in values or unset.")
@@ -996,30 +1002,32 @@ def create_mcp_server(
                 raise ValueError(
                     f"update_metadata only supports markdown files (.md, .markdown). Got: {path}"
                 )
-            current = filesystem.read_file(path)
-            if sha is not None:
-                current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
-                if sha != current_sha:
-                    raise ValueError(
-                        f"SHA mismatch for '{path}': expected {current_sha}, got {sha}. "
-                        "The file may have changed since it was last read."
-                    )
-            # merge_frontmatter's own second return value is frontmatter-only
-            # (the truthfulness guard in that module is defined against it, so
-            # it must stay that way). Report the same shape every other
-            # surface does — frontmatter over leading blockquote — or an agent
-            # that sets one key and reads the answer back concludes it just
-            # wiped the blockquote-provided keys.
-            new_content, _ = merge_frontmatter(current, values, unset)
-            metadata = extract_metadata(new_content)[0]
-            filesystem.write_file(path, new_content)
+            async with _write_guard(ctx):
+                current = filesystem.read_file(path)
+                if sha is not None:
+                    current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
+                    if sha != current_sha:
+                        raise ValueError(
+                            f"SHA mismatch for '{path}': expected {current_sha}, got {sha}. "
+                            "The file may have changed since it was last read."
+                        )
+                # merge_frontmatter's own second return value is frontmatter-only
+                # (the truthfulness guard in that module is defined against it, so
+                # it must stay that way). Report the same shape every other
+                # surface does — frontmatter over leading blockquote — or an agent
+                # that sets one key and reads the answer back concludes it just
+                # wiped the blockquote-provided keys.
+                new_content, _ = merge_frontmatter(current, values, unset)
+                metadata = extract_metadata(new_content)[0]
+                filesystem.write_file(path, new_content)
+                commit = await _after_write(ctx, [path], commit_message, author, f"Update {path}")
             if _is_resource_file(path):
                 uri = AnyUrl(f"stash://{path}")
                 await ctx.session.send_resource_updated(uri=uri)
             emit(CONTENT_UPDATED, path)
             logger.info(f"Metadata updated: {path}")
             new_sha = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
-            return {"path": path, "metadata": metadata, "new_sha": new_sha}
+            return {"path": path, "metadata": metadata, "new_sha": new_sha, "commit": commit}
 
     # --- Read-only tools (always registered) ---
 
