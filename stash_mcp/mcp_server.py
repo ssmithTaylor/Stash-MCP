@@ -109,8 +109,8 @@ def _build_instructions(
         "relative to the content root, with no leading slash (e.g. 'docs/guide.md'). "
         "Start with README.md at the content root (the store index) and the "
         "README.md of the root you are working in; use list_content(path=<root>) "
-        "to browse it and find_content(path_prefix=<root>) to search within it. "
-        "list_content(recursive=true) lists every file and is only useful for "
+        "to browse it and find_content(pattern, path_prefix=<root>) to search "
+        "within it. list_content(recursive=true) lists every file and is only useful for "
         "small stores."
     ]
     if read_only:
@@ -1175,7 +1175,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
         Only files with recognized text extensions are scanned; binaries
         and unknown extensions are skipped.
 
-        For conceptual queries ("how does X work"), use search_content.
+        When this server has search_content registered, prefer it for
+        conceptual queries ("how does X work") — it ranks by meaning
+        instead of enumerating every literal match.
 
         Args:
             pattern: Literal substring (default) or regex (when is_regex=True).
