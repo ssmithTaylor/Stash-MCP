@@ -63,6 +63,14 @@ class Config:
     )
     SEARCH_CHUNK_SIZE: int = int(os.getenv("STASH_SEARCH_CHUNK_SIZE", "1000"))
     SEARCH_CHUNK_OVERLAP: int = int(os.getenv("STASH_SEARCH_CHUNK_OVERLAP", "100"))
+    # Search — glob patterns excluded from results by default (same dialect
+    # as STASH_CONTENT_PATHS; root-anchored, use **/name/** for any depth).
+    # Callers pass include_excluded=true to see them. Unset = no exclusions.
+    SEARCH_EXCLUDE_PATTERNS: list[str] | None = _parse_content_paths(
+        os.getenv("STASH_SEARCH_EXCLUDE_PATTERNS")
+    )
+    # Soft scoping: score multiplier (1 + weight) for results under boost_prefixes.
+    SEARCH_BOOST_WEIGHT: float = float(os.getenv("STASH_SEARCH_BOOST_WEIGHT", "0.15"))
 
     # Find tool settings
     FIND_MAX_RESULTS_CEILING: int = int(

@@ -20,8 +20,17 @@ from pydantic import AnyUrl, BaseModel, Field
 
 from .config import Config
 from .events import CONTENT_CREATED, CONTENT_DELETED, CONTENT_MOVED, CONTENT_UPDATED, emit
-from .filesystem import FileNotFoundError, FileSystem, InvalidPathError
+from .filesystem import (
+    FileNotFoundError,
+    FileSystem,
+    InvalidPathError,
+    glob_to_regex,
+    normalize_glob,
+)
+from .frontmatter import extract_metadata, merge_frontmatter
+from .headings import scan_headings
 from .metrics import get_metrics
+from .search import reject_path_traversal
 from .transactions import TransactionError, TransactionManager
 
 logger = logging.getLogger(__name__)
@@ -98,7 +107,11 @@ def _build_instructions(
     parts = [
         "Stash is a file-backed document store. All paths are POSIX-style and "
         "relative to the content root, with no leading slash (e.g. 'docs/guide.md'). "
-        "Start with list_content(recursive=true) to discover files."
+        "Start with README.md at the content root (the store index) and the "
+        "README.md of the root you are working in; use list_content(path=<root>) "
+        "to browse it and find_content(pattern, path_prefix=<root>) to search "
+        "within it. list_content(recursive=true) lists every file and is only useful for "
+        "small stores."
     ]
     if read_only:
         parts.append(
@@ -107,11 +120,13 @@ def _build_instructions(
     else:
         parts.append(
             "Writing a file creates missing parent directories automatically; there "
-            "is no separate mkdir step. To modify a file, call read_content first to "
-            "get its sha, then edit_content (targeted string replacement, preferred "
-            "for small changes) or overwrite_content (full replace). create_content "
-            "is only for files that do not exist yet; delete_content also requires "
-            "the sha."
+            "is no separate mkdir step. To add knowledge to an existing markdown "
+            "doc: list_content to find it, inspect_content_structure to see its "
+            "heading outline, read_content for the current text and sha, then "
+            "edit_content to change just the relevant part instead of rewriting "
+            "the file. overwrite_content replaces the full file, update_metadata "
+            "sets or removes frontmatter keys, create_content is only for files "
+            "that do not exist yet, and delete_content also requires the sha."
         )
     if transactions_active:
         parts.append(
@@ -123,8 +138,15 @@ def _build_instructions(
         )
     if search_enabled:
         parts.append(
-            "search_content finds content by meaning and returns ranked snippets; "
-            "follow up with read_content to retrieve full files."
+            "search_content finds content by meaning and returns ranked snippets "
+            "with the Section (heading path) each came from; scope with "
+            "path_prefix (hard — only these roots) or boost_prefix (soft — "
+            "prefers without hiding the rest). The server may be configured to "
+            "exclude certain paths (e.g. working directories) from results by "
+            "default; pass include_excluded=true to search them too. The Section "
+            "line names the heading a snippet came from, so follow up with "
+            "read_content and jump straight to that part instead of scanning "
+            "the whole file."
         )
     if git_enabled:
         parts.append(
@@ -222,17 +244,38 @@ def _is_searchable(path: str) -> bool:
 
 
 def _get_description(fs: FileSystem, path: str) -> str:
-    """Get description for a file from frontmatter or first line."""
+    """Describe a file by its first content line.
+
+    Skips YAML frontmatter, a leading provenance blockquote, blank lines and
+    HTML comments so the description is the title, not the metadata.
+    """
     try:
         content = fs.read_file(path)
-        lines = content.strip().splitlines()
-        if not lines:
-            return f"Content file: {path}"
-        first_line = lines[0].strip()
-        # Strip markdown heading markers
-        if first_line.startswith("#"):
-            first_line = first_line.lstrip("# ").strip()
-        return first_line[:100] if first_line else f"Content file: {path}"
+        _, body = extract_metadata(content)
+        in_comment = False
+        after_delimiter = False
+        for raw in body.splitlines():
+            line = raw.strip()
+            if in_comment:
+                if "-->" in line:
+                    in_comment = False
+                continue
+            if not line or line.startswith(">"):
+                after_delimiter = False
+                continue
+            if line in ("---", "..."):
+                after_delimiter = True
+                continue
+            if after_delimiter and ":" in line and not line.startswith("#"):
+                continue
+            after_delimiter = False
+            if line.startswith("<!--"):
+                in_comment = "-->" not in line
+                continue
+            if line.startswith("#"):
+                line = line.lstrip("# ").strip()
+            return line[:100] if line else f"Content file: {path}"
+        return f"Content file: {path}"
     except Exception:
         return f"Content file: {path}"
 
@@ -290,10 +333,6 @@ def _apply_edits(content: str, edits: list[EditOperation], path: str) -> str:
     return content
 
 
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
-_FENCE_RE = re.compile(r"^```")
-
-
 def _build_heading_tree(flat: list[dict]) -> list[dict]:
     """Convert a flat list of headings into a nested tree."""
     root: list[dict] = []
@@ -313,29 +352,41 @@ def _build_heading_tree(flat: list[dict]) -> list[dict]:
     return root
 
 
-def parse_markdown_structure(content: str) -> list[dict]:
-    """Parse markdown content and return a nested heading structure."""
-    in_code_block = False
-    flat_headings: list[dict] = []
+def parse_markdown_structure(content: str, line_offset: int = 0) -> list[dict]:
+    """Parse markdown content and return a nested heading structure.
 
-    for line_num, line in enumerate(content.splitlines(), start=1):
-        if _FENCE_RE.match(line.strip()):
-            in_code_block = not in_code_block
-            continue
-        if in_code_block:
-            continue
-        match = _HEADING_RE.match(line.strip())
-        if match:
-            level = len(match.group(1))
-            text = match.group(2).strip()
-            flat_headings.append({
-                "heading": text,
-                "level": level,
-                "line_number": line_num,
-                "children": [],
-            })
-
+    *line_offset* is added to every reported line number, so a caller that
+    parses a document's *body* still reports lines relative to the original
+    file (see ``_document_outline``).
+    """
+    flat_headings = [
+        {
+            "heading": h.text,
+            "level": h.level,
+            "line_number": h.line + line_offset,
+            "children": [],
+        }
+        for h in scan_headings(content)
+    ]
     return _build_heading_tree(flat_headings)
+
+
+def _document_outline(content: str) -> tuple[list[dict], str | None, dict[str, str]]:
+    """Return ``(sections, title, metadata)`` for a markdown document.
+
+    Headings are scanned over the *body*, with any YAML frontmatter block
+    stripped first: a ``#`` comment inside frontmatter matches the heading
+    regex, so parsing the raw file reports it as a document heading and — if
+    it is the first one — as the document ``title``, burying the real H1.
+    That also contradicts the search indexer, which runs ``scan_headings``
+    over the body. Line numbers are shifted back by the number of lines the
+    frontmatter consumed, so they still point at the original file.
+    """
+    metadata, body = extract_metadata(content)
+    line_offset = content[: len(content) - len(body)].count("\n")
+    sections = parse_markdown_structure(body, line_offset)
+    title = next((h["heading"] for h in sections if h["level"] == 1), None)
+    return sections, title, metadata
 
 
 def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=None) -> FastMCP:
@@ -608,6 +659,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             ones. All edits are validated in memory and the file is written once;
             if any edit fails, nothing is written.
 
+            To change only YAML frontmatter keys, prefer update_metadata.
+
             Args:
                 file_path: File path relative to content root
                 sha: SHA-256 hex digest of the current file content (from read_content)
@@ -653,7 +706,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             ctx: Context,
         ) -> dict:
             """
-            Atomically apply edits to multiple files (max 10 per call).
+            Apply string-replacement edits to up to 10 files in one call;
+            every file is validated before any is written.
 
             All validations run before any writes — if any file fails validation
             the entire operation is aborted and no files are modified.
@@ -721,6 +775,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             """
             Delete a content file.
 
+            On git-tracked servers the deletion is recoverable from git
+            history; without git tracking it is permanent.
+
             Args:
                 path: File path relative to content root
                 sha: SHA-256 hex digest of the current file content (from read_content)
@@ -741,6 +798,89 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             logger.info(f"Deleted: {path}")
             return f"Deleted: {path}"
 
+        @_write_tool(
+            annotations=ToolAnnotations(
+                title="Update document metadata",
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=True,
+                openWorldHint=False,
+            )
+        )
+        async def update_metadata(
+            path: ContentPath,
+            values: Annotated[
+                dict[str, str],
+                Field(description="Frontmatter keys to set (values are written as strings)"),
+            ],
+            ctx: Context,
+            unset: Annotated[
+                list[str], Field(description="Frontmatter keys to remove"),
+            ] = [],
+            sha: Annotated[
+                str | None,
+                Field(
+                    description="Optional staleness check: SHA-256 of the current "
+                    "full content, from read_content. Omit to apply the merge "
+                    "without checking whether the file changed since you read it "
+                    "(the body is preserved either way)."
+                ),
+            ] = None,
+        ) -> dict:
+            """Set or remove keys in a file's YAML frontmatter without touching the body.
+
+            Markdown files only (.md, .markdown) — a YAML block prepended to a
+            .py/.json/.yaml/.csv file would silently corrupt it.
+
+            Creates the frontmatter block when the file has none, preserves the
+            other keys and their order, and leaves the body byte-for-byte
+            unchanged. Use this for provenance/freshness fields (verified,
+            review_every, owner, describes, layer, status, stale_anchors)
+            instead of string-editing the YAML.
+
+            Args:
+                path: Markdown file path (.md or .markdown) relative to content root
+                values: Keys to set
+                unset: Keys to remove
+                sha: Optional current content sha (as returned by read_content)
+            Returns:
+                A dict with 'path', 'metadata' and 'new_sha'. 'metadata' is the
+                document's full metadata after the write — frontmatter merged
+                over the leading blockquote, exactly what read_content and
+                search results report — not just the frontmatter keys.
+            """
+            if not values and not unset:
+                raise ValueError("Provide at least one key in values or unset.")
+            suffix = PurePosixPath(path).suffix.lower()
+            if suffix not in {".md", ".markdown"}:
+                raise ValueError(
+                    f"update_metadata only supports markdown files (.md, .markdown). Got: {path}"
+                )
+            current = filesystem.read_file(path)
+            if sha is not None:
+                current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
+                if sha != current_sha:
+                    raise ValueError(
+                        f"SHA mismatch for '{path}': expected {current_sha}, got {sha}. "
+                        "The file may have changed since it was last read."
+                    )
+            # merge_frontmatter's own second return value is frontmatter-only
+            # (the truthfulness guard in that module is defined against it, so
+            # it must stay that way). Report the same shape every other
+            # surface does — frontmatter over leading blockquote — or an agent
+            # that sets one key and reads the answer back concludes it just
+            # wiped the blockquote-provided keys.
+            new_content, _ = merge_frontmatter(current, values, unset)
+            metadata = extract_metadata(new_content)[0]
+            filesystem.write_file(path, new_content)
+            if _is_resource_file(path):
+                uri = AnyUrl(f"stash://{path}")
+                await ctx.session.send_resource_updated(uri=uri)
+            emit(CONTENT_UPDATED, path)
+            logger.info(f"Metadata updated: {path}")
+            new_sha = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
+            return {"path": path, "metadata": metadata, "new_sha": new_sha}
+
     # --- Read-only tools (always registered) ---
 
     @mcp.tool(
@@ -756,8 +896,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
     ) -> dict:
         """
         Read and return the contents of a file along with its SHA-256 hash.
-        The sha is required by overwrite_content, edit_content, and
-        delete_content to ensure the file has not changed since it was read.
+        The sha is the concurrency token required by the write tools
+        (overwrite_content, edit_content, edit_content_batch, delete_content)
+        when they are registered.
 
         Args:
             path: File path relative to content root
@@ -767,12 +908,14 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 point, call again without max_lines.
         Returns:
             A dict with 'content' (file text), 'sha' (SHA-256 hex digest of
-            the FULL file, even when truncated), 'truncated' (bool), and
-            'total_lines' (line count of the full file)
+            the FULL file, even when truncated), 'truncated' (bool),
+            'total_lines' (line count of the full file), and 'metadata'
+            (frontmatter/blockquote key-values)
         """
         content = await asyncio.to_thread(filesystem.read_file, path)
         sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
         total_lines = _count_lines(content)
+        metadata = extract_metadata(content)[0]
         truncated = False
         if max_lines is not None:
             if max_lines < 1:
@@ -783,6 +926,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             "sha": sha,
             "truncated": truncated,
             "total_lines": total_lines,
+            "metadata": metadata,
         }
 
     @mcp.tool(
@@ -805,8 +949,10 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
     ) -> dict:
         """Read multiple files and return their contents with SHA-256 hashes.
 
-        Reads up to 10 files in a single call. Each file's sha is required
-        by overwrite_content, edit_content, and delete_content.
+        Reads up to 10 files in a single call. Each file's sha is the
+        concurrency token required by the write tools (overwrite_content,
+        edit_content, edit_content_batch, delete_content) when they are
+        registered.
 
         Args:
             paths: List of file paths relative to content root (max 10)
@@ -814,8 +960,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 beginning of each file. If omitted, returns full content.
         Returns:
             A dict with 'results' list, each containing 'path', 'content',
-            'sha', 'truncated', 'total_lines', and 'error' (null on success;
-            per-file failures set 'error' without failing the whole call)
+            'sha', 'truncated', 'total_lines', 'metadata' (frontmatter/blockquote
+            key-values; null on error), and 'error' (null on success; per-file
+            failures set 'error' without failing the whole call)
         """
         if not paths:
             raise ValueError("At least one path is required.")
@@ -832,19 +979,20 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 content = await asyncio.to_thread(filesystem.read_file, path)
                 sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 total_lines = _count_lines(content)
+                metadata = extract_metadata(content)[0]
                 truncated = False
                 if max_lines is not None:
                     content, truncated = _truncate_lines(content, max_lines)
                 results.append({
                     "path": path, "content": content, "sha": sha,
                     "truncated": truncated, "total_lines": total_lines,
-                    "error": None,
+                    "metadata": metadata, "error": None,
                 })
             except (FileNotFoundError, InvalidPathError) as exc:
                 results.append({
                     "path": path, "content": None, "sha": None,
                     "truncated": False, "total_lines": None,
-                    "error": str(exc),
+                    "metadata": None, "error": str(exc),
                 })
         return {"results": results}
 
@@ -864,35 +1012,92 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             bool,
             Field(description="If true, list every file under path as full relative paths"),
         ] = False,
-    ) -> str:
+        max_depth: Annotated[
+            int | None,
+            Field(ge=1, description="Bound the recursive listing to this many levels below "
+                  "path (1 = direct children only); implies recursive"),
+        ] = None,
+        glob: Annotated[
+            str | None,
+            Field(description="Glob over full relative paths (STASH_CONTENT_PATHS dialect: *, ?, "
+                  "**), e.g. 'projects/*/services/*.md'; implies recursive. Matched from the "
+                  "content root, NOT relative to path, so put the directory in the glob "
+                  "itself: glob='projects/x/*.md', not path='projects/x' + glob='*.md'"),
+        ] = None,
+        limit: Annotated[
+            int, Field(ge=1, description="Maximum entries returned (default 500)"),
+        ] = 500,
+        with_metadata: Annotated[
+            bool,
+            Field(description="Return JSON rows for markdown files with size and frontmatter "
+                  "metadata instead of the text listing; implies recursive"),
+        ] = False,
+    ) -> str | dict:
         """List files and directories in the content store.
 
         Non-recursive listings show one entry per line with a 📁 prefix for
         directories and 📄 for files; entries are names only, so join them
         with *path* to build full paths. Recursive listings return full
         relative file paths, one per line, with no prefixes. Hidden files
-        (dotfiles) are excluded.
+        (dotfiles) are excluded. Large stores: prefer max_depth/glob over a
+        bare recursive listing, which is capped by limit.
 
         Args:
             path: Path relative to content root (defaults to root)
             recursive: If true, list all files recursively
+            max_depth: Bound recursion depth (implies recursive)
+            glob: Filter full paths with a glob, root-anchored rather than
+                relative to *path* (implies recursive)
+            limit: Cap on entries; a trailing "… truncated" line marks a cut
+            with_metadata: Return {"items": [{path, size, metadata}], "truncated"}
+                for markdown files (implies recursive)
         Returns:
-            A formatted string listing the files and directories
+            A formatted string listing, or a dict when with_metadata is true
         """
-        if recursive:
-            files = filesystem.list_all_files(path)
+        base = path.strip("/")
+        base_depth = len(base.split("/")) if base else 0
+        # bool(glob), not `glob is not None`: an explicit glob="" (the likeliest
+        # way a caller spells "no glob") would otherwise flip this into a full
+        # recursive listing while the `if glob:` below applies no filter at all.
+        wants_files = recursive or max_depth is not None or bool(glob) or with_metadata
+        if wants_files:
+            files = await asyncio.to_thread(filesystem.list_all_files, base)
+            if max_depth is not None:
+                files = [f for f in files if len(f.split("/")) - base_depth <= max_depth]
+            if glob:
+                rx = glob_to_regex(normalize_glob(glob))
+                files = [f for f in files if rx.match(f)]
+            if with_metadata:
+                files = [f for f in files if f.lower().endswith((".md", ".markdown"))]
+            truncated = len(files) > limit
+            files = files[:limit]
+            if with_metadata:
+                items = []
+                for f in files:
+                    text = await asyncio.to_thread(filesystem.try_read_text, f)
+                    if text is None:
+                        continue
+                    meta, _ = extract_metadata(text)
+                    items.append({
+                        "path": f, "size": len(text.encode("utf-8")), "metadata": meta,
+                    })
+                return {"items": items, "truncated": truncated}
             if not files:
-                return f"No files found under '{path or '/'}'"
-            return "\n".join(files)
-        else:
-            items = filesystem.list_files(path)
-            lines = []
-            for name, is_dir in items:
-                prefix = "📁 " if is_dir else "📄 "
-                lines.append(f"{prefix}{name}")
-            if not lines:
-                return f"Empty directory: '{path or '/'}'"
-            return "\n".join(lines)
+                return f"No files found under '{base or '/'}'"
+            out = "\n".join(files)
+            if truncated:
+                out += f"\n… truncated ({len(files)} shown; raise limit or narrow with path/glob)"
+            return out
+        items = filesystem.list_files(base)
+        lines = []
+        for name, is_dir in items[:limit]:
+            prefix = "📁 " if is_dir else "📄 "
+            lines.append(f"{prefix}{name}")
+        if not lines:
+            return f"Empty directory: '{base or '/'}'"
+        if len(items) > limit:
+            lines.append(f"… truncated ({limit} shown)")
+        return "\n".join(lines)
 
     @mcp.tool(
         annotations=ToolAnnotations(
@@ -907,17 +1112,21 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             Field(description="Markdown file path (.md or .markdown) relative to content root"),
         ],
     ) -> dict:
-        """Read a markdown file and return its document structure based on headings.
+        """Return a markdown file's heading outline (title + nested sections
+        with line numbers) without its body text.
 
         Parses the heading hierarchy (h1-h6) and returns a nested outline of
         the document. Useful for understanding document organization before
-        reading full content.
+        reading full content. A YAML frontmatter block is not scanned for
+        headings — a '#' comment inside it is a comment, not an h1 — but
+        line numbers stay relative to the whole file.
 
         Args:
             path: File path relative to content root (must be a .md or .markdown file)
         Returns:
-            A dict with 'path', 'title' (first h1 if present), and 'sections'
-            (nested list of {heading, level, line_number, children} entries)
+            A dict with 'path', 'title' (first h1 if present), 'sections'
+            (nested list of {heading, level, line_number, children} entries),
+            and 'metadata' (frontmatter/blockquote key-values)
         """
         suffix = PurePosixPath(path).suffix.lower()
         if suffix not in {".md", ".markdown"}:
@@ -925,13 +1134,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 f"inspect_content_structure only supports markdown files (.md, .markdown). Got: {path}"
             )
         content = filesystem.read_file(path)
-        sections = parse_markdown_structure(content)
-        title = None
-        for heading in sections:
-            if heading["level"] == 1:
-                title = heading["heading"]
-                break
-        return {"path": path, "title": title, "sections": sections}
+        sections, title, metadata = _document_outline(content)
+        return {"path": path, "title": title, "sections": sections, "metadata": metadata}
 
     @mcp.tool(
         annotations=ToolAnnotations(
@@ -955,13 +1159,16 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
 
         Parses up to 10 markdown files and returns their heading hierarchies.
         Useful for scanning a documentation tree to understand content organization
-        across multiple files.
+        across multiple files. A YAML frontmatter block is not scanned for
+        headings — a '#' comment inside it is a comment, not an h1 — but line
+        numbers stay relative to the whole file.
 
         Args:
             paths: List of markdown file paths relative to content root (max 10)
         Returns:
             A dict with 'results' list, each containing the path, title, sections
-            (nested {heading, level, line_number, children} entries), and error
+            (nested {heading, level, line_number, children} entries), metadata
+            (frontmatter/blockquote key-values; null on error), and error
             (null on success; per-file failures set 'error' without failing
             the whole call)
         """
@@ -982,16 +1189,12 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                         f"(.md, .markdown). Got: {path}"
                     )
                 content = filesystem.read_file(path)
-                sections = parse_markdown_structure(content)
-                title = None
-                for s in sections:
-                    if s["level"] == 1:
-                        title = s["heading"]
-                        break
+                sections, title, metadata = _document_outline(content)
                 results.append({
                     "path": path,
                     "title": title,
                     "sections": sections,
+                    "metadata": metadata,
                     "error": None,
                 })
             except (FileNotFoundError, InvalidPathError, ValueError) as exc:
@@ -999,6 +1202,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                     "path": path,
                     "title": None,
                     "sections": None,
+                    "metadata": None,
                     "error": str(exc),
                 })
         return {"results": results}
@@ -1018,6 +1222,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
         file_types: str | None = None,
         path_prefix: str | None = None,
         context_lines: int = 0,
+        exclude_patterns: str | None = None,
     ) -> dict:
         """Find every line matching a literal string or regex.
 
@@ -1027,19 +1232,27 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
         Only files with recognized text extensions are scanned; binaries
         and unknown extensions are skipped.
 
-        For conceptual queries ("how does X work"), use search_content.
+        When this server has search_content registered, prefer it for
+        conceptual queries ("how does X work") — it ranks by meaning
+        instead of enumerating every literal match.
 
         Args:
             pattern: Literal substring (default) or regex (when is_regex=True).
-            is_regex: Treat pattern as a Python regex.
+            is_regex: Treat pattern as a Python regex, matched line by line —
+                a pattern can never span lines.
             case_sensitive: Match case-sensitively. Default false.
             max_results: Hard cap on total matches returned. Default 50.
             file_types: Optional comma-separated file extensions
                 (e.g. ".md,.py").
-            path_prefix: Optional path prefix to limit the search
-                (e.g. "docs/" restricts to that subtree).
+            path_prefix: Single subtree to scan, e.g. "docs/". One prefix
+                only — unlike search_content's path_prefix, this is NOT
+                comma-separated.
             context_lines: Lines of context to include before and after
                 each match. Default 0, max 10.
+            exclude_patterns: Optional comma-separated globs to skip (e.g. "**/_reports/**");
+                the server's default search-exclusion patterns are NOT
+                applied here — find_content scans everything text-like
+                unless you exclude explicitly.
         Returns:
             A dict with 'matches' (list of {file_path, line_number, line,
             context_before, context_after}), 'truncated' (bool), and
@@ -1071,6 +1284,13 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
         if file_types:
             types_list = [t.strip() for t in file_types.split(",") if t.strip()]
 
+        exclude_res = []
+        if exclude_patterns:
+            exclude_res = [
+                glob_to_regex(normalize_glob(p))
+                for p in exclude_patterns.split(",") if p.strip()
+            ]
+
         try:
             all_files = await asyncio.to_thread(
                 filesystem.list_all_files, path_prefix or ""
@@ -1084,6 +1304,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
 
         for fp in all_files:
             if not _is_searchable(fp):
+                continue
+            if exclude_res and any(rx.match(fp) for rx in exclude_res):
                 continue
             if types_list and not any(fp.endswith(ext) for ext in types_list):
                 continue
@@ -1317,6 +1539,11 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             query: str,
             max_results: int = 5,
             file_types: str | None = None,
+            path_prefix: str | None = None,
+            boost_prefix: str | None = None,
+            exclude_patterns: str | None = None,
+            include_excluded: bool = False,
+            metadata_filters: dict[str, str] | None = None,
         ) -> str:
             """Search for content by meaning using semantic similarity.
 
@@ -1331,23 +1558,66 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             instead — it returns every match up to max_results (see the
             truncated flag) rather than a ranked top-k.
 
+            Scoping: when you work inside one root of a multi-project store,
+            pass boost_prefix=<root> to rank that root first without hiding
+            the rest; pass path_prefix=<root> only when you want nothing
+            else. The server may be configured to exclude working
+            directories (e.g. report/scan output) from results by default;
+            pass include_excluded=true to search them too.
+
             Args:
                 query: Natural language search query
                 max_results: Maximum number of results (default 5)
                 file_types: Optional comma-separated file extensions
                     (e.g. ".md,.py")
+                path_prefix: Optional comma-separated subtree(s) to search;
+                    results must lie under one of them (e.g. "projects/x/").
+                    A subtree whose directory name contains a literal ","
+                    cannot be expressed this way — it would be read as two.
+                boost_prefix: Optional comma-separated subtree(s) to prefer;
+                    results under them rank first, others still appear
+                exclude_patterns: Optional comma-separated glob patterns to
+                    drop (root-anchored; "**/_reports/**" matches at any
+                    depth). Applied even when include_excluded=true.
+                include_excluded: Also return files matched by the server's
+                    default exclusion patterns (default false)
+                metadata_filters: Optional {key: value} equality filters on
+                    document metadata (frontmatter keys such as layer,
+                    describes, verified); keys are format-insensitive;
+                    values must match exactly as strings.
             Returns:
-                Search results formatted as a string
+                Search results formatted as a string; each result shows the
+                path, score and a snippet, plus — only when the underlying
+                value exists — the Section (heading path) the chunk came
+                from and Meta/Context/Last changed lines. The Section line
+                names the heading the snippet came from, so after
+                read_content you can jump straight to that part of the file
+                instead of scanning the whole thing. A Meta value cut at 60
+                characters ends in "…".
             """
             types_list = None
             if file_types:
                 types_list = [
                     t.strip() for t in file_types.split(",") if t.strip()
                 ]
+            excludes = None
+            if exclude_patterns:
+                excludes = [
+                    p.strip() for p in exclude_patterns.split(",") if p.strip()
+                ]
+            for label, value in (("path_prefix", path_prefix), ("boost_prefix", boost_prefix)):
+                reject_path_traversal(label, value)
 
             t0 = time.perf_counter()
             results = await search_engine.search(
-                query, max_results=max_results, file_types=types_list
+                query,
+                max_results=max_results,
+                file_types=types_list,
+                path_prefix=path_prefix,
+                exclude_patterns=excludes,
+                metadata_filters=metadata_filters,
+                include_excluded=include_excluded,
+                boost_prefixes=boost_prefix,
             )
             get_metrics().record_search_query(
                 query=query,
@@ -1362,6 +1632,16 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             lines = []
             for r in results:
                 lines.append(f"📄 {r.file_path} (score: {r.score:.2f})")
+                if r.heading_path:
+                    lines.append(f"   Section: {' > '.join(r.heading_path)}")
+                if r.metadata:
+                    # Mark the cut: without it an agent can't tell a truncated
+                    # `describes:` from a complete one.
+                    meta_str = " ".join(
+                        f"{k}={v[:60]}…" if len(v) > 60 else f"{k}={v}"
+                        for k, v in sorted(r.metadata.items())
+                    )
+                    lines.append(f"   Meta: {meta_str}")
                 if r.context:
                     lines.append(f"   Context: {r.context}")
                 if r.last_changed_at:
