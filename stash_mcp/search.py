@@ -1590,6 +1590,16 @@ class SearchEngine:
                 # sparse index would produce inconsistent rankings.
                 dense = self.store.search(query_embedding, top_n=fetch_n, mask=mask)
                 if boost_mask is not None:
+                    # NOTE: _merge_candidates appends the boost-scoped rescues
+                    # *after* the general pool, and _rrf_fuse scores purely by
+                    # position, so a rescued candidate enters fusion at the
+                    # worst reciprocal rank in the list. With MMR disabled
+                    # nothing reorders afterwards except the score multiplier
+                    # below, which acts on RRF scores that already encode that
+                    # penalty -- so boosting is near-inert in the
+                    # hybrid + MMR-disabled combination. Fixing it properly
+                    # needs a scoping parameter on BM25Store.search so the
+                    # sparse side can be fetched boost-scoped too.
                     dense = _merge_candidates(
                         dense,
                         self.store.search(query_embedding, top_n=max_results, mask=boost_mask),
@@ -1689,6 +1699,13 @@ class SearchEngine:
             # not. Re-enforce the documented hard cap on the final, boost-
             # ordered list. No-op whenever a single MMR pass already produced
             # raw_results (i.e. whenever boosting didn't trigger a second call).
+            #
+            # The `mmr_enabled` gate is about that *double fetch*, not about
+            # MMR itself: max_per_file is only ever applied by the MMR-based
+            # retrieval calls, so those are the only paths whose union can
+            # exceed it. The non-MMR branches never enforce the cap at all, so
+            # applying it here would silently start capping them. Don't
+            # "fix" this by dropping the gate.
             raw_results = _enforce_max_per_file(raw_results, self.max_per_file)
 
         # Blame is needed up-front only when recency reranking is on
@@ -1868,8 +1885,12 @@ class SearchEngine:
             Total number of chunks indexed.
         """
         async with self._lock:
-            self.store.clear()
-            self.meta = IndexMeta()
+            # Route through the shared helper so the BM25 store is wiped in
+            # the same breath as the vector store. Clearing only `store` and
+            # `meta` left every pre-reindex sparse posting in place, so a
+            # hybrid query could fuse fresh dense hits with chunks that no
+            # longer exist.
+            self._clear_index_for_rebuild("Full reindex requested; clearing index for rebuild.")
 
         file_paths = []
         if self._filesystem is not None:

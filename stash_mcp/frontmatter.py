@@ -193,6 +193,13 @@ def _locate_entries(raw_block: str) -> dict[str, tuple[int, int, str]] | None:
             if is_block_collection
             else _trim_trailing_newlines(raw_block, start, raw_end)
         )
+        # An alias-valued key (`b: *a`) resolves to the *anchor's* node, whose
+        # end_mark sits back at the anchor's definition -- before this key even
+        # begins. `raw_block[start:end]` would then be empty and a splice would
+        # duplicate text rather than replace it, so refuse the block outright
+        # and let the caller fall back to the whole-block redump.
+        if end < start:
+            return None
         spans.append((normalize_key(key_node.value), start, end, key_node.value))
         prev_end = end
     norms = [norm for norm, *_ in spans]
@@ -262,15 +269,24 @@ def _is_truthful(candidate: str, data: dict) -> bool:
     this still catches it -- a surgical result that doesn't reparse back to
     the metadata it would be returned alongside is never used.
 
-    Two checks, not one. `_scalars(reparsed) == _scalars(data)` alone isn't
-    enough: yaml.safe_load collapses duplicate top-level keys to the last
-    one, so a candidate that (by some bug) wrote a key twice can still
-    reparse to exactly the right values while permanently duplicating a
-    line on disk. Requiring `_locate_entries(candidate) is not None` closes
-    that hole by demanding the candidate itself be safely re-editable --
-    which duplicate (or flow-mapping-sibling, or merge-key-shadowed)
-    top-level keys are not -- the same standard already applied to the
-    *input* raw_block, now also applied to what we're about to write.
+    Three checks, not one. `_scalars(reparsed) == _scalars(data)` alone isn't
+    enough on either axis:
+
+    - It only compares *scalar* values -- `_scalars()` drops list/dict values
+      from both sides -- so a non-scalar key that a mis-computed span dropped
+      or duplicated would slip past unnoticed. Comparing the key *sets* too
+      closes that. They are compared normalized because a brand-new key is
+      appended in its normalized spelling while `data` still carries the
+      caller's raw one (`Layer` -> `layer`), and that difference is by
+      design, not corruption.
+    - yaml.safe_load collapses duplicate top-level keys to the last one, so a
+      candidate that (by some bug) wrote a key twice can still reparse to
+      exactly the right values while permanently duplicating a line on disk.
+      Requiring `_locate_entries(candidate) is not None` closes that hole by
+      demanding the candidate itself be safely re-editable -- which duplicate
+      (or flow-mapping-sibling, or merge-key-shadowed) top-level keys are not
+      -- the same standard already applied to the *input* raw_block, now also
+      applied to what we're about to write.
     """
     try:
         reparsed = yaml.safe_load(candidate) if candidate.strip() else {}
@@ -281,6 +297,8 @@ def _is_truthful(candidate: str, data: dict) -> bool:
     if not isinstance(reparsed, dict):
         return False
     if _scalars(reparsed) != _scalars(data):
+        return False
+    if {normalize_key(str(k)) for k in reparsed} != {normalize_key(str(k)) for k in data}:
         return False
     return _locate_entries(candidate) is not None
 

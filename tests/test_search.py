@@ -1966,6 +1966,25 @@ class TestHybridSearchEngine:
         paths = [r.file_path for r in results]
         assert "search.md" in paths
 
+    async def test_reindex_clears_the_bm25_store_too(self, hybrid_engine):
+        """``reindex`` cleared ``store`` and ``meta`` but not ``bm25_store``.
+
+        The two indexes must be wiped together or they drift. Deleting every
+        file first makes the drift observable: with nothing left to re-index,
+        nothing marks BM25 dirty, so nothing triggers the incidental full
+        rebuild that otherwise papers over the missing clear.
+        """
+        engine = hybrid_engine
+        await engine.build_index(["auth.md", "db.md", "search.md"])
+        assert engine.bm25_store.count > 0
+
+        for name in ("auth.md", "db.md", "search.md"):
+            (engine.content_dir / name).unlink()
+
+        await engine.reindex()
+        assert engine.store.count == 0
+        assert engine.bm25_store.count == 0      # was: stale postings survived
+
     async def test_hybrid_disabled_is_dense_only(self, tmp_path):
         """hybrid_enabled=False bypasses BM25 entirely."""
         content_dir = tmp_path / "content"

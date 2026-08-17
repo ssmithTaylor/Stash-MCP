@@ -314,6 +314,68 @@ class TestMergeFrontmatterUnsafeShapesFallBack:
         assert "layer" not in reparsed
         assert reparsed["owner"] == "me"
 
+    def test_alias_valued_key_falls_back_instead_of_using_an_inverted_span(self):
+        """`b: *a` composes to the *anchor's* node, whose end_mark precedes
+        the key -- yielding end < start, i.e. an empty ``raw_block[start:end]``
+        that a splice would insert next to rather than replace.
+        _locate_entries must refuse the block instead.
+        """
+        from stash_mcp.frontmatter import _locate_entries
+
+        assert _locate_entries("a: &anchor v\nb: *anchor") is None
+
+        content = "---\na: &anchor v\nb: *anchor\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"b": "replaced"})
+        reparsed, _ = extract_metadata(new)
+        assert meta == reparsed                       # truthful
+        assert reparsed == {"a": "v", "b": "replaced"}
+        # exactly one `b:` entry -- an inverted span would have inserted a
+        # second one beside the original instead of replacing it
+        block = split_frontmatter_block(new)[0]
+        assert len([ln for ln in block.split("\n") if ln.startswith("b:")]) == 1
+
+    def test_normal_spans_are_unaffected_by_the_inverted_span_guard(self):
+        """The guard must not make ordinary blocks fall back (which would
+        silently start stripping comments everywhere).
+        """
+        content = "---\n# keep me\nlayer: a\nowner: me\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"layer": "b"})
+        block = split_frontmatter_block(new)[0]
+        assert "# keep me" in block                    # surgical path, not redump
+        assert meta == {"layer": "b", "owner": "me"}
+
+
+class TestIsTruthfulKeySetCheck:
+    """``_scalars()`` drops list/dict values from *both* sides, so value
+    equality alone can't notice a non-scalar key that a mis-computed span
+    dropped. The key-set comparison closes that.
+    """
+
+    def test_lost_non_scalar_key_is_not_truthful(self):
+        from stash_mcp.frontmatter import _is_truthful
+
+        # scalar values agree exactly; only the list-valued `tags` is missing
+        assert _is_truthful("a: 1\ntags:\n  - x\n", {"a": 1, "tags": ["x"]}) is True
+        assert _is_truthful("a: 1\n", {"a": 1, "tags": ["x"]}) is False
+
+    def test_extra_non_scalar_key_is_not_truthful(self):
+        from stash_mcp.frontmatter import _is_truthful
+
+        assert _is_truthful("a: 1\ntags:\n  - x\n", {"a": 1}) is False
+
+    def test_new_key_appended_in_normalized_form_still_passes(self):
+        """Key sets are compared *normalized*: a brand-new key is appended in
+        its normalized spelling while `data` still holds the caller's raw one.
+        Comparing raw sets would fail here and force a comment-stripping
+        redump for every capitalized/hyphenated new key.
+        """
+        content = "---\n# keep me\nexisting: 1\n---\nbody\n"
+        new, meta = merge_frontmatter(content, {"Last-Verified": "2026-08-16"})
+        block = split_frontmatter_block(new)[0]
+        assert "# keep me" in block                    # surgical path preserved
+        assert "last_verified: '2026-08-16'" in block
+        assert meta == {"existing": "1", "last_verified": "2026-08-16"}
+
 
 class TestMergeFrontmatterBlockCollectionDirectlyTouched:
     """Regression coverage: earlier tests only ever set/unset a scalar key
