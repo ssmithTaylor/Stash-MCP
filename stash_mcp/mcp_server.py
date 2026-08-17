@@ -20,6 +20,32 @@ from pydantic import AnyUrl, BaseModel, Field
 
 from .config import Config
 from .events import CONTENT_CREATED, CONTENT_DELETED, CONTENT_MOVED, CONTENT_UPDATED, emit
+
+# --- ToolAnnotations policy -------------------------------------------------
+#
+# Clients use these hints to decide whether to confirm a call, so they need to
+# be consistent across the whole surface rather than set per-tool by feel.
+#
+#   readOnlyHint     True for tools that only read. False for anything that
+#                    writes, including the transaction lifecycle tools.
+#   destructiveHint  True when the call can replace or remove content that
+#                    already exists — overwrite, edit, metadata merge, move
+#                    (the source path stops existing), delete, abort. False
+#                    only for genuinely additive calls: create_content (which
+#                    refuses to clobber) and start/commit transaction.
+#                    NOTE the MCP default is *true*, so leaving it unset on a
+#                    write tool reads as destructive; state it either way.
+#   idempotentHint   Whether repeating the identical call is a no-op. Most of
+#                    the sha-guarded and path-guarded writes are not: the
+#                    second call errors.
+#   openWorldHint    False everywhere. Stash only ever touches the local
+#                    content store; no tool reaches an external system.
+#
+# Invariant, enforced by tests/test_mcp_server.py: every tool with
+# readOnlyHint=False sets all four hints explicitly. Read-only tools leave
+# destructiveHint/idempotentHint unset, which is correct — the MCP spec
+# defines them as meaningful only when readOnlyHint is false.
+# ---------------------------------------------------------------------------
 from .filesystem import (
     FileNotFoundError,
     FileSystem,
@@ -640,7 +666,11 @@ def create_mcp_server(
             annotations=ToolAnnotations(
                 title="Create file",
                 readOnlyHint=False,
+                # Purely additive: refuses to write when the path already
+                # exists, so it can never replace existing content.
                 destructiveHint=False,
+                # Repeating the call fails with "already exists".
+                idempotentHint=False,
                 openWorldHint=False,
             )
         )
@@ -681,7 +711,9 @@ def create_mcp_server(
             annotations=ToolAnnotations(
                 title="Overwrite file content",
                 readOnlyHint=False,
-                destructiveHint=False,
+                # Replaces the whole file body; the previous content is gone
+                # from the working tree (recoverable only via git history).
+                destructiveHint=True,
                 idempotentHint=True,
                 openWorldHint=False,
             )
@@ -736,7 +768,9 @@ def create_mcp_server(
             annotations=ToolAnnotations(
                 title="Edit file",
                 readOnlyHint=False,
-                destructiveHint=False,
+                # Replaces matched text rather than appending, so the edit is
+                # not an additive update.
+                destructiveHint=True,
                 idempotentHint=True,
                 openWorldHint=False,
             )
@@ -797,7 +831,8 @@ def create_mcp_server(
             annotations=ToolAnnotations(
                 title="Edit multiple files",
                 readOnlyHint=False,
-                destructiveHint=False,
+                # Same as edit_content, across several files.
+                destructiveHint=True,
                 idempotentHint=True,
                 openWorldHint=False,
             )
@@ -900,6 +935,9 @@ def create_mcp_server(
                 title="Delete file",
                 readOnlyHint=False,
                 destructiveHint=True,
+                # Requires the current sha, so a repeat call fails once the
+                # file is gone.
+                idempotentHint=False,
                 openWorldHint=False,
             )
         )
@@ -944,7 +982,8 @@ def create_mcp_server(
             annotations=ToolAnnotations(
                 title="Update document metadata",
                 readOnlyHint=False,
-                destructiveHint=False,
+                # Merging overwrites the values of keys that already exist.
+                destructiveHint=True,
                 idempotentHint=True,
                 openWorldHint=False,
             )
@@ -1499,7 +1538,11 @@ def create_mcp_server(
             annotations=ToolAnnotations(
                 title="Move or rename file",
                 readOnlyHint=False,
-                destructiveHint=False,
+                # The source path stops existing, and any inbound links or
+                # cross-references to it break.
+                destructiveHint=True,
+                # A repeat call fails: the source is no longer there.
+                idempotentHint=False,
                 openWorldHint=False,
             )
         )
@@ -1550,7 +1593,9 @@ def create_mcp_server(
             annotations=ToolAnnotations(
                 title="Move content directory",
                 readOnlyHint=False,
-                destructiveHint=False,
+                # Same as move_content, for every file under the directory.
+                destructiveHint=True,
+                idempotentHint=False,
                 openWorldHint=False,
             )
         )
@@ -1618,7 +1663,9 @@ def create_mcp_server(
             annotations=ToolAnnotations(
                 title="Move multiple files",
                 readOnlyHint=False,
-                destructiveHint=False,
+                # Same as move_content, across several files.
+                destructiveHint=True,
+                idempotentHint=False,
                 openWorldHint=False,
             )
         )
@@ -1996,7 +2043,10 @@ def create_mcp_server(
             annotations=ToolAnnotations(
                 title="Start transaction",
                 readOnlyHint=False,
+                # Opens a transaction; touches no content on its own.
                 destructiveHint=False,
+                # A second call while one is open is an error, not a no-op.
+                idempotentHint=False,
                 openWorldHint=False,
             )
         )
@@ -2035,7 +2085,11 @@ def create_mcp_server(
             annotations=ToolAnnotations(
                 title="Commit transaction",
                 readOnlyHint=False,
+                # Records history; destroys nothing. The destructive writes
+                # already happened inside the transaction.
                 destructiveHint=False,
+                # A repeat call fails: there is no open transaction left.
+                idempotentHint=False,
                 openWorldHint=False,
             )
         )

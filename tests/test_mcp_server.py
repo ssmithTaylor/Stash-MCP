@@ -2098,3 +2098,133 @@ def test_get_description_unterminated_frontmatter(temp_fs):
         "README.md", "---\nlayer: x\ntitle: something\n\n# Real Title\nBody"
     )
     assert _get_description(temp_fs, "README.md") == "Real Title"
+
+
+class TestToolAnnotationConsistency:
+    """Every tool's ToolAnnotations follow one policy, not per-tool taste.
+
+    The hints drive whether a client asks the user to confirm a call, so an
+    unset `destructiveHint` on a write tool is not neutral — the MCP spec
+    defaults it to *true*. These tests pin the policy documented at the top of
+    mcp_server.py so a new tool can't quietly ship with a partial set.
+    """
+
+    @staticmethod
+    async def _all_tools(with_transactions: bool = True):
+        """Build a server with every conditional tool registered."""
+        with TemporaryDirectory() as tmp:
+            import subprocess
+
+            subprocess.run(["git", "init", tmp], capture_output=True, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@e.com",
+                 "commit", "--allow-empty", "-m", "init"],
+                cwd=tmp, capture_output=True, check=True,
+            )
+            from stash_mcp.git_backend import GitBackend
+            from stash_mcp.transactions import TransactionManager
+
+            fs = FileSystem(Path(tmp))
+            git_backend = GitBackend(Path(tmp), author_default="T <t@e.com>")
+            search_engine = MagicMock()
+            tm = None
+            fs_for_mcp = fs
+            if with_transactions:
+                tm = TransactionManager(
+                    fs, git_backend, autocommit=False, author_default="T <t@e.com>"
+                )
+                fs_for_mcp = tm
+            mcp = create_mcp_server(
+                fs_for_mcp,
+                search_engine=search_engine,
+                git_backend=git_backend,
+                transaction_manager=tm,
+            )
+            return await mcp.get_tools()
+
+    @pytest.mark.asyncio
+    async def test_every_write_tool_sets_all_four_hints(self):
+        tools = await self._all_tools()
+        writers = {
+            name: t.annotations
+            for name, t in tools.items()
+            if t.annotations is not None and t.annotations.readOnlyHint is False
+        }
+        assert writers, "expected the write tools to be registered"
+        incomplete = {
+            name: {
+                field: getattr(a, field)
+                for field in ("destructiveHint", "idempotentHint", "openWorldHint")
+                if getattr(a, field) is None
+            }
+            for name, a in writers.items()
+        }
+        incomplete = {k: v for k, v in incomplete.items() if v}
+        assert incomplete == {}, f"write tools with unset hints: {incomplete}"
+
+    @pytest.mark.asyncio
+    async def test_every_tool_has_annotations_with_a_title(self):
+        tools = await self._all_tools()
+        missing = [
+            name
+            for name, t in tools.items()
+            if t.annotations is None or not t.annotations.title
+        ]
+        assert missing == [], f"tools without annotations/title: {missing}"
+
+    @pytest.mark.asyncio
+    async def test_no_tool_claims_to_reach_an_external_system(self):
+        tools = await self._all_tools()
+        open_world = [
+            name
+            for name, t in tools.items()
+            if t.annotations is not None and t.annotations.openWorldHint is not False
+        ]
+        assert open_world == [], f"openWorldHint should be False everywhere: {open_world}"
+
+    @pytest.mark.asyncio
+    async def test_content_replacing_tools_are_marked_destructive(self):
+        """A move destroys the source path; an edit/overwrite replaces content.
+
+        Marking these non-destructive is what the policy exists to prevent —
+        a client would skip confirmation on a call that loses data.
+        """
+        tools = await self._all_tools()
+        expected_destructive = {
+            "overwrite_content",
+            "edit_content",
+            "edit_content_batch",
+            "update_metadata",
+            "delete_content",
+            "move_content",
+            "move_content_batch",
+            "move_content_directory",
+            "abort_content_transaction",
+        }
+        for name in expected_destructive:
+            assert name in tools, f"{name} not registered"
+            assert tools[name].annotations.destructiveHint is True, (
+                f"{name} must be destructiveHint=True"
+            )
+
+    @pytest.mark.asyncio
+    async def test_additive_tools_are_not_marked_destructive(self):
+        """create_content refuses to clobber, so it stays non-destructive."""
+        tools = await self._all_tools()
+        for name in ("create_content", "start_content_transaction",
+                     "commit_content_transaction"):
+            assert tools[name].annotations.destructiveHint is False, (
+                f"{name} should be destructiveHint=False"
+            )
+
+    @pytest.mark.asyncio
+    async def test_read_only_tools_are_marked_read_only(self):
+        tools = await self._all_tools()
+        for name in ("read_content", "read_content_batch", "list_content",
+                     "find_content", "search_content", "inspect_content_structure",
+                     "log_content", "diff_content", "blame_content",
+                     "list_content_transactions"):
+            assert name in tools, f"{name} not registered"
+            assert tools[name].annotations.readOnlyHint is True, (
+                f"{name} should be readOnlyHint=True"
+            )
