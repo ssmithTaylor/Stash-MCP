@@ -1159,7 +1159,17 @@ class TestUISearchScope:
 
     def test_scope_options_html_escapes_directory_names(self):
         """Directory names are user-controlled; escaping must hold in both the
-        ``value="..."`` attribute context and the ``<option>`` text context.
+        ``value="..."`` attribute context and the ``<option>`` text context --
+        for *both* branches of ``_scope_options_html``, which build their
+        attribute value differently:
+
+        - top-level branch: escape the name, *then* append a literal ``/``.
+        - child branch: concatenate the raw ``f"{name}/{child}/"`` first,
+          *then* escape that whole string as one unit.
+
+        So the dangerous top-level entry is given a dangerous child too --
+        otherwise the child branch (a different operation order) is never
+        exercised by a dangerous name.
 
         ``<``, ``>`` and ``"`` are illegal in real Windows directory names, so
         this exercises ``_scope_options_html`` directly against a minimal
@@ -1169,21 +1179,39 @@ class TestUISearchScope:
 
         from stash_mcp.ui import _scope_options_html
 
-        dangerous = '<script>alert("x")</script>'
+        dangerous_parent = '<script>alert("p")</script>'
+        dangerous_child = '<img src=x onerror=alert("c")>'
 
         class _FakeFS:
             def list_files(self, relative_path: str = ""):
-                tree = {"": [(dangerous, True)], dangerous: []}
+                tree = {
+                    "": [(dangerous_parent, True)],
+                    dangerous_parent: [(dangerous_child, True)],
+                }
                 return tree[relative_path]
 
         out = _scope_options_html(_FakeFS())
-        # the raw string must not survive anywhere -- either context would
-        # let it break out (close the attribute, or close the tag)
-        assert dangerous not in out
+        # neither raw string survives anywhere -- either context would let it
+        # break out (close the attribute, or close the tag)
+        assert dangerous_parent not in out
+        assert dangerous_child not in out
         assert "<script>" not in out
-        escaped = html_mod.escape(dangerous)
-        assert f'value="{escaped}/"' in out  # attribute context
-        assert f'>{escaped}/</option>' in out  # text context
+        assert "<img" not in out
+
+        escaped_parent = html_mod.escape(dangerous_parent)
+        escaped_child = html_mod.escape(dangerous_child)
+
+        # top-level option: name escaped, *then* '/' appended
+        assert f'value="{escaped_parent}/"' in out  # attribute context
+        assert f'>{escaped_parent}/</option>' in out  # text context
+
+        # child option: "{name}/{child}/" is concatenated raw first, then the
+        # whole thing is escaped as one unit for the attribute -- assert
+        # against the escape of the *concatenation*, not of the parts alone
+        escaped_concat = html_mod.escape(f"{dangerous_parent}/{dangerous_child}/")
+        assert f'value="{escaped_concat}"' in out  # attribute context
+        # child option text only ever shows the child segment (indented)
+        assert f'>&nbsp;&nbsp;{escaped_child}/</option>' in out  # text context
 
 
 class TestUIFeatures:
