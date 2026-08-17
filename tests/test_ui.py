@@ -1157,6 +1157,74 @@ class TestUISearchScope:
         assert "localStorage.setItem('stash-search-scope'" in html_text
         assert "localStorage.getItem('stash-search-scope')" in html_text
 
+    def test_ui_search_scopes_a_comma_named_directory_correctly(self):
+        """A directory whose own name contains a ',' must scope, not split in two.
+
+        ``/ui/search`` takes ``path_prefix`` as a repeated parameter rather
+        than the comma-separated string ``/api/search`` uses, because the
+        scope selector generates it from real directory names.
+        ``normalize_prefixes`` splits string values on commas but never
+        splits list elements, so the name survives intact.
+        """
+        import asyncio
+
+        from stash_mcp.search import SearchEngine
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as idx:
+            fs = FileSystem(Path(tmp))
+            fs.write_file("clients, active/doc.md", "# Active\n\nauth oauth flow")
+            fs.write_file("clients/doc.md", "# Plain\n\nauth oauth flow")
+            fs.write_file("active/doc.md", "# Other\n\nauth oauth flow")
+            engine = SearchEngine(
+                content_dir=Path(tmp), index_dir=Path(idx), embed_fn=_mock_embed
+            )
+            asyncio.run(engine.build_index([
+                "clients, active/doc.md", "clients/doc.md", "active/doc.md",
+            ]))
+            app = create_api(fs, search_engine=engine)
+            app.include_router(create_ui_router(fs, search_engine=engine))
+            client = TestClient(app)
+
+            data = client.get(
+                "/ui/search", params={"q": "auth oauth", "path_prefix": "clients, active/"}
+            ).json()
+            # scoped to the one real directory -- not the union of
+            # "clients/" and "active/", which is what a comma split gives
+            assert [r["file_path"] for r in data["results"]] == ["clients, active/doc.md"]
+
+            # the selector offers exactly that value, so the round trip is real
+            assert 'value="clients, active/"' in client.get("/ui/browse/").text
+
+    def test_ui_search_rejects_path_traversal(self):
+        """Consistent with MCP search_content and REST /api/search."""
+        import asyncio
+
+        from stash_mcp.search import SearchEngine
+
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as idx:
+            fs = FileSystem(Path(tmp))
+            fs.write_file("a/doc.md", "# A\n\nauth")
+            engine = SearchEngine(
+                content_dir=Path(tmp), index_dir=Path(idx), embed_fn=_mock_embed
+            )
+            asyncio.run(engine.build_index(["a/doc.md"]))
+            app = create_api(fs, search_engine=engine)
+            app.include_router(create_ui_router(fs, search_engine=engine))
+            resp = TestClient(app).get(
+                "/ui/search", params={"q": "auth", "path_prefix": "../etc"}
+            )
+            assert resp.status_code == 400
+            assert "path_prefix" in resp.json()["error"]
+
+    def test_search_js_sends_path_prefix_exactly_once(self, scoped_ui):
+        """The repeated-parameter server signature needs no JS change: the
+        sidebar builds the query string with a single ``&path_prefix=``
+        occurrence, which arrives as a one-element list.
+        """
+        html_text = scoped_ui.get("/ui/browse/").text
+        assert html_text.count("path_prefix=") == 1
+        assert "'&path_prefix='+encodeURIComponent(scope)" in html_text
+
     def test_scope_options_html_escapes_directory_names(self):
         """Directory names are user-controlled; escaping must hold in both the
         ``value="..."`` attribute context and the ``<option>`` text context --

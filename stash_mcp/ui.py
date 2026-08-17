@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 
 import markdown as md
 import yaml as _yaml
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .events import CONTENT_CREATED, CONTENT_DELETED, CONTENT_MOVED, CONTENT_UPDATED, emit
@@ -22,6 +22,7 @@ from .filesystem import FileNotFoundError as FSFileNotFoundError
 from .filesystem import FileSystem, InvalidPathError
 from .frontmatter import extract_metadata
 from .mcp_server import MIME_TYPES
+from .search import reject_path_traversal
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
@@ -2481,13 +2482,31 @@ def create_ui_router(
 
         @router.get("/ui/search")
         async def ui_search(
-            q: str = "", max_results: int = 10, path_prefix: str | None = None
+            q: str = "",
+            max_results: int = 10,
+            path_prefix: list[str] = Query(default=[]),
         ):
-            """Search content using the vector search engine."""
+            """Search content using the vector search engine.
+
+            ``path_prefix`` is a *repeated* query parameter here, not the
+            comma-separated string ``/api/search`` and MCP's
+            ``search_content`` take. This is the one surface that generates a
+            prefix from real directory names (the scope selector), so a
+            directory whose own name contains a comma -- ``clients, active/``
+            -- must survive: ``normalize_prefixes`` splits string values on
+            commas but never splits list elements. The sidebar JS already
+            sends the parameter exactly once, so a single occurrence arrives
+            as a one-element list and scopes exactly as before.
+            """
             if not q.strip():
                 return JSONResponse({"results": [], "total": 0})
+            try:
+                for value in path_prefix:
+                    reject_path_traversal("path_prefix", value)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
             results = await search_engine.search(
-                q.strip(), max_results=max_results, path_prefix=path_prefix
+                q.strip(), max_results=max_results, path_prefix=path_prefix or None
             )
             return JSONResponse(
                 {

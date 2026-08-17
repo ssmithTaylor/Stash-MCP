@@ -1554,7 +1554,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 file_types: Optional comma-separated file extensions
                     (e.g. ".md,.py")
                 path_prefix: Optional comma-separated subtree(s) to search;
-                    results must lie under one of them (e.g. "projects/x/")
+                    results must lie under one of them (e.g. "projects/x/").
+                    A subtree whose directory name contains a literal ","
+                    cannot be expressed this way — it would be read as two.
                 boost_prefix: Optional comma-separated subtree(s) to prefer;
                     results under them rank first, others still appear
                 exclude_patterns: Optional comma-separated glob patterns to

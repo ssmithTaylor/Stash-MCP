@@ -330,6 +330,8 @@ def create_api(filesystem: FileSystem, lifespan=None, search_engine=None) -> Fas
                 max_results: Maximum number of results (default 5).
                 file_types: Comma-separated file extensions (e.g. ".md,.py").
                 path_prefix: Comma-separated subtree(s); results must lie under one.
+                    A subtree whose directory name contains a literal ","
+                    cannot be expressed this way — it would be read as two.
                 boost_prefix: Comma-separated subtree(s) to rank first without hiding others.
                 exclude_patterns: Comma-separated glob patterns to drop (always applied).
                 include_excluded: Also return files matched by the server's default
