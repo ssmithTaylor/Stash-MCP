@@ -152,8 +152,9 @@ def _build_instructions(
     if transactions_active and autocommit:
         parts.append(
             "Writes are committed to git automatically, one commit per write; pass "
-            "commit_message (and optionally author) on create/edit/overwrite/move/"
-            "delete to attribute the change. To land several writes as one commit, "
+            "commit_message (and optionally author) on any write tool "
+            "(create/edit/overwrite/move/delete/update_metadata) to attribute the "
+            "change. To land several writes as one commit, "
             "call start_content_transaction first, make the changes, then "
             "commit_content_transaction (or abort_content_transaction to revert "
             "them). Transactions from different sessions may be open at the same "
@@ -162,7 +163,8 @@ def _build_instructions(
     elif transactions_active:
         parts.append(
             "Writes are gated behind transactions: call start_content_transaction "
-            "before any create/edit/overwrite/move/delete, make the changes, then "
+            "before any write (create/edit/overwrite/move/delete/update_metadata), "
+            "make the changes, then "
             "commit_content_transaction with a commit message to persist them (or "
             "abort_content_transaction to discard). Transactions from different "
             "sessions may be open at the same time; idle transactions are "
