@@ -1710,11 +1710,14 @@ def create_mcp_server(
             Subsequent writes from this session are grouped into one commit
             made by commit_content_transaction (abort_content_transaction
             reverts exactly those files). Transactions from other sessions
-            may be open at the same time. Idle transactions are auto-aborted
-            after a timeout.
+            may be open at the same time and do not block this one. Fails
+            if this session already has an open transaction — commit or
+            abort it first (list_content_transactions shows it). Idle
+            transactions are auto-aborted after a timeout, discarding their
+            changes.
 
             Returns:
-                Transaction UUID string
+                Confirmation string containing the transaction UUID.
             """
             session_id = str(id(ctx.session))
             try:
@@ -1835,6 +1838,11 @@ def create_mcp_server(
                 and 'transactions' (a list with every open transaction's own
                 transaction_id, session_id, started_at, touched_paths, and
                 owned_by_current_session).
+
+                Top-level transaction_id/session_id describe this session's
+                transaction when it has one, otherwise the oldest open one —
+                check owned_by_current_session. Another session's open
+                transaction does not block you from starting your own.
             """
             session_id = str(id(ctx.session))
             return tm.get_transaction_status(session_id)
