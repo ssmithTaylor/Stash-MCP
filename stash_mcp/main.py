@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -109,6 +110,125 @@ def _maybe_clone_repo() -> None:
 
     Config.GIT_TRACKING = True
     logger.info("Clone complete. Git tracking auto-enabled.")
+
+
+def _nearest_existing_ancestor(path: Path) -> Path:
+    """Return the closest directory in *path*'s own chain that exists on disk.
+
+    Returns *path* itself (resolved) if it already exists. Otherwise walks up
+    through its parents until it finds one that does. The filesystem root
+    always exists, so this always terminates with a real, existing directory.
+    """
+    current = path.resolve()
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            break  # reached the filesystem root; defensive, should not happen
+        current = parent
+    return current
+
+
+def _maybe_init_repo() -> None:
+    """Initialise a local git repo in the content dir when tracking is on and
+    no remote is configured.
+
+    Precedence: a configured clone/sync URL always wins. ``_maybe_clone_repo()``
+    owns that path — including its hard-fail on clone failure — so this
+    function is a no-op whenever ``STASH_GIT_CLONE_URL``/``STASH_GIT_SYNC_URL``
+    is set. It only bootstraps a repo for the case that's otherwise a hard
+    startup failure: ``STASH_GIT_TRACKING=true`` with no remote and a content
+    directory that isn't a git repo yet (e.g. a fresh container volume).
+
+    A directory that already sits *inside* a different, pre-existing git
+    repository is refused rather than silently nested: ``git rev-parse
+    --git-dir`` would succeed from such a directory (it resolves upward to
+    the parent repo's ``.git``), so ``--show-toplevel`` is used instead and
+    compared against the content dir to detect this case correctly.
+
+    This check must not be skipped just because the content dir doesn't exist
+    yet — that's the common case, since this runs before
+    ``Config.ensure_content_dir()``. So the ``--show-toplevel`` probe always
+    runs, from the nearest ancestor of the content dir that actually exists
+    (which may be the content dir itself, or may be several levels up). If
+    that resolves to a repository at all, the content dir would end up nested
+    underneath it — refused unconditionally — *unless* the content dir itself
+    already exists and *is* that repository's root.
+    """
+    if Config.GIT_CLONE_URL or Config.GIT_SYNC_URL:
+        return
+
+    if not Config.GIT_TRACKING:
+        return
+
+    content_dir = Config.CONTENT_DIR
+    nearest_existing = _nearest_existing_ancestor(content_dir)
+
+    toplevel_result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=nearest_existing,
+        capture_output=True,
+        text=True,
+    )
+    if toplevel_result.returncode == 0:
+        toplevel = Path(toplevel_result.stdout.strip()).resolve()
+        if content_dir.exists() and toplevel == content_dir.resolve():
+            # content_dir itself already exists and is the repo root.
+            return
+        logger.error(
+            "Content directory %s is inside an existing git repository "
+            "rooted at %s. Refusing to create a nested repo. Point "
+            "STASH_CONTENT_ROOT at the parent repo root, set "
+            "STASH_GIT_TRACKING=false, or run 'git init' in the content "
+            "directory yourself if a nested repo is genuinely intended.",
+            content_dir,
+            toplevel,
+        )
+        raise SystemExit(1)
+    # Non-zero: no existing ancestor of content_dir is inside a git repository.
+
+    content_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("No git repository found at %s; running 'git init'", content_dir)
+    init_result = subprocess.run(
+        ["git", "init", str(content_dir)], capture_output=True, text=True
+    )
+    if init_result.returncode != 0:
+        logger.error("git init failed for %s: %s", content_dir, init_result.stderr.strip())
+        raise SystemExit(1)
+
+    from .git_backend import GitBackend
+
+    backend = GitBackend(content_dir, author_default=Config.GIT_AUTHOR_DEFAULT)
+    try:
+        backend.validate()  # sets local user.name/user.email if not already configured
+    except RuntimeError as exc:
+        logger.error("Failed to configure committer identity after git init: %s", exc)
+        raise SystemExit(1) from exc
+
+    # Commit whatever is already present (respecting .gitignore) so a
+    # pre-populated content dir doesn't leave existing files untracked — an
+    # untracked file looks "restorable" to a transaction abort and would be
+    # deleted by it. --allow-empty guarantees a commit even when there's
+    # nothing to stage, since an unborn HEAD breaks GitBackend elsewhere
+    # (reset_hard, and the HEAD-relative commands used during transactions).
+    add_result = subprocess.run(
+        ["git", "add", "-A"], cwd=content_dir, capture_output=True, text=True
+    )
+    if add_result.returncode != 0:
+        logger.error("git add failed during auto-init: %s", add_result.stderr.strip())
+        raise SystemExit(1)
+
+    commit_result = subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "Initial commit (stash-mcp auto-init)"],
+        cwd=content_dir,
+        capture_output=True,
+        text=True,
+    )
+    if commit_result.returncode != 0:
+        logger.error("git commit failed during auto-init: %s", commit_result.stderr.strip())
+        raise SystemExit(1)
+
+    logger.info("Initialised local git repository at %s with an initial commit.", content_dir)
 
 
 def _create_search_engine():
@@ -239,6 +359,7 @@ async def _git_sync_loop(
 def create_app():
     """Create and configure the FastAPI application."""
     _maybe_clone_repo()
+    _maybe_init_repo()
     Config.ensure_content_dir()
     filesystem = FileSystem(Config.CONTENT_DIR, include_patterns=Config.CONTENT_PATHS)
 
