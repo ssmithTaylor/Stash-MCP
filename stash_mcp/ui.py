@@ -1280,6 +1280,11 @@ transition:background 150ms ease,transform 150ms ease}
 border:1px solid #313244;border-radius:6px;font-size:13px;outline:none;
 transition:border-color 150ms ease,box-shadow 150ms ease}
 .search-input:focus{border-color:#94e2d5;box-shadow:0 0 0 2px rgba(148,226,213,0.1)}
+.search-scope{width:100%;margin-top:6px;padding:6px 8px;background:#1e1e2e;color:#a6adc8;
+border:1px solid #313244;border-radius:6px;font-size:12px}
+.search-result-root{display:inline-block;font-size:10px;font-weight:600;letter-spacing:.02em;
+color:#94e2d5;background:#1e1e2e;border:1px solid #313244;border-radius:4px;padding:1px 6px;
+margin-bottom:2px}
 .search-results{margin-top:6px;display:none}
 .search-results.active{display:block}
 .search-result{display:block;padding:6px 10px;margin:2px 0;border-radius:4px;
@@ -1736,7 +1741,11 @@ function handleSearch(query){
       box.classList.add('active');
       if(tree)tree.style.display='none';
     }
-    fetch('/ui/search?q='+encodeURIComponent(query))
+    var scopeEl=document.getElementById('search-scope');
+    var scope=scopeEl?scopeEl.value:'';
+    if(scopeEl){try{localStorage.setItem('stash-search-scope',scope);}catch(e){}}
+    fetch('/ui/search?q='+encodeURIComponent(query)
+      +(scope?'&path_prefix='+encodeURIComponent(scope):''))
       .then(function(r){return r.json();})
       .then(function(data){
         if(!box)return;
@@ -1745,8 +1754,13 @@ function handleSearch(query){
           data.results.forEach(function(r){
             var snippet=r.content||'';
             if(snippet.length>120)snippet=snippet.substring(0,120)+'\u2026';
+            var parts=r.file_path.split('/');
+            var root=parts.length>2?parts.slice(0,2).join('/'):(parts.length>1?parts[0]:'');
+            var section=(r.heading_path&&r.heading_path.length)?
+              ' \u203a '+_escHtml(r.heading_path.join(' > ')):'';
             h+='<a class="search-result" href="/ui/browse/'+encodeURIComponent(r.file_path)+'">'
-              +'<span class="search-result-path">'+_escHtml(r.file_path)+'</span>'
+              +(root?'<span class="search-result-root">'+_escHtml(root)+'</span>':'')
+              +'<span class="search-result-path">'+_escHtml(r.file_path)+section+'</span>'
               +'<span class="search-result-snippet">'+_escHtml(snippet)+'</span>'
               +'</a>';
           });
@@ -1763,6 +1777,11 @@ function handleSearch(query){
       .catch(function(){filterTree(query);});
   },300);
 }
+(function(){
+  var s=document.getElementById('search-scope');
+  if(!s)return;
+  try{var v=localStorage.getItem('stash-search-scope');if(v!==null){s.value=v;}}catch(e){}
+})();
 var _unsaved=false;
 (function(){
   var ta=document.querySelector('.editor-area');
@@ -2054,6 +2073,33 @@ def _page(
 </body></html>"""
 
 
+def _scope_options_html(filesystem: FileSystem) -> str:
+    """Build `<option>`s for the search-scope select: Everything + every
+    top-level directory + its immediate subdirectories.
+
+    Directory names are user-controlled (they come from the store's own
+    tree), so every name is HTML-escaped before landing in either the
+    `value="..."` attribute or the option's text content.
+    """
+    options = ['<option value="">Everything</option>']
+    try:
+        top = [n for n, d in filesystem.list_files("") if d and not n.startswith(".")]
+    except Exception:
+        top = []
+    for name in top:
+        options.append(f'<option value="{html.escape(name)}/">{html.escape(name)}/</option>')
+        try:
+            children = [n for n, d in filesystem.list_files(name) if d and not n.startswith(".")]
+        except Exception:
+            children = []
+        for child in children:
+            value = f"{name}/{child}/"
+            options.append(
+                f'<option value="{html.escape(value)}">&nbsp;&nbsp;{html.escape(child)}/</option>'
+            )
+    return "".join(options)
+
+
 def _sidebar_html(
     filesystem: FileSystem,
     active: str = "",
@@ -2064,6 +2110,13 @@ def _sidebar_html(
     tree = _build_tree_html(filesystem, active=active)
     vector_attr = ' data-vector-search="true"' if search_enabled else ""
     placeholder = "Search content\u2026" if search_enabled else "Search files..."
+    scope_select = (
+        '<select id="search-scope" class="search-scope" aria-label="Search scope" '
+        "onchange=\"handleSearch(document.getElementById('tree-search').value)\">"
+        f"{_scope_options_html(filesystem)}</select>"
+        if search_enabled
+        else ""
+    )
     results_div = '<div id="search-results" class="search-results"></div>' if search_enabled else ""
     new_doc_btn = (
         "" if read_only else f'<a href="/ui/new" class="btn-new">{_icon("plus")} New Document</a>'
@@ -2075,6 +2128,7 @@ def _sidebar_html(
         f'<input type="text" id="tree-search" class="search-input" '
         f'placeholder="{placeholder}" aria-label="Search" '
         f'oninput="handleSearch(this.value)">'
+        f"{scope_select}"
         f"{results_div}"
         "</div>"
         "</div>"
@@ -2426,12 +2480,14 @@ def create_ui_router(
         from fastapi.responses import JSONResponse
 
         @router.get("/ui/search")
-        async def ui_search(q: str = "", max_results: int = 10):
+        async def ui_search(
+            q: str = "", max_results: int = 10, path_prefix: str | None = None
+        ):
             """Search content using the vector search engine."""
             if not q.strip():
                 return JSONResponse({"results": [], "total": 0})
             results = await search_engine.search(
-                q.strip(), max_results=max_results
+                q.strip(), max_results=max_results, path_prefix=path_prefix
             )
             return JSONResponse(
                 {
@@ -2440,6 +2496,7 @@ def create_ui_router(
                             "file_path": r.file_path,
                             "content": r.content[:200] if r.content else "",
                             "score": round(r.score, 3),
+                            "heading_path": r.heading_path,
                         }
                         for r in results
                     ],
