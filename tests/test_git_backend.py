@@ -806,6 +806,34 @@ class TestMaybeInitRepo:
         )
         assert status.strip() == ""
 
+    def test_initial_commit_respects_gitignore(self, tmp_path, monkeypatch):
+        """`git add -A` respects .gitignore -- ignored paths must not be staged."""
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        content_dir = tmp_path / "content"
+        content_dir.mkdir()
+        (content_dir / ".gitignore").write_text("ignored.txt\nsecrets/\n")
+        (content_dir / "tracked.md").write_text("# Tracked\n")
+        (content_dir / "ignored.txt").write_text("do not track me\n")
+        (content_dir / "secrets").mkdir()
+        (content_dir / "secrets" / "foo.txt").write_text("sh\n")
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+
+        app_main._maybe_init_repo()
+
+        tracked = subprocess.check_output(
+            ["git", "-C", str(content_dir), "show", "--name-only", "--format=", "HEAD"],
+            text=True,
+        ).strip().splitlines()
+        assert sorted(tracked) == [".gitignore", "tracked.md"]
+        assert "ignored.txt" not in tracked
+        assert "secrets/foo.txt" not in tracked
+
     def test_already_a_repo_is_noop(self, tmp_path, monkeypatch):
         import stash_mcp.config as cfg
         import stash_mcp.main as app_main
@@ -848,6 +876,40 @@ class TestMaybeInitRepo:
             app_main._maybe_init_repo()
 
         assert not (content_dir / ".git").exists()
+
+    def test_nonexistent_content_dir_nested_inside_parent_repo_refuses(
+        self, tmp_path, monkeypatch
+    ):
+        """The ancestor-repo check must fire even when content_dir does not
+        exist yet -- the common case, since _maybe_init_repo() runs before
+        Config.ensure_content_dir() (see main.py's create_app()). Gating the
+        toplevel check on content_dir.exists() would let this fall straight
+        through to mkdir + git init, silently creating a nested repo.
+        """
+        import stash_mcp.config as cfg
+        import stash_mcp.main as app_main
+
+        parent = tmp_path / "outer"
+        parent.mkdir()
+        _init_repo(parent)  # parent is a real repo with a commit
+        content_dir = parent / "data" / "content"  # deliberately never created
+
+        monkeypatch.setattr(cfg.Config, "GIT_CLONE_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_SYNC_URL", None)
+        monkeypatch.setattr(cfg.Config, "GIT_TRACKING", True)
+        monkeypatch.setattr(cfg.Config, "CONTENT_DIR", content_dir)
+
+        assert not content_dir.exists()
+
+        with pytest.raises(SystemExit):
+            app_main._maybe_init_repo()
+
+        # Nothing new should exist anywhere under the parent repo -- not just
+        # "no .git at content_dir", but no directory was created at all.
+        git_dirs = sorted(p for p in parent.rglob(".git"))
+        assert git_dirs == [parent / ".git"], f"unexpected .git dirs: {git_dirs}"
+        assert not content_dir.exists()
+        assert not (parent / "data").exists()
 
     def test_clone_url_configured_skips_init(self, tmp_path, monkeypatch):
         """A configured remote wins — no local init is attempted."""

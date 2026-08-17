@@ -112,6 +112,22 @@ def _maybe_clone_repo() -> None:
     logger.info("Clone complete. Git tracking auto-enabled.")
 
 
+def _nearest_existing_ancestor(path: Path) -> Path:
+    """Return the closest directory in *path*'s own chain that exists on disk.
+
+    Returns *path* itself (resolved) if it already exists. Otherwise walks up
+    through its parents until it finds one that does. The filesystem root
+    always exists, so this always terminates with a real, existing directory.
+    """
+    current = path.resolve()
+    while not current.exists():
+        parent = current.parent
+        if parent == current:
+            break  # reached the filesystem root; defensive, should not happen
+        current = parent
+    return current
+
+
 def _maybe_init_repo() -> None:
     """Initialise a local git repo in the content dir when tracking is on and
     no remote is configured.
@@ -128,6 +144,15 @@ def _maybe_init_repo() -> None:
     --git-dir`` would succeed from such a directory (it resolves upward to
     the parent repo's ``.git``), so ``--show-toplevel`` is used instead and
     compared against the content dir to detect this case correctly.
+
+    This check must not be skipped just because the content dir doesn't exist
+    yet — that's the common case, since this runs before
+    ``Config.ensure_content_dir()``. So the ``--show-toplevel`` probe always
+    runs, from the nearest ancestor of the content dir that actually exists
+    (which may be the content dir itself, or may be several levels up). If
+    that resolves to a repository at all, the content dir would end up nested
+    underneath it — refused unconditionally — *unless* the content dir itself
+    already exists and *is* that repository's root.
     """
     if Config.GIT_CLONE_URL or Config.GIT_SYNC_URL:
         return
@@ -136,30 +161,30 @@ def _maybe_init_repo() -> None:
         return
 
     content_dir = Config.CONTENT_DIR
+    nearest_existing = _nearest_existing_ancestor(content_dir)
 
-    if content_dir.exists():
-        toplevel_result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=content_dir,
-            capture_output=True,
-            text=True,
+    toplevel_result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=nearest_existing,
+        capture_output=True,
+        text=True,
+    )
+    if toplevel_result.returncode == 0:
+        toplevel = Path(toplevel_result.stdout.strip()).resolve()
+        if content_dir.exists() and toplevel == content_dir.resolve():
+            # content_dir itself already exists and is the repo root.
+            return
+        logger.error(
+            "Content directory %s is inside an existing git repository "
+            "rooted at %s. Refusing to create a nested repo. Point "
+            "STASH_CONTENT_ROOT at the parent repo root, set "
+            "STASH_GIT_TRACKING=false, or run 'git init' in the content "
+            "directory yourself if a nested repo is genuinely intended.",
+            content_dir,
+            toplevel,
         )
-        if toplevel_result.returncode == 0:
-            toplevel = Path(toplevel_result.stdout.strip()).resolve()
-            if toplevel == content_dir.resolve():
-                # Already the repo root — nothing to do.
-                return
-            logger.error(
-                "Content directory %s is inside an existing git repository "
-                "rooted at %s. Refusing to create a nested repo. Point "
-                "STASH_CONTENT_ROOT at the parent repo root, set "
-                "STASH_GIT_TRACKING=false, or run 'git init' in the content "
-                "directory yourself if a nested repo is genuinely intended.",
-                content_dir,
-                toplevel,
-            )
-            raise SystemExit(1)
-        # Non-zero: content_dir is not inside any git repository — proceed.
+        raise SystemExit(1)
+    # Non-zero: no existing ancestor of content_dir is inside a git repository.
 
     content_dir.mkdir(parents=True, exist_ok=True)
 
