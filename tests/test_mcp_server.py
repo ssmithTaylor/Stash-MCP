@@ -472,6 +472,25 @@ async def test_list_content_with_metadata_returns_json_rows(mcp_server, temp_fs)
     assert all(p.endswith(".md") for p in rows)          # data.json is not listed
 
 
+async def test_list_content_with_metadata_sets_truncated_true_at_the_limit(mcp_server, temp_fs):
+    """The dict shape's truncated flag must be exercised in its true branch too."""
+    temp_fs.write_file("docs/meta.md", "---\nlayer: x\n---\n# M\n")
+    tool = await mcp_server.get_tool("list_content")
+    data = json.loads(str((await tool.run({
+        "path": "docs", "with_metadata": True, "limit": 1,
+    })).content[0].text))
+    assert data["truncated"] is True
+    assert len(data["items"]) == 1
+
+
+async def test_list_content_empty_glob_is_not_a_full_recursive_dump(mcp_server):
+    """glob="" (an LLM's likeliest spelling of "no glob") must not flip on recursion."""
+    tool = await mcp_server.get_tool("list_content")
+    text = str((await tool.run({"path": "", "glob": ""})).content[0].text)
+    assert "📁 docs" in text and "📄 README.md" in text   # plain directory listing
+    assert "docs/README.md" not in text                   # not the recursive full-path dump
+
+
 async def test_list_content_default_output_unchanged(mcp_server):
     tool = await mcp_server.get_tool("list_content")
     text = str((await tool.run({"path": ""})).content[0].text)
@@ -1553,6 +1572,64 @@ async def test_inspect_content_structure_tool_file_not_found(temp_fs):
         await tool.run({"path": "missing.md"})
 
 
+_FM_COMMENT_DOC = (
+    "---\n"                                # line 1
+    "# Provenance block, do not edit\n"    # line 2 -- a YAML comment, NOT an h1
+    "layer: frogpilot\n"                   # line 3
+    "---\n"                                # line 4
+    "# Real Title\n"                       # line 5
+    "\n"                                   # line 6
+    "## Setup\n"                           # line 7
+)
+
+
+async def test_inspect_content_structure_skips_frontmatter_comments(temp_fs):
+    """A '#' comment inside frontmatter is a comment, not a heading (and not the title)."""
+    temp_fs.write_file("fm.md", _FM_COMMENT_DOC)
+    mcp = create_mcp_server(temp_fs)
+    tool = await mcp.get_tool("inspect_content_structure")
+    data = json.loads(str((await tool.run({"path": "fm.md"})).content[0].text))
+    assert data["title"] == "Real Title"
+    assert [s["heading"] for s in data["sections"]] == ["Real Title"]
+    assert data["metadata"] == {"layer": "frogpilot"}
+    # ... and it agrees with what the search indexer scans (the body).
+    from stash_mcp.frontmatter import extract_metadata
+    from stash_mcp.headings import scan_headings
+    body = extract_metadata(_FM_COMMENT_DOC)[1]
+    assert [(h.text, h.level) for h in scan_headings(body)] == [("Real Title", 1), ("Setup", 2)]
+
+
+async def test_inspect_content_structure_line_numbers_index_the_original_file(temp_fs):
+    """Headings are scanned over the body, but line_number still points at the raw file."""
+    temp_fs.write_file("fm.md", _FM_COMMENT_DOC)
+    mcp = create_mcp_server(temp_fs)
+    tool = await mcp.get_tool("inspect_content_structure")
+    data = json.loads(str((await tool.run({"path": "fm.md"})).content[0].text))
+    raw_lines = _FM_COMMENT_DOC.split("\n")
+    title_section = data["sections"][0]
+    setup_section = title_section["children"][0]
+    assert title_section["line_number"] == 5
+    assert setup_section["line_number"] == 7
+    assert raw_lines[title_section["line_number"] - 1] == "# Real Title"
+    assert raw_lines[setup_section["line_number"] - 1] == "## Setup"
+
+
+async def test_inspect_content_structure_batch_skips_frontmatter_comments(temp_fs):
+    """The batch surface strips frontmatter the same way the single-file one does."""
+    temp_fs.write_file("fm.md", _FM_COMMENT_DOC)
+    temp_fs.write_file("plain.md", "# Plain\n\n## Bits\n")
+    mcp = create_mcp_server(temp_fs)
+    tool = await mcp.get_tool("inspect_content_structure_batch")
+    data = json.loads(str((await tool.run({"paths": ["fm.md", "plain.md"]})).content[0].text))
+    by_path = {r["path"]: r for r in data["results"]}
+    assert by_path["fm.md"]["title"] == "Real Title"
+    assert by_path["fm.md"]["sections"][0]["line_number"] == 5
+    assert by_path["fm.md"]["metadata"] == {"layer": "frogpilot"}
+    # a document without frontmatter is unshifted
+    assert by_path["plain.md"]["title"] == "Plain"
+    assert by_path["plain.md"]["sections"][0]["line_number"] == 1
+
+
 async def test_inspect_content_structure_tool_path_in_result(temp_fs):
     """Test inspect_content_structure includes the path in the result."""
     temp_fs.write_file("docs/guide.md", "# Guide\n")
@@ -1713,6 +1790,48 @@ async def test_update_metadata_tool_and_read_metadata(mcp_server, temp_fs, mock_
     inspect = await mcp_server.get_tool("inspect_content_structure")
     info = json.loads(str((await inspect.run({"path": "docs/x.md"})).content[0].text))
     assert info["metadata"] == {"verified": "2026-08-16"} and info["title"] == "X"
+
+
+async def test_update_metadata_returns_the_same_metadata_shape_as_every_other_surface(
+    mcp_server, temp_fs, mock_context,
+):
+    """Frontmatter ∪ leading blockquote, not frontmatter alone.
+
+    Returning only the frontmatter keys would read as "setting layer wiped
+    describes/domain" to an agent that trusts what it gets back.
+    """
+    temp_fs.write_file(
+        "docs/bq.md", "# Title\n\n> Describes: openpilot@v1 | Domain: core\n\nBody\n"
+    )
+    update = await mcp_server.get_tool("update_metadata")
+    written = json.loads(str((await update.run({
+        "path": "docs/bq.md", "values": {"layer": "a"},
+    })).content[0].text))
+    expected = {"describes": "openpilot@v1", "domain": "core", "layer": "a"}
+    assert written["metadata"] == expected
+
+    read = await mcp_server.get_tool("read_content")
+    got = json.loads(str((await read.run({"path": "docs/bq.md"})).content[0].text))
+    assert got["metadata"] == expected == written["metadata"]
+    assert got["sha"] == written["new_sha"]
+
+    inspect = await mcp_server.get_tool("inspect_content_structure")
+    info = json.loads(str((await inspect.run({"path": "docs/bq.md"})).content[0].text))
+    assert info["metadata"] == expected
+
+
+async def test_update_metadata_rejects_non_markdown_files(mcp_server, temp_fs, mock_context):
+    """Prepending a YAML block to a .py/.json/.csv file would silently corrupt it."""
+    update = await mcp_server.get_tool("update_metadata")
+    for path, body in (
+        ("script.py", "import os\nprint(os)\n"),
+        ("data.json", '{"key": "value"}'),
+        ("table.csv", "a,b\n1,2\n"),
+    ):
+        temp_fs.write_file(path, body)
+        with pytest.raises(ValueError, match="only supports markdown files"):
+            await update.run({"path": path, "values": {"layer": "a"}})
+        assert temp_fs.read_file(path) == body      # untouched, no "---" prefix
 
 
 # --- find_content tests ---

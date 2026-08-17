@@ -352,13 +352,41 @@ def _build_heading_tree(flat: list[dict]) -> list[dict]:
     return root
 
 
-def parse_markdown_structure(content: str) -> list[dict]:
-    """Parse markdown content and return a nested heading structure."""
+def parse_markdown_structure(content: str, line_offset: int = 0) -> list[dict]:
+    """Parse markdown content and return a nested heading structure.
+
+    *line_offset* is added to every reported line number, so a caller that
+    parses a document's *body* still reports lines relative to the original
+    file (see ``_document_outline``).
+    """
     flat_headings = [
-        {"heading": h.text, "level": h.level, "line_number": h.line, "children": []}
+        {
+            "heading": h.text,
+            "level": h.level,
+            "line_number": h.line + line_offset,
+            "children": [],
+        }
         for h in scan_headings(content)
     ]
     return _build_heading_tree(flat_headings)
+
+
+def _document_outline(content: str) -> tuple[list[dict], str | None, dict[str, str]]:
+    """Return ``(sections, title, metadata)`` for a markdown document.
+
+    Headings are scanned over the *body*, with any YAML frontmatter block
+    stripped first: a ``#`` comment inside frontmatter matches the heading
+    regex, so parsing the raw file reports it as a document heading and — if
+    it is the first one — as the document ``title``, burying the real H1.
+    That also contradicts the search indexer, which runs ``scan_headings``
+    over the body. Line numbers are shifted back by the number of lines the
+    frontmatter consumed, so they still point at the original file.
+    """
+    metadata, body = extract_metadata(content)
+    line_offset = content[: len(content) - len(body)].count("\n")
+    sections = parse_markdown_structure(body, line_offset)
+    title = next((h["heading"] for h in sections if h["level"] == 1), None)
+    return sections, title, metadata
 
 
 def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=None) -> FastMCP:
@@ -791,6 +819,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
         ) -> dict:
             """Set or remove keys in a file's YAML frontmatter without touching the body.
 
+            Markdown files only (.md, .markdown) — a YAML block prepended to a
+            .py/.json/.yaml/.csv file would silently corrupt it.
+
             Creates the frontmatter block when the file has none, preserves the
             other keys and their order, and leaves the body byte-for-byte
             unchanged. Use this for provenance/freshness fields (verified,
@@ -798,16 +829,23 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             instead of string-editing the YAML.
 
             Args:
-                path: File path relative to content root
+                path: Markdown file path (.md or .markdown) relative to content root
                 values: Keys to set
                 unset: Keys to remove
                 sha: Optional current content sha (as returned by read_content)
             Returns:
-                A dict with 'path', 'metadata' (the resulting scalar metadata)
-                and 'new_sha'
+                A dict with 'path', 'metadata' and 'new_sha'. 'metadata' is the
+                document's full metadata after the write — frontmatter merged
+                over the leading blockquote, exactly what read_content and
+                search results report — not just the frontmatter keys.
             """
             if not values and not unset:
                 raise ValueError("Provide at least one key in values or unset.")
+            suffix = PurePosixPath(path).suffix.lower()
+            if suffix not in {".md", ".markdown"}:
+                raise ValueError(
+                    f"update_metadata only supports markdown files (.md, .markdown). Got: {path}"
+                )
             current = filesystem.read_file(path)
             if sha is not None:
                 current_sha = hashlib.sha256(current.encode("utf-8")).hexdigest()
@@ -816,7 +854,14 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                         f"SHA mismatch for '{path}': expected {current_sha}, got {sha}. "
                         "The file may have changed since it was last read."
                     )
-            new_content, metadata = merge_frontmatter(current, values, unset)
+            # merge_frontmatter's own second return value is frontmatter-only
+            # (the truthfulness guard in that module is defined against it, so
+            # it must stay that way). Report the same shape every other
+            # surface does — frontmatter over leading blockquote — or an agent
+            # that sets one key and reads the answer back concludes it just
+            # wiped the blockquote-provided keys.
+            new_content, _ = merge_frontmatter(current, values, unset)
+            metadata = extract_metadata(new_content)[0]
             filesystem.write_file(path, new_content)
             if _is_resource_file(path):
                 uri = AnyUrl(f"stash://{path}")
@@ -962,7 +1007,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
         glob: Annotated[
             str | None,
             Field(description="Glob over full relative paths (STASH_CONTENT_PATHS dialect: *, ?, "
-                  "**), e.g. 'projects/*/services/*.md'; implies recursive"),
+                  "**), e.g. 'projects/*/services/*.md'; implies recursive. Matched from the "
+                  "content root, NOT relative to path, so put the directory in the glob "
+                  "itself: glob='projects/x/*.md', not path='projects/x' + glob='*.md'"),
         ] = None,
         limit: Annotated[
             int, Field(ge=1, description="Maximum entries returned (default 500)"),
@@ -986,7 +1033,8 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
             path: Path relative to content root (defaults to root)
             recursive: If true, list all files recursively
             max_depth: Bound recursion depth (implies recursive)
-            glob: Filter full paths with a glob (implies recursive)
+            glob: Filter full paths with a glob, root-anchored rather than
+                relative to *path* (implies recursive)
             limit: Cap on entries; a trailing "… truncated" line marks a cut
             with_metadata: Return {"items": [{path, size, metadata}], "truncated"}
                 for markdown files (implies recursive)
@@ -995,7 +1043,10 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
         """
         base = path.strip("/")
         base_depth = len(base.split("/")) if base else 0
-        wants_files = recursive or max_depth is not None or glob is not None or with_metadata
+        # bool(glob), not `glob is not None`: an explicit glob="" (the likeliest
+        # way a caller spells "no glob") would otherwise flip this into a full
+        # recursive listing while the `if glob:` below applies no filter at all.
+        wants_files = recursive or max_depth is not None or bool(glob) or with_metadata
         if wants_files:
             files = await asyncio.to_thread(filesystem.list_all_files, base)
             if max_depth is not None:
@@ -1052,7 +1103,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
 
         Parses the heading hierarchy (h1-h6) and returns a nested outline of
         the document. Useful for understanding document organization before
-        reading full content.
+        reading full content. A YAML frontmatter block is not scanned for
+        headings — a '#' comment inside it is a comment, not an h1 — but
+        line numbers stay relative to the whole file.
 
         Args:
             path: File path relative to content root (must be a .md or .markdown file)
@@ -1067,13 +1120,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                 f"inspect_content_structure only supports markdown files (.md, .markdown). Got: {path}"
             )
         content = filesystem.read_file(path)
-        sections = parse_markdown_structure(content)
-        title = None
-        for heading in sections:
-            if heading["level"] == 1:
-                title = heading["heading"]
-                break
-        metadata = extract_metadata(content)[0]
+        sections, title, metadata = _document_outline(content)
         return {"path": path, "title": title, "sections": sections, "metadata": metadata}
 
     @mcp.tool(
@@ -1098,7 +1145,9 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
 
         Parses up to 10 markdown files and returns their heading hierarchies.
         Useful for scanning a documentation tree to understand content organization
-        across multiple files.
+        across multiple files. A YAML frontmatter block is not scanned for
+        headings — a '#' comment inside it is a comment, not an h1 — but line
+        numbers stay relative to the whole file.
 
         Args:
             paths: List of markdown file paths relative to content root (max 10)
@@ -1126,13 +1175,7 @@ def create_mcp_server(filesystem: FileSystem, search_engine=None, git_backend=No
                         f"(.md, .markdown). Got: {path}"
                     )
                 content = filesystem.read_file(path)
-                sections = parse_markdown_structure(content)
-                title = None
-                for s in sections:
-                    if s["level"] == 1:
-                        title = s["heading"]
-                        break
-                metadata = extract_metadata(content)[0]
+                sections, title, metadata = _document_outline(content)
                 results.append({
                     "path": path,
                     "title": title,
