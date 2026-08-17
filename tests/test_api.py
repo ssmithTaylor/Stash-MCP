@@ -370,3 +370,102 @@ def test_event_emitted_on_patch_move(test_client, event_listener):
     assert args[0] == "content_moved"
     assert args[1] == "moved.md"
     assert kwargs.get("source_path") == "test.md"
+
+
+# --- Read-only mode tests ---
+
+
+def test_create_content_blocked_when_read_only(test_client, monkeypatch):
+    """POST create returns 403 in read-only mode and never touches disk."""
+    monkeypatch.setattr("stash_mcp.api.Config.READ_ONLY", True)
+    response = test_client.post(
+        "/api/content/blocked.md",
+        json={"content": "should not be written"},
+    )
+    assert response.status_code == 403
+
+    # The file must not have been created.
+    check = test_client.get("/api/content/blocked.md")
+    assert check.status_code == 404
+
+
+def test_update_content_blocked_when_read_only(test_client, monkeypatch):
+    """PUT update returns 403 in read-only mode and leaves the file unchanged."""
+    monkeypatch.setattr("stash_mcp.api.Config.READ_ONLY", True)
+    response = test_client.put(
+        "/api/content/test.md",
+        json={"content": "should not overwrite"},
+    )
+    assert response.status_code == 403
+
+    # The existing file's content must be untouched.
+    check = test_client.get("/api/content/test.md")
+    assert check.status_code == 200
+    assert check.json()["content"] == "# Test Content"
+
+
+def test_delete_content_blocked_when_read_only(test_client, monkeypatch):
+    """DELETE returns 403 in read-only mode and does not remove the file."""
+    monkeypatch.setattr("stash_mcp.api.Config.READ_ONLY", True)
+    response = test_client.delete("/api/content/test.md")
+    assert response.status_code == 403
+
+    # The file must still exist with its original content.
+    check = test_client.get("/api/content/test.md")
+    assert check.status_code == 200
+    assert check.json()["content"] == "# Test Content"
+
+
+def test_move_content_blocked_when_read_only(test_client, monkeypatch):
+    """PATCH move returns 403 in read-only mode and does not move the file."""
+    monkeypatch.setattr("stash_mcp.api.Config.READ_ONLY", True)
+    response = test_client.patch(
+        "/api/content/test.md",
+        json={"destination": "moved.md"},
+    )
+    assert response.status_code == 403
+
+    # The source must remain in place and the destination must not exist.
+    source = test_client.get("/api/content/test.md")
+    assert source.status_code == 200
+    dest = test_client.get("/api/content/moved.md")
+    assert dest.status_code == 404
+
+
+def test_delete_nonexistent_content_returns_403_when_read_only(
+    test_client, monkeypatch
+):
+    """DELETE on nonexistent path returns 403 (not 404) in read-only mode.
+
+    The 403 guard is the first statement in the route body, ensuring
+    it runs before the existence check that would otherwise return 404.
+    """
+    monkeypatch.setattr("stash_mcp.api.Config.READ_ONLY", True)
+    response = test_client.delete("/api/content/does-not-exist.md")
+    assert response.status_code == 403
+
+
+def test_write_routes_work_when_not_read_only(test_client, monkeypatch):
+    """READ_ONLY=False leaves all four write routes fully functional.
+
+    Guards against a broken "always return 403" implementation of the
+    read-only check.
+    """
+    monkeypatch.setattr("stash_mcp.api.Config.READ_ONLY", False)
+
+    create = test_client.post("/api/content/works.md", json={"content": "# Works"})
+    assert create.status_code == 201
+
+    update = test_client.put("/api/content/works.md", json={"content": "# Updated"})
+    assert update.status_code == 200
+    assert test_client.get("/api/content/works.md").json()["content"] == "# Updated"
+
+    move = test_client.patch(
+        "/api/content/works.md", json={"destination": "moved-works.md"}
+    )
+    assert move.status_code == 200
+    assert test_client.get("/api/content/moved-works.md").status_code == 200
+
+    delete = test_client.delete("/api/content/moved-works.md")
+    assert delete.status_code == 200
+    assert test_client.get("/api/content/moved-works.md").status_code == 404
