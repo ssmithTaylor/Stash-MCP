@@ -23,7 +23,7 @@ def fake_fastembed(monkeypatch):
     """
     import numpy as np
 
-    calls = {"init": [], "embed": [], "embed_threads": []}
+    calls = {"init": [], "embed": [], "embed_batch_sizes": [], "embed_threads": []}
 
     class FakeTokenizer:
         """Mimics ``tokenizers.Tokenizer``: enable_* replace the whole config
@@ -89,6 +89,7 @@ def fake_fastembed(monkeypatch):
         def embed(self, documents, batch_size=256, **kwargs):
             docs = list(documents)
             calls["embed"].append(docs)
+            calls["embed_batch_sizes"].append(batch_size)
             calls["embed_threads"].append(threading.current_thread())
             for doc in docs:
                 # float64 like the real library, and a generator (not a list)

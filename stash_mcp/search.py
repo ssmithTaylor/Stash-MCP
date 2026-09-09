@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .embedders import (
     DEFAULT_EMBEDDER_MODEL,
+    DEFAULT_ONNX_BATCH_SIZE,
     ONNX_PREFIX,
     FastEmbedAdapter,
     is_onnx_model,
@@ -813,6 +814,7 @@ class SearchEngine:
         embed_fn=None,
         model_cache_dir: Path | str | None = None,
         onnx_threads: int | None = None,
+        onnx_batch_size: int = DEFAULT_ONNX_BATCH_SIZE,
         filesystem=None,
         git_backend=None,
         chunk_size: int = 1000,
@@ -850,6 +852,9 @@ class SearchEngine:
                 ``onnx:`` backend (``STASH_SEARCH_ONNX_THREADS``). None keeps
                 onnxruntime's default (one thread per host core, which can
                 oversubscribe under container CPU limits).
+            onnx_batch_size: Maximum documents per FastEmbed inference batch
+                (``STASH_SEARCH_ONNX_BATCH_SIZE``). Smaller batches bound the
+                ONNX Runtime workspace retained after bulk indexing.
             filesystem: Optional FileSystem instance for content path filtering.
             git_backend: Optional GitBackend instance for blame-enriched results.
             chunk_size: Number of characters per chunk for the sliding window.
@@ -935,6 +940,7 @@ class SearchEngine:
                 onnx_model_name(embedder_model),
                 cache_dir=cache_dir,
                 threads=onnx_threads,
+                batch_size=onnx_batch_size,
             )
 
         # Remote / torch providers go through Pydantic AI's Embedder

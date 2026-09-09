@@ -128,6 +128,7 @@ def _create_search_engine():
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
             model_cache_dir=Config.MODEL_CACHE_DIR,
             onnx_threads=Config.SEARCH_ONNX_THREADS,
+            onnx_batch_size=Config.SEARCH_ONNX_BATCH_SIZE,
             chunk_size=Config.SEARCH_CHUNK_SIZE,
             chunk_overlap=Config.SEARCH_CHUNK_OVERLAP,
             mmr_enabled=Config.SEARCH_MMR_ENABLED,

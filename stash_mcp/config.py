@@ -67,6 +67,12 @@ class Config:
         if os.getenv("STASH_SEARCH_ONNX_THREADS")
         else None
     )
+    # FastEmbed defaults to 256 documents per batch, which can retain more than
+    # 1 GiB of ONNX Runtime workspace after a bulk index. A bounded default
+    # keeps reindexing within small-container memory limits.
+    SEARCH_ONNX_BATCH_SIZE: int = int(
+        os.getenv("STASH_SEARCH_ONNX_BATCH_SIZE", "32")
+    )
     CONTEXTUAL_RETRIEVAL: bool = (
         os.getenv("STASH_CONTEXTUAL_RETRIEVAL", "false").lower() == "true"
     )

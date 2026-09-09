@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 ONNX_PREFIX = "onnx:"
 DEFAULT_ONNX_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_EMBEDDER_MODEL = f"{ONNX_PREFIX}{DEFAULT_ONNX_MODEL}"
+DEFAULT_ONNX_BATCH_SIZE = 32
 
 # Token limits applied after loading, keyed by lower-cased fastembed model
 # name. fastembed's packaging of all-MiniLM-L6-v2 (qdrant/all-MiniLM-L6-v2-onnx)
@@ -130,6 +131,9 @@ class FastEmbedAdapter:
         cache_dir: Directory for downloaded model files. Created if missing;
             if it cannot be used, fastembed's default cache is used instead.
         threads: onnxruntime intra/inter-op thread count (None = library default).
+        batch_size: Maximum documents per FastEmbed inference batch. The
+            bounded default avoids retaining the library's much larger
+            256-document workspace after bulk indexing.
         max_tokens: Truncation limit applied after loading. Defaults to a
             per-model correction table (see ``_KNOWN_MAX_TOKENS``); pass an int
             to force a value, or leave None for models not in the table to keep
@@ -146,12 +150,16 @@ class FastEmbedAdapter:
         *,
         cache_dir: Path | str | None = None,
         threads: int | None = None,
+        batch_size: int = DEFAULT_ONNX_BATCH_SIZE,
         max_tokens: int | None = None,
     ):
         self._text_embedding_cls = _import_text_embedding()
         self.model_name = model_name
         self.cache_dir = _resolve_cache_dir(cache_dir)
         self.threads = threads
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        self.batch_size = batch_size
         self.max_tokens = (
             max_tokens
             if max_tokens is not None
@@ -259,7 +267,10 @@ class FastEmbedAdapter:
         if not texts:
             return []
         model = self._get_model()
-        return [[float(x) for x in vector] for vector in model.embed(texts)]
+        return [
+            [float(x) for x in vector]
+            for vector in model.embed(texts, batch_size=self.batch_size)
+        ]
 
     async def __call__(self, texts: list[str]) -> list[list[float]]:
         """Embed *texts* in a worker thread, returning one vector per text."""

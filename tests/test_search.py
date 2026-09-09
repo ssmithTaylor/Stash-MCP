@@ -821,6 +821,7 @@ class TestSearchConfig:
         assert Config.SEARCH_INDEX_DIR == Path("/data/.stash-index")
         # Default local backend is ONNX Runtime (fastembed), not torch
         assert Config.SEARCH_EMBEDDER_MODEL == "onnx:sentence-transformers/all-MiniLM-L6-v2"
+        assert Config.SEARCH_ONNX_BATCH_SIZE == 32
         assert Config.CONTEXTUAL_RETRIEVAL is False
         assert Config.CONTEXTUAL_MODEL == "claude-haiku-4-5-20251001"
         assert Config.SEARCH_CHUNK_SIZE == 1000
@@ -995,6 +996,15 @@ class TestOnnxBackendWiring:
             onnx_threads=2,
         )
         assert engine._embed_fn.threads == 2
+
+    def test_onnx_batch_size_is_passed_to_adapter(self, fake_fastembed, tmp_path):
+        engine = SearchEngine(
+            content_dir=tmp_path / "content",
+            index_dir=tmp_path / "index",
+            embedder_model=self.ONNX_MODEL,
+            onnx_batch_size=7,
+        )
+        assert engine._embed_fn.batch_size == 7
 
     async def test_switching_torch_to_onnx_model_string_clears_index(self, tmp_path):
         """Upgrading from the torch default to the ONNX default triggers a rebuild."""
